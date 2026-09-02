@@ -4,6 +4,7 @@ export type ChatSendErrorCode =
   | 'socket_disconnected'
   | 'local_model_failed'
   | 'cloud_send_failed'
+  | 'thread_create_failed'
   | 'voice_transcription'
   | 'stt_not_ready'
   | 'microphone_unavailable'

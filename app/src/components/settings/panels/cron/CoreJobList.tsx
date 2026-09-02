@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import type { CoreCronJob, CoreCronRun } from '../../../../utils/tauriCommands';
 
 interface CoreJobListProps {
@@ -21,6 +23,10 @@ const CoreJobList = ({
   onLoadCoreRuns,
   onRemoveCoreJob,
 }: CoreJobListProps) => {
+  // Removal is destructive (the job is gone from the scheduler), so the
+  // first click arms a confirm state and only the second click deletes.
+  const [removeConfirmId, setRemoveConfirmId] = useState<string | null>(null);
+
   return (
     <section className="rounded-xl border border-stone-200 bg-white">
       <div className="p-4 border-b border-stone-200">
@@ -111,10 +117,22 @@ const CoreJobList = ({
                 </button>
                 <button
                   type="button"
-                  className="btn btn-sm btn-error"
+                  className={`btn btn-sm ${removeConfirmId === job.id ? 'btn-error' : 'btn-outline'}`}
                   disabled={coreBusyKey === `core-remove:${job.id}`}
-                  onClick={() => onRemoveCoreJob(job.id)}>
-                  {coreBusyKey === `core-remove:${job.id}` ? 'Removing…' : 'Remove'}
+                  onClick={() => {
+                    if (removeConfirmId !== job.id) {
+                      setRemoveConfirmId(job.id);
+                      return;
+                    }
+                    setRemoveConfirmId(null);
+                    onRemoveCoreJob(job.id);
+                  }}
+                  onBlur={() => setRemoveConfirmId(prev => (prev === job.id ? null : prev))}>
+                  {coreBusyKey === `core-remove:${job.id}`
+                    ? 'Removing…'
+                    : removeConfirmId === job.id
+                      ? 'Confirm remove?'
+                      : 'Remove'}
                 </button>
               </div>
 

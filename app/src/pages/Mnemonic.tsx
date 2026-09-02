@@ -32,6 +32,7 @@ const Mnemonic = () => {
   // Import mode state
   const [importWords, setImportWords] = useState<string[]>(Array(IMPORT_SLOTS_INITIAL).fill(''));
   const [importValid, setImportValid] = useState<boolean | null>(null);
+  const [importOverflowWarning, setImportOverflowWarning] = useState<string | null>(null);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   useEffect(() => {
@@ -46,6 +47,7 @@ const Mnemonic = () => {
     setConfirmed(false);
     setError(null);
     setImportValid(null);
+    setImportOverflowWarning(null);
     setImportWords(Array(IMPORT_SLOTS_INITIAL).fill(''));
   }, [mode]);
 
@@ -60,9 +62,9 @@ const Mnemonic = () => {
       textarea.style.opacity = '0';
       document.body.appendChild(textarea);
       textarea.select();
-      document.execCommand('copy');
+      const ok = document.execCommand('copy');
       document.body.removeChild(textarea);
-      setCopied(true);
+      if (ok) setCopied(true);
     }
   }, [mnemonic]);
 
@@ -84,6 +86,16 @@ const Mnemonic = () => {
         }
         setImportWords(newWords);
         setImportValid(null);
+        if (pastedWords.length > slotCount - index) {
+          const dropped = pastedWords.length - (slotCount - index);
+          setImportOverflowWarning(
+            `${pastedWords.length} words pasted, but only ${slotCount - index} fit — ${dropped} extra ${
+              dropped === 1 ? 'word was' : 'words were'
+            } dropped. Paste into an empty field to import the full phrase.`
+          );
+        } else {
+          setImportOverflowWarning(null);
+        }
         const nextEmpty = newWords.findIndex(w => !w);
         const focusIndex = nextEmpty === -1 ? slotCount - 1 : nextEmpty;
         inputRefs.current[focusIndex]?.focus();
@@ -293,6 +305,7 @@ const Mnemonic = () => {
                         ref={el => {
                           inputRefs.current[index] = el;
                         }}
+                        aria-label={`Recovery phrase word ${index + 1}`}
                         type="text"
                         value={word}
                         onChange={e => handleImportWordChange(index, e.target.value)}
@@ -311,6 +324,15 @@ const Mnemonic = () => {
                   ))}
                 </div>
               </div>
+
+              {/* Overflow warning — extra pasted words were dropped */}
+              {importOverflowWarning && (
+                <div
+                  role="alert"
+                  className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-center text-xs text-amber-800 leading-relaxed">
+                  {importOverflowWarning}
+                </div>
+              )}
 
               {/* Validation status */}
               {importValid === true && (

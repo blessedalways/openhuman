@@ -182,6 +182,14 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
   const [inlineSuggestionValue, setInlineSuggestionValue] = useState('');
   const [sendError, setSendError] = useState<ChatSendError | null>(null);
   const [sendAdvisory, setSendAdvisory] = useState<string | null>(null);
+  // Set when the mount-time thread list load fails so the sidebar can show a
+  // retry instead of a misleading "No threads yet" empty state.
+  const [threadsLoadError, setThreadsLoadError] = useState<string | null>(null);
+  const [isCreatingThread, setIsCreatingThread] = useState(false);
+  // Synchronous double-click guard for New Thread: the state above only
+  // drives the disabled visuals and is batched, so a fast second click in
+  // the same tick would otherwise create two threads.
+  const creatingThreadRef = useRef(false);
   const socketStatus = useAppSelector(selectSocketStatus);
   const toolTimelineByThread = useAppSelector(state => state.chatRuntime.toolTimelineByThread);
   const inferenceStatusByThread = useAppSelector(
@@ -231,6 +239,10 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
   // from `selectedThreadId` so switching threads mid-turn doesn't move the
   // timer's reference point.
   const sendingThreadIdRef = useRef<string | null>(null);
+  // Synchronous double-send guard. `activeThreadId` (which normally blocks a
+  // second send) is only set after the local message persists, so a fast
+  // double Enter/click inside that window would otherwise enqueue two turns.
+  const sendInFlightRef = useRef(false);
 
   const getAudioExtension = (mimeType: string): string => {
     const lower = mimeType.toLowerCase();
@@ -246,9 +258,36 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
     typeof navigator.mediaDevices.getUserMedia === 'function';
 
   const handleCreateNewThread = async () => {
-    const thread = await dispatch(createNewThread()).unwrap();
-    dispatch(setSelectedThread(thread.id));
-    void dispatch(loadThreadMessages(thread.id));
+    if (creatingThreadRef.current) return;
+    creatingThreadRef.current = true;
+    setIsCreatingThread(true);
+    try {
+      const thread = await dispatch(createNewThread()).unwrap();
+      dispatch(setSelectedThread(thread.id));
+      void dispatch(loadThreadMessages(thread.id));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSendError(
+        chatSendError('thread_create_failed', `Couldn't create a new conversation: ${message}`)
+      );
+    } finally {
+      creatingThreadRef.current = false;
+      setIsCreatingThread(false);
+    }
+  };
+
+  const handleRetryLoadThreads = async () => {
+    setThreadsLoadError(null);
+    try {
+      const data = await dispatch(loadThreads()).unwrap();
+      if (!selectedThreadId && data.threads.length > 0) {
+        dispatch(setSelectedThread(data.threads[0].id));
+        void dispatch(loadThreadMessages(data.threads[0].id));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setThreadsLoadError(`Couldn't load your conversations: ${message}`);
+    }
   };
 
   useEffect(() => {
@@ -288,6 +327,12 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
         } else {
           void handleCreateNewThread();
         }
+      })
+      .catch(error => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        console.debug('[chat] initial loadThreads failed: %s', message);
+        setThreadsLoadError(`Couldn't load your conversations: ${message}`);
       });
 
     return () => {
@@ -545,6 +590,8 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
 
     const sendingThreadId = selectedThreadId;
     if (!sendingThreadId) return;
+    if (sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
     const userMessage: ThreadMessage = {
       id: `msg_${globalThis.crypto.randomUUID()}`,
       content: trimmed,
@@ -557,6 +604,7 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
     try {
       await dispatch(addMessageLocal({ threadId: sendingThreadId, message: userMessage })).unwrap();
     } catch (error) {
+      sendInFlightRef.current = false;
       const msg = error instanceof Error ? error.message : String(error);
       setSendError(chatSendError('cloud_send_failed', msg));
       return;
@@ -603,6 +651,8 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
       }
       dispatch(clearRuntimeForThread({ threadId: sendingThreadId }));
       dispatch(setActiveThread(null));
+    } finally {
+      sendInFlightRef.current = false;
     }
   };
 
@@ -991,7 +1041,8 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
             {/* [#1123] welcomeLocked guard removed — always show new thread button */}
             <button
               onClick={() => void handleCreateNewThread()}
-              className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-stone-100 text-stone-500 hover:text-stone-700 transition-colors"
+              disabled={isCreatingThread}
+              className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-stone-100 text-stone-500 hover:text-stone-700 transition-colors disabled:opacity-40 disabled:pointer-events-none"
               title="New thread">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path
@@ -1013,7 +1064,17 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
             />
           </div>
           <div className="flex-1 overflow-y-auto">
-            {sortedThreads.length === 0 ? (
+            {threadsLoadError ? (
+              <div className="mx-3 mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5">
+                <p className="text-xs leading-relaxed text-amber-800">{threadsLoadError}</p>
+                <button
+                  type="button"
+                  onClick={() => void handleRetryLoadThreads()}
+                  className="mt-1.5 text-xs font-medium text-amber-800 underline hover:text-amber-900">
+                  Retry
+                </button>
+              </div>
+            ) : sortedThreads.length === 0 ? (
               <p className="px-4 py-6 text-xs text-stone-400 text-center">
                 {selectedLabel === 'all' ? 'No threads yet' : `No "${selectedLabel}" threads`}
               </p>
@@ -1135,7 +1196,8 @@ const Conversations = ({ variant = 'page', composer = 'text' }: ConversationsPro
               <TokenUsagePill />
               <button
                 onClick={() => void handleCreateNewThread()}
-                className="px-2.5 py-1 rounded-lg text-xs font-medium text-primary-600 hover:bg-primary-50 transition-colors"
+                disabled={isCreatingThread}
+                className="px-2.5 py-1 rounded-lg text-xs font-medium text-primary-600 hover:bg-primary-50 transition-colors disabled:opacity-40 disabled:pointer-events-none"
                 title="New thread (/new)">
                 + New
               </button>

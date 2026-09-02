@@ -29,14 +29,15 @@ export default function VoiceSetupModal({ onClose, skillStatus }: Props) {
   const [isEnabling, setIsEnabling] = useState(false);
   const [enableError, setEnableError] = useState<string | null>(null);
 
-  // Close on Escape key
+  // Close on Escape key (blocked while an enable is in flight so the
+  // outcome isn't lost mid-operation).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (!isEnabling && e.key === 'Escape') onClose();
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  }, [onClose, isEnabling]);
 
   const handleEnable = async () => {
     setIsEnabling(true);
@@ -68,7 +69,7 @@ export default function VoiceSetupModal({ onClose, skillStatus }: Props) {
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
       onClick={e => {
-        if (e.target === e.currentTarget) onClose();
+        if (!isEnabling && e.target === e.currentTarget) onClose();
       }}>
       <div
         role="dialog"
@@ -99,7 +100,9 @@ export default function VoiceSetupModal({ onClose, skillStatus }: Props) {
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={() => {
+              if (!isEnabling) onClose();
+            }}
             className="w-7 h-7 rounded-lg flex items-center justify-center text-stone-400 hover:text-stone-600 hover:bg-stone-100 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
