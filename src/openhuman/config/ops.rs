@@ -253,6 +253,37 @@ pub struct RuntimeFlagsOut {
     pub log_prompts: bool,
 }
 
+/// Normalize a user-supplied `api_url` before persisting it.
+///
+/// `config.api_url` backs both the hosted-backend base URL (which appends
+/// `/auth/...` etc.) and the LLM inference base URL. Older builds persisted
+/// the OpenHuman provider preset (the full hosted `/chat/completions`
+/// endpoint) verbatim, which breaks the backend base URL. The hosted backend
+/// uses session auth — no custom URL is ever valid for it — so map the known
+/// backend hosts back to unset. Custom provider URLs are preserved as-is.
+fn normalize_saved_api_url(api_url: String) -> Option<String> {
+    let trimmed = api_url.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let is_hosted_backend_endpoint = reqwest::Url::parse(&trimmed).is_ok_and(|url| {
+        matches!(
+            url.host_str(),
+            Some("api.tinyhumans.ai") | Some("staging-api.tinyhumans.ai")
+        ) && url
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/chat/completions")
+    });
+    if is_hosted_backend_endpoint {
+        log::warn!(
+            "[config] api_url pointed at the hosted OpenHuman inference endpoint; resetting to session-based backend"
+        );
+        return None;
+    }
+    Some(trimmed)
+}
+
 /// Returns a full configuration snapshot for the UI.
 pub async fn get_config_snapshot(config: &Config) -> Result<RpcOutcome<serde_json::Value>, String> {
     let snapshot = snapshot_config_json(config)?;
@@ -271,11 +302,7 @@ pub async fn apply_model_settings(
     update: ModelSettingsPatch,
 ) -> Result<RpcOutcome<serde_json::Value>, String> {
     if let Some(api_url) = update.api_url {
-        config.api_url = if api_url.trim().is_empty() {
-            None
-        } else {
-            Some(api_url)
-        };
+        config.api_url = normalize_saved_api_url(api_url);
     }
     if let Some(api_key) = update.api_key {
         let trimmed_key = api_key.trim();

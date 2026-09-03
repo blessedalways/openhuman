@@ -98,6 +98,49 @@ pub fn sanitize_api_error(input: &str) -> String {
 
 const TRANSPORT_ERROR_MAX_CHARS: usize = 1200;
 
+/// Map a transport error chain to an actionable user hint, if recognized.
+///
+/// Windows 11 users behind TLS-intercepting software (antivirus, corporate
+/// proxies) or required system proxies historically saw every provider fail
+/// with an opaque "error sending request" message. Recognize the common
+/// signatures so the surfaced error points at the actual fix.
+fn transport_error_hint(chain: &str) -> Option<&'static str> {
+    let lowered = chain.to_ascii_lowercase();
+
+    // rustls / native-tls verification failures. The core trusts the OS
+    // certificate store, so this usually means the interceptor's root CA is
+    // not installed (or an old app build without OS-store trust).
+    if lowered.contains("certificate")
+        || lowered.contains("unknownissuer")
+        || lowered.contains("handshake failure")
+    {
+        return Some(
+            "TLS certificate verification failed. If antivirus, a VPN, or a corporate proxy \
+             intercepts HTTPS (common on Windows), install its root certificate into the OS \
+             certificate store or disable its HTTPS scanning, then retry.",
+        );
+    }
+
+    // reqwest/hyper surface proxy failures with the proxy URL in the chain.
+    if lowered.contains("proxy") {
+        return Some(
+            "A network proxy is configured but the connection through it failed. Check your \
+             system proxy settings or the app's proxy_config, and make sure the proxy is \
+             reachable.",
+        );
+    }
+
+    None
+}
+
+/// Append [`transport_error_hint`] to a scrubbed chain, when one matches.
+fn with_transport_hint(scrubbed: String, chain: &str) -> String {
+    match transport_error_hint(chain) {
+        Some(hint) if !scrubbed.contains(hint) => format!("{scrubbed} — Hint: {hint}"),
+        _ => scrubbed,
+    }
+}
+
 /// Full `source()` chain for connection / TLS failures (scrubbed, longer than API body snippets).
 pub fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut parts: Vec<String> = vec![err.to_string()];
@@ -108,6 +151,7 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
     }
     let joined = parts.join(" | ");
     let scrubbed = scrub_secret_patterns(&joined);
+    let scrubbed = with_transport_hint(scrubbed, &joined);
     if scrubbed.chars().count() <= TRANSPORT_ERROR_MAX_CHARS {
         return scrubbed;
     }
@@ -126,6 +170,7 @@ pub fn format_anyhow_chain(err: &anyhow::Error) -> String {
         .collect::<Vec<_>>()
         .join(" | ");
     let scrubbed = scrub_secret_patterns(&joined);
+    let scrubbed = with_transport_hint(scrubbed, &joined);
     if scrubbed.chars().count() <= TRANSPORT_ERROR_MAX_CHARS {
         return scrubbed;
     }
@@ -366,5 +411,55 @@ mod tests {
             create_backend_inference_provider(None, None, &ProviderRuntimeOptions::default())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn transport_hint_matches_certificate_failures() {
+        let chain = "error sending request for url (https://api.openai.com/v1/chat/completions) \
+                     | invalid peer certificate: UnknownIssuer";
+        assert!(transport_error_hint(chain)
+            .unwrap()
+            .contains("TLS certificate"));
+        assert!(transport_error_hint("bad certificate: verify failed")
+            .unwrap()
+            .contains("OS"));
+        assert!(transport_error_hint("error sending request | handshake failure").is_some());
+    }
+
+    #[test]
+    fn transport_hint_matches_proxy_failures() {
+        let chain = "error sending request for url (https://openrouter.ai/api/v1) | connect error \
+             | proxy CONNECT tunnel failed";
+        assert!(transport_error_hint(chain).unwrap().contains("proxy"));
+    }
+
+    #[test]
+    fn transport_hint_ignores_unrelated_errors() {
+        assert!(transport_error_hint("401 Unauthorized: bad api key").is_none());
+        assert!(transport_error_hint("connection refused (os error 111)").is_none());
+    }
+
+    #[test]
+    fn format_error_chain_appends_certificate_hint() {
+        #[derive(Debug)]
+        struct FakeTransport;
+        impl std::fmt::Display for FakeTransport {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "invalid peer certificate: UnknownIssuer")
+            }
+        }
+        impl std::error::Error for FakeTransport {}
+
+        let formatted = format_error_chain(&FakeTransport);
+        assert!(formatted.contains("UnknownIssuer"));
+        assert!(formatted.contains("Hint:"));
+        assert!(formatted.contains("antivirus, a VPN, or a corporate proxy"));
+    }
+
+    #[test]
+    fn format_anyhow_chain_leaves_api_errors_unhinted() {
+        let err = anyhow::anyhow!("openrouter API error (401): invalid credentials");
+        let formatted = format_anyhow_chain(&err);
+        assert!(!formatted.contains("Hint:"));
     }
 }

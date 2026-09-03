@@ -19,12 +19,44 @@ pub const VITE_APP_ENV_VAR: &str = "VITE_OPENHUMAN_APP_ENV";
 ///    [`DEFAULT_STAGING_API_BASE_URL`], otherwise [`DEFAULT_API_BASE_URL`]
 pub fn effective_api_url(api_url: &Option<String>) -> String {
     if let Some(u) = api_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        return normalize_api_base_url(u);
+        return normalize_api_base_url(&strip_inference_endpoint_path(u));
     }
     if let Some(env_url) = api_base_from_env() {
         return env_url;
     }
     default_api_base_url_for_env(app_env_from_env().as_deref()).to_string()
+}
+
+/// Strip an LLM inference endpoint path from a backend base URL.
+///
+/// `config.api_url` is shared by two consumers: the hosted-backend base URL
+/// (this module appends `/auth/...` etc.) and the LLM inference base URL.
+/// The provider presets store full `/chat/completions` endpoint URLs, and
+/// older builds persisted the OpenHuman preset verbatim, poisoning every
+/// backend call with a doubled path. A `/chat/completions` suffix is always
+/// an inference endpoint here, never a valid backend base — collapse it to
+/// the host root so backend calls resolve again.
+fn strip_inference_endpoint_path(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+
+    let is_inference_endpoint = parsed
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/chat/completions");
+    if !is_inference_endpoint {
+        return url.to_string();
+    }
+
+    let host = parsed.host_str().unwrap_or_default();
+    match (parsed.scheme(), host) {
+        (scheme, host) if !host.is_empty() => match parsed.port() {
+            Some(port) => format!("{scheme}://{host}:{port}"),
+            None => format!("{scheme}://{host}"),
+        },
+        _ => url.to_string(),
+    }
 }
 
 /// Trim and strip trailing slashes so paths join consistently.
@@ -124,6 +156,29 @@ mod tests {
             DEFAULT_STAGING_API_BASE_URL
         );
         assert!(is_staging_app_env(Some("STAGING")));
+    }
+
+    #[test]
+    fn effective_api_url_strips_inference_endpoint_path() {
+        // Regression: the OpenHuman provider preset used to persist the full
+        // hosted `/chat/completions` endpoint into `api_url`, poisoning every
+        // backend call (which appends `/auth/...` to this base).
+        let url = Some("https://api.tinyhumans.ai/openai/v1/chat/completions".to_string());
+        assert_eq!(effective_api_url(&url), "https://api.tinyhumans.ai");
+
+        let url = Some("https://staging-api.tinyhumans.ai/openai/v1/chat/completions/".to_string());
+        assert_eq!(effective_api_url(&url), "https://staging-api.tinyhumans.ai");
+    }
+
+    #[test]
+    fn effective_api_url_keeps_non_endpoint_paths() {
+        // Bases with deliberate path prefixes (reverse proxies) stay intact —
+        // only the `/chat/completions` endpoint shape is collapsed.
+        let url = Some("https://backend.example.test/api/".to_string());
+        assert_eq!(effective_api_url(&url), "https://backend.example.test/api");
+
+        let url = Some("https://backend.example.test".to_string());
+        assert_eq!(effective_api_url(&url), "https://backend.example.test");
     }
 
     #[test]

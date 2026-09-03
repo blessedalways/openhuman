@@ -65,7 +65,11 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: 'openhuman',
     label: 'OpenHuman',
-    apiUrl: 'https://api.tinyhumans.ai/openai/v1/chat/completions',
+    // Must stay empty: `config.api_url` also drives the hosted-backend base
+    // URL (auth/socket calls append `/auth/...` to it), and the core infers
+    // the session-based backend from an unset api_url. Persisting the full
+    // `/chat/completions` endpoint breaks every backend call.
+    apiUrl: '',
     suggestedModel: '',
     roleModels: null,
     note: 'Hosted OpenHuman backend — uses your signed-in session, no API key required.',
