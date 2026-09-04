@@ -3,7 +3,7 @@ name: Build Windows
 on:
   workflow_dispatch:
   push:
-    branches: [fix/windows]
+    branches: [fix/windows, hoplite/hermion-84b28abe]
 permissions:
   contents: read
 concurrency:
