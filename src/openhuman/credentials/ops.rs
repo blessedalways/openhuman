@@ -15,7 +15,7 @@ use crate::rpc::RpcOutcome;
 use super::{AuthService, APP_SESSION_PROVIDER, DEFAULT_AUTH_PROFILE_NAME};
 use crate::openhuman::config::{
     default_root_openhuman_dir, pre_login_user_dir, read_active_user_id, user_openhuman_dir,
-    write_active_user_id,
+    write_active_user_id, PRE_LOGIN_USER_ID,
 };
 use crate::openhuman::memory::conversations;
 
@@ -261,6 +261,80 @@ pub async fn store_session(
     // Start all login-gated services (voice, autocomplete, screen
     // intelligence, local AI). Uses the effective config so services see
     // the user-scoped workspace directory.
+    start_login_gated_services(&effective_config).await;
+    logs.push("login-gated services started".to_string());
+
+    Ok(RpcOutcome::new(summarize_auth_profile(&profile), logs))
+}
+
+/// Start a local-only session — no cloud account, no network validation.
+///
+/// Local-first mode: the session token is minted locally, the pre-login
+/// (`users/local`) directory is activated as the user-scoped root, and the
+/// login-gated services (local AI, voice, screen intelligence, autocomplete)
+/// start immediately. Cloud-backed features (teams, OAuth integrations,
+/// hosted inference) simply remain unavailable until a real account is
+/// linked via the normal sign-in flow. Upgrading to an account later keeps
+/// local threads: the pre-login purge in `store_session` only runs when no
+/// active user was set before.
+pub async fn store_local_session(
+    config: &Config,
+    display_name: Option<String>,
+) -> Result<RpcOutcome<super::responses::AuthProfileSummary>, String> {
+    let token = format!("local-{}", uuid::Uuid::new_v4());
+    let name = display_name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    let user = serde_json::json!({
+        "id": PRE_LOGIN_USER_ID,
+        "name": name.unwrap_or_else(|| "Local user".to_string()),
+        "local_only": true,
+    });
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("user_id".to_string(), PRE_LOGIN_USER_ID.to_string());
+    metadata.insert("user_json".to_string(), user.to_string());
+
+    let mut logs = vec!["local session started (no cloud account)".to_string()];
+
+    // Activate the pre-login (`users/local`) directory as the scoped root so
+    // config, credentials, and threads resolve locally.
+    if let Ok(root_dir) = default_root_openhuman_dir() {
+        let user_dir = user_openhuman_dir(&root_dir, PRE_LOGIN_USER_ID);
+        if let Err(e) = std::fs::create_dir_all(&user_dir) {
+            tracing::warn!(error = %e, "failed to create local user directory");
+        } else if let Err(e) = write_active_user_id(&root_dir, PRE_LOGIN_USER_ID) {
+            tracing::warn!(error = %e, "failed to write active_user.toml for local session");
+        } else {
+            logs.push("local user directory activated".to_string());
+            tracing::info!(
+                user_dir = %user_dir.display(),
+                "Local-only session directory activated"
+            );
+        }
+    }
+
+    // Reload config so it picks up the newly activated user directory.
+    let effective_config = match crate::openhuman::config::load_config_with_timeout().await {
+        Ok(c) => c,
+        Err(_) => config.clone(),
+    };
+
+    let auth = AuthService::from_config(&effective_config);
+    let profile = auth
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            &token,
+            metadata,
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+    logs.push("local session stored".to_string());
+
+    if let Err(e) = crate::openhuman::subconscious::global::bootstrap_after_login().await {
+        tracing::warn!(error = %e, "[subconscious] post-login bootstrap failed for local session");
+    }
     start_login_gated_services(&effective_config).await;
     logs.push("login-gated services started".to_string());
 

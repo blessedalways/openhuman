@@ -342,6 +342,29 @@ describe('Mnemonic — import mode: word input', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Import mode — paste overflow feedback
+// ---------------------------------------------------------------------------
+
+describe('Mnemonic — import mode: paste overflow feedback', () => {
+  it('warns when pasting more words than the grid fits instead of silently dropping them', () => {
+    renderWithUser();
+    switchToImport();
+    const inputs = screen.getAllByRole('textbox');
+    fireEvent.change(inputs[0], { target: { value: `${FIXED_MNEMONIC} extra` } });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/25 words pasted, but only 24 fit/i);
+  });
+
+  it('shows no warning when the pasted phrase matches an allowed length', () => {
+    renderWithUser();
+    switchToImport();
+    fillAllImportWords();
+
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Import mode — keyboard navigation
 // ---------------------------------------------------------------------------
 

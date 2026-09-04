@@ -65,7 +65,11 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: 'openhuman',
     label: 'OpenHuman',
-    apiUrl: 'https://api.tinyhumans.ai/openai/v1/chat/completions',
+    // Must stay empty: `config.api_url` also drives the hosted-backend base
+    // URL (auth/socket calls append `/auth/...` to it), and the core infers
+    // the session-based backend from an unset api_url. Persisting the full
+    // `/chat/completions` endpoint breaks every backend call.
+    apiUrl: '',
     suggestedModel: '',
     roleModels: null,
     note: 'Hosted OpenHuman backend — uses your signed-in session, no API key required.',
@@ -147,6 +151,21 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
       idle: 'border-stone-200 hover:border-stone-400 hover:bg-stone-50',
       selected: 'border-stone-500 bg-stone-200 ring-2 ring-stone-300 text-stone-900',
       dot: 'bg-stone-500',
+    },
+  },
+  {
+    id: 'llamacpp',
+    label: 'llama.cpp (local)',
+    // llama-server's OpenAI-compatible endpoint; 127.0.0.1 avoids Windows
+    // resolving `localhost` to an unused IPv6 address.
+    apiUrl: 'http://127.0.0.1:8080/v1/chat/completions',
+    suggestedModel: '',
+    roleModels: { ...EMPTY_ROLE_MODELS },
+    note: 'Connect to a running llama.cpp llama-server (default port 8080, e.g. `llama-server -m model.gguf --port 8080`). No API key needed — the loaded model is used.',
+    tint: {
+      idle: 'border-stone-200 hover:border-stone-400 hover:bg-stone-50',
+      selected: 'border-stone-500 bg-stone-200 ring-2 ring-stone-300 text-stone-900',
+      dot: 'bg-stone-400',
     },
   },
   {

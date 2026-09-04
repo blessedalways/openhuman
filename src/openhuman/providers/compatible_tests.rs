@@ -37,17 +37,31 @@ fn strips_trailing_slash() {
     assert_eq!(p.base_url, "https://example.com");
 }
 
-#[tokio::test]
-async fn chat_fails_without_key() {
-    let p = make_provider("Venice", "https://api.venice.ai", None);
-    let result = p
-        .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
-        .await;
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Venice API key not set"));
+#[test]
+fn auth_header_skipped_without_key() {
+    // Local servers (Ollama, llama.cpp, vLLM) run without API keys — the
+    // request must go out without an auth header instead of erroring.
+    let p = make_provider("LocalLLM", "http://127.0.0.1:8080", None);
+    let request = p
+        .apply_auth_header(
+            reqwest::Client::new().get("http://127.0.0.1:8080/v1/chat/completions"),
+            None,
+        )
+        .build()
+        .expect("build request");
+    assert!(!request.headers().contains_key("authorization"));
+
+    let request = p
+        .apply_auth_header(
+            reqwest::Client::new().get("http://127.0.0.1:8080/v1/chat/completions"),
+            Some("sk-local-test"),
+        )
+        .build()
+        .expect("build request");
+    assert_eq!(
+        request.headers().get("authorization").unwrap(),
+        "Bearer sk-local-test"
+    );
 }
 
 #[test]
@@ -248,25 +262,57 @@ fn custom_auth_style() {
     assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
 }
 
-#[tokio::test]
-async fn all_compatible_providers_fail_without_key() {
+#[test]
+fn all_compatible_providers_skip_auth_without_key() {
+    // Key-less providers must send requests without auth headers (no error),
+    // regardless of the auth style the provider would use with a key.
     let providers = vec![
-        make_provider("Venice", "https://api.venice.ai", None),
-        make_provider("Moonshot", "https://api.moonshot.cn", None),
-        make_provider("GLM", "https://open.bigmodel.cn", None),
-        make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
-        make_provider("Groq", "https://api.groq.com/openai", None),
-        make_provider("Mistral", "https://api.mistral.ai", None),
-        make_provider("xAI", "https://api.x.ai", None),
-        make_provider("Astrai", "https://as-trai.com/v1", None),
+        (
+            make_provider("Venice", "https://api.venice.ai", None),
+            "Bearer",
+        ),
+        (
+            make_provider("Moonshot", "https://api.moonshot.cn", None),
+            "Bearer",
+        ),
+        (
+            OpenAiCompatibleProvider::new(
+                "MiniMax",
+                "https://api.minimaxi.com/v1",
+                None,
+                AuthStyle::XApiKey,
+            ),
+            "x-api-key",
+        ),
+        (
+            OpenAiCompatibleProvider::new(
+                "custom",
+                "https://api.example.com",
+                None,
+                AuthStyle::Custom("X-Custom-Key".into()),
+            ),
+            "X-Custom-Key",
+        ),
     ];
 
-    for p in providers {
-        let result = p.chat_with_system(None, "test", "model", 0.7).await;
-        assert!(result.is_err(), "{} should fail without key", p.name);
+    for (p, header_name) in providers {
+        let request = p
+            .apply_auth_header(
+                reqwest::Client::new().get("http://127.0.0.1:8080/v1/chat/completions"),
+                None,
+            )
+            .build()
+            .expect("build request");
         assert!(
-            result.unwrap_err().to_string().contains("API key not set"),
-            "{} error should mention key",
+            !request.headers().contains_key("authorization"),
+            "{} should not send Authorization without key",
+            p.name
+        );
+        assert!(
+            !request
+                .headers()
+                .contains_key(header_name.to_lowercase().as_str()),
+            "{} should not send auth header without key",
             p.name
         );
     }
@@ -917,30 +963,19 @@ fn response_with_multiple_tool_calls() {
     );
 }
 
-#[tokio::test]
-async fn chat_with_tools_fails_without_key() {
-    let p = make_provider("TestProvider", "https://example.com", None);
-    let messages = vec![ChatMessage {
-        id: None,
-        role: "user".to_string(),
-        content: "hello".to_string(),
-        extra_metadata: None,
-    }];
-    let tools = vec![serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "test_tool",
-            "description": "A test tool",
-            "parameters": {}
-        }
-    })];
-
-    let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("TestProvider API key not set"));
+#[test]
+fn chat_with_tools_without_key_sends_no_auth_header() {
+    // Regression of the old contract: key-less providers no longer fail with
+    // "API key not set" — the request goes out without auth (local servers).
+    let p = make_provider("TestProvider", "http://127.0.0.1:8080", None);
+    let request = p
+        .apply_auth_header(
+            reqwest::Client::new().post("http://127.0.0.1:8080/v1/chat/completions"),
+            None,
+        )
+        .build()
+        .expect("build request");
+    assert!(!request.headers().contains_key("authorization"));
 }
 
 #[test]

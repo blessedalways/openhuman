@@ -129,6 +129,10 @@ describe('BackendProviderPanel', () => {
     const args = vi.mocked(openhumanUpdateModelSettings).mock.calls[0][0];
     expect(args.model_routes).toEqual([]);
     expect(args.api_key).toBeUndefined();
+    // Regression: the OpenHuman preset must NOT persist the hosted
+    // `/chat/completions` endpoint — an empty api_url keeps the core on the
+    // session-based backend and leaves the backend base URL intact.
+    expect(args.api_url).toBe('');
   });
 
   it('omits all touched fields on Save when nothing was edited (post failed-load safety)', async () => {

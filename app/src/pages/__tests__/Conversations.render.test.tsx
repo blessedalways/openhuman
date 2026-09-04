@@ -671,3 +671,157 @@ describe('Conversations — smoke render (#1123 welcome-lock removal)', () => {
     });
   });
 });
+
+describe('Conversations — composer robustness papercuts', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetThreads.mockResolvedValue({ threads: [], count: 0 });
+    mockGetThreadMessages.mockResolvedValue({ messages: [], count: 0 });
+    mockUseUsageState.mockReturnValue({
+      teamUsage: null,
+      currentPlan: null,
+      currentTier: 'FREE' as const,
+      isFreeTier: true,
+      usagePct10h: 0,
+      usagePct7d: 0,
+      isNearLimit: false,
+      isAtLimit: false,
+      isRateLimited: false,
+      isBudgetExhausted: false,
+      shouldShowBudgetCompletedMessage: false,
+      isLoading: false,
+      refresh: vi.fn(),
+    });
+  });
+
+  it('enqueues only one agent turn when send is triggered again mid-flight', async () => {
+    const { textarea } = await renderSelectedConversation();
+
+    let resolveAppend!: (value: unknown) => void;
+    vi.mocked(threadApi.appendMessage).mockReturnValue(
+      new Promise(resolve => {
+        resolveAppend = resolve;
+      }) as never
+    );
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'hello twice' } });
+    });
+    await act(async () => {
+      // Two Enter keydowns land before the message persistence resolves —
+      // the synchronous in-flight guard must let only one through.
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+    });
+
+    expect(threadApi.appendMessage).toHaveBeenCalledTimes(1);
+    expect(chatSend).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveAppend({});
+    });
+    await waitFor(() => {
+      expect(chatSend).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('shows a retry banner when the initial thread list load fails', async () => {
+    mockGetThreads.mockRejectedValue(new Error('backend down'));
+
+    await act(async () => {
+      await renderConversations({ thread: emptyThreadState, socket: socketState('connected') });
+    });
+
+    expect(await screen.findByText(/Couldn't load your conversations/i)).toBeInTheDocument();
+  });
+
+  it('recovers from a failed thread list load via Retry', async () => {
+    mockGetThreads.mockRejectedValueOnce(new Error('backend down'));
+    const thread = makeThread({ id: 't-9', title: 'Recovered Thread' });
+    mockGetThreads.mockResolvedValueOnce({ threads: [thread], count: 1 });
+
+    await act(async () => {
+      await renderConversations({ thread: emptyThreadState, socket: socketState('connected') });
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Recovered Thread').length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText(/Couldn't load your conversations/i)).not.toBeInTheDocument();
+  });
+
+  it('surfaces an error when auto-creating a first conversation fails', async () => {
+    mockGetThreads.mockResolvedValue({ threads: [], count: 0 });
+    vi.mocked(threadApi.createNewThread).mockRejectedValue(new Error('server exploded'));
+
+    await act(async () => {
+      await renderConversations({ thread: emptyThreadState, socket: socketState('connected') });
+    });
+
+    expect(await screen.findByText(/Couldn't create a new conversation/i)).toBeInTheDocument();
+  });
+
+  it('creates only one thread when New Thread is clicked twice in a row', async () => {
+    vi.mocked(threadApi.createNewThread).mockReturnValue(new Promise(() => {}));
+    mockGetThreads.mockReturnValue(new Promise(() => {}));
+
+    await act(async () => {
+      await renderConversations({ thread: emptyThreadState, socket: socketState('connected') });
+    });
+
+    const newBtn = screen.getByRole('button', { name: 'New thread' });
+    await act(async () => {
+      fireEvent.click(newBtn);
+      fireEvent.click(newBtn);
+    });
+
+    expect(threadApi.createNewThread).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a send error and clears the in-flight guard when the local save fails', async () => {
+    const { textarea, thread } = await renderSelectedConversation();
+    vi.mocked(threadApi.appendMessage).mockRejectedValueOnce(new Error('persist failed'));
+
+    await submitComposerText(textarea, 'will fail');
+
+    // The save failed, so the turn was never sent — but the attempt happened.
+    expect(threadApi.appendMessage).toHaveBeenCalledWith(
+      thread.id,
+      expect.objectContaining({ content: 'will fail', sender: 'user' })
+    );
+    expect(chatSend).not.toHaveBeenCalled();
+
+    // The guard must have been released so a retry actually sends.
+    vi.mocked(threadApi.appendMessage).mockResolvedValue({
+      id: 'persisted-1',
+      content: 'works now',
+      type: 'text',
+      extraMetadata: {},
+      sender: 'user',
+      createdAt: new Date().toISOString(),
+    });
+    await submitComposerText(textarea, 'works now');
+    await waitFor(() => {
+      expect(chatSend).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('keeps the retry banner when the retry load fails again', async () => {
+    mockGetThreads.mockRejectedValueOnce(new Error('first down'));
+    mockGetThreads.mockRejectedValueOnce(new Error('still down'));
+
+    await act(async () => {
+      await renderConversations({ thread: emptyThreadState, socket: socketState('connected') });
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+    });
+
+    expect(await screen.findByText(/still down/i)).toBeInTheDocument();
+  });
+});

@@ -47,3 +47,40 @@ describe('RecoveryPhrasePanel — trust-surface polish', () => {
     expect(container).toBeTruthy();
   });
 });
+
+describe('RecoveryPhrasePanel — paste overflow feedback', () => {
+  const TWELVE_WORDS =
+    'abandon ability able about above absent absorb abstract absurd abuse access accident';
+
+  function openImportMode() {
+    renderWithProviders(<RecoveryPhrasePanel />);
+    fireEvent.click(screen.getByText(/I already have a recovery phrase/i));
+    return screen.getByLabelText('Recovery phrase word 1');
+  }
+
+  it('warns when pasting more words than the grid fits instead of silently dropping them', () => {
+    const firstInput = openImportMode();
+    fireEvent.change(firstInput, {
+      target: { value: `${TWELVE_WORDS} extra` }, // 13 words into 12 slots
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/13 words pasted, but only 12 fit/i);
+  });
+
+  it('shows no warning when the pasted phrase matches an allowed length', () => {
+    const firstInput = openImportMode();
+    fireEvent.change(firstInput, { target: { value: TWELVE_WORDS } });
+
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clears the overflow warning when the word count selection changes', () => {
+    const firstInput = openImportMode();
+    fireEvent.change(firstInput, { target: { value: `${TWELVE_WORDS} extra` } });
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '24' }));
+
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});

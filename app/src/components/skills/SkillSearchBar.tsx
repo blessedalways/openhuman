@@ -30,12 +30,15 @@ export default function SkillSearchBar({
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
+        aria-label="Search skills"
         className="w-full rounded-xl border border-stone-200 bg-white py-2 pl-9 pr-9 text-sm text-stone-900 placeholder-stone-400 focus:border-primary-300 focus:outline-none focus:ring-1 focus:ring-primary-200"
       />
       {value && (
         <button
           type="button"
           onClick={() => onChange('')}
+          aria-label="Clear search"
+          title="Clear search"
           className="absolute inset-y-0 right-3 flex items-center text-stone-400 hover:text-stone-600">
           <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -119,8 +119,11 @@ describe('ScreenIntelligenceSetupModal', () => {
     render(<ScreenIntelligenceSetupModal onClose={onClose} />);
 
     screen.getByText('Close', { selector: 'button' }).click();
-
     expect(onClose).toHaveBeenCalledTimes(1);
+
+    // Backdrop click closes too on the unsupported screen.
+    fireEvent.click(document.querySelectorAll('.fixed.inset-0')[0]);
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 
   it('renders the permissions setup flow when platform_supported is true', () => {
@@ -133,5 +136,54 @@ describe('ScreenIntelligenceSetupModal', () => {
     expect(screen.getByText('Accessibility')).toBeInTheDocument();
     expect(screen.getByText('Input Monitoring')).toBeInTheDocument();
     expect(screen.queryByText(/macOS only/i)).not.toBeInTheDocument();
+  });
+
+  it('closes on Escape, backdrop, or X while idle', () => {
+    const onClose = vi.fn();
+    vi.mocked(useScreenIntelligenceState).mockReturnValue(baseState);
+
+    render(<ScreenIntelligenceSetupModal onClose={onClose} initialStep="enable" />);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(document.querySelectorAll('.fixed.inset-0')[0]);
+    const x = document.querySelector('[role="dialog"] button');
+    fireEvent.click(x as HTMLButtonElement);
+
+    expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  it('blocks Escape while enabling so the outcome is not lost', async () => {
+    const { openhumanUpdateScreenIntelligenceSettings } = await import(
+      '../../../utils/tauriCommands'
+    );
+    let resolveEnable!: (value: unknown) => void;
+    vi.mocked(openhumanUpdateScreenIntelligenceSettings).mockReturnValue(
+      new Promise(resolve => {
+        resolveEnable = resolve;
+      }) as never
+    );
+
+    const onClose = vi.fn();
+    vi.mocked(useScreenIntelligenceState).mockReturnValue(baseState);
+    render(<ScreenIntelligenceSetupModal onClose={onClose} initialStep="enable" />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Enable Screen Intelligence/i }));
+    });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(document.querySelectorAll('.fixed.inset-0')[0]);
+    const x = document.querySelector('[role="dialog"] button');
+    fireEvent.click(x as HTMLButtonElement);
+
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Once the enable settles and the success step shows, Escape closes again.
+    await act(async () => {
+      resolveEnable({});
+    });
+    await waitFor(() => {
+      expect(screen.getByText('Ready to go')).toBeInTheDocument();
+    });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

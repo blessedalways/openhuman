@@ -32,6 +32,7 @@ const RecoveryPhrasePanel = () => {
   const [selectedWordCount, setSelectedWordCount] = useState(IMPORT_SLOTS_INITIAL);
   const [importWords, setImportWords] = useState<string[]>(Array(IMPORT_SLOTS_INITIAL).fill(''));
   const [importValid, setImportValid] = useState<boolean | null>(null);
+  const [importOverflowWarning, setImportOverflowWarning] = useState<string | null>(null);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   useEffect(() => {
@@ -45,6 +46,7 @@ const RecoveryPhrasePanel = () => {
     setConfirmed(false);
     setError(null);
     setImportValid(null);
+    setImportOverflowWarning(null);
     setSelectedWordCount(IMPORT_SLOTS_INITIAL);
     setImportWords(Array(IMPORT_SLOTS_INITIAL).fill(''));
   }, [mode]);
@@ -59,6 +61,7 @@ const RecoveryPhrasePanel = () => {
       return newWords;
     });
     setImportValid(null);
+    setImportOverflowWarning(null);
     setError(null);
   }, []);
 
@@ -97,6 +100,7 @@ const RecoveryPhrasePanel = () => {
         if (BIP39_IMPORT_LENGTHS.includes(fullPhraseLen as (typeof BIP39_IMPORT_LENGTHS)[number])) {
           setImportWords(pastedWords.map(w => w.toLowerCase()));
           setImportValid(null);
+          setImportOverflowWarning(null);
           inputRefs.current[fullPhraseLen - 1]?.focus();
           return;
         }
@@ -107,6 +111,16 @@ const RecoveryPhrasePanel = () => {
         }
         setImportWords(newWords);
         setImportValid(null);
+        if (pastedWords.length > slotCount - index) {
+          const dropped = pastedWords.length - (slotCount - index);
+          setImportOverflowWarning(
+            `${pastedWords.length} words pasted, but only ${slotCount - index} fit — ${dropped} extra ${
+              dropped === 1 ? 'word was' : 'words were'
+            } dropped. Paste into an empty field to import the full phrase.`
+          );
+        } else {
+          setImportOverflowWarning(null);
+        }
         const nextEmpty = newWords.findIndex(w => !w);
         const focusIndex = nextEmpty === -1 ? slotCount - 1 : nextEmpty;
         inputRefs.current[focusIndex]?.focus();
@@ -379,6 +393,14 @@ const RecoveryPhrasePanel = () => {
                       ))}
                     </div>
                   </div>
+
+                  {importOverflowWarning && (
+                    <div
+                      role="alert"
+                      className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 leading-relaxed">
+                      {importOverflowWarning}
+                    </div>
+                  )}
 
                   {importValid === true && (
                     <div className="flex items-center gap-2 text-sage-400 text-sm mb-3 justify-center">

@@ -373,6 +373,17 @@ const SettingsHome = () => {
         ))}
       </div>
 
+      {/* Logout failures (plain "Log out" item) previously only rendered
+          inside the Clear App Data modal, so a failed logout silently
+          did nothing. Surface them here, in the open. */}
+      {error && (
+        <div
+          role="alert"
+          className="mx-4 mt-4 rounded-lg border border-coral-300 bg-coral-50 px-3 py-2 text-xs leading-relaxed text-coral-700">
+          {error}
+        </div>
+      )}
+
       {/* Log Out & Clear Data Confirmation Modal */}
       {showLogoutAndClearModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30">

@@ -547,6 +547,16 @@ const CAPABILITIES: &[Capability] = &[
         privacy: None,
     },
     Capability {
+        id: "auth.local_session",
+        name: "Local-Only Session",
+        domain: "auth",
+        category: CapabilityCategory::Auth,
+        description: "Use the app without a cloud account: chat via your own API key or a local LLM server (llama.cpp, Ollama), with all data kept on this device.",
+        how_to: "Welcome > Continue without an account (local-only)",
+        status: CapabilityStatus::Stable,
+        privacy: None,
+    },
+    Capability {
         id: "auth.onboarding_setup",
         name: "Onboarding Setup",
         domain: "auth",

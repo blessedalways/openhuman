@@ -320,11 +320,17 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    /// Apply the provider's auth header. A `None` credential sends the
+    /// request without auth — required for key-less local servers (Ollama,
+    /// llama.cpp, vLLM) where no API key is configured.
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
-        credential: &str,
+        credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
+        let Some(credential) = credential else {
+            return req;
+        };
         match &self.auth_header {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
@@ -334,7 +340,7 @@ impl OpenAiCompatibleProvider {
 
     async fn chat_via_responses(
         &self,
-        credential: &str,
+        credential: Option<&str>,
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
@@ -662,7 +668,7 @@ impl OpenAiCompatibleProvider {
     /// OpenAI/Fireworks streaming schema that tolerates unknown fields.
     async fn stream_native_chat(
         &self,
-        credential: &str,
+        credential: Option<&str>,
         native_request: &NativeChatRequest,
         delta_tx: &tokio::sync::mpsc::Sender<crate::openhuman::providers::ProviderDelta>,
         dump_seq: u64,
@@ -1057,12 +1063,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Configure via the web UI or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let mut messages = Vec::new();
 
@@ -1198,12 +1199,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Configure via the web UI or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1303,12 +1299,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Configure via the web UI or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1405,12 +1396,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Configure via the web UI or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = if self.merge_system_into_user {
@@ -1589,19 +1575,8 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        // Key-less providers (Ollama, llama.cpp, vLLM) stream without auth.
+        let credential = self.credential.clone();
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1637,14 +1612,16 @@ impl Provider for OpenAiCompatibleProvider {
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
-            // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            // Apply auth header (skipped entirely when no credential is set)
+            if let Some(credential) = &credential {
+                req_builder = match &auth_header {
+                    AuthStyle::Bearer => {
+                        req_builder.header("Authorization", format!("Bearer {}", credential))
+                    }
+                    AuthStyle::XApiKey => req_builder.header("x-api-key", credential),
+                    AuthStyle::Custom(header) => req_builder.header(header, credential),
+                };
+            }
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -1710,16 +1687,14 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            // Hit the chat completions URL with a GET to establish the connection pool.
-            // The server will likely return 405 Method Not Allowed, which is fine -
-            // the goal is TLS handshake and HTTP/2 negotiation.
-            let url = self.chat_completions_url();
-            let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
-                .send()
-                .await?;
-        }
+        // Hit the chat completions URL with a GET to establish the connection pool.
+        // The server will likely return 405 Method Not Allowed, which is fine -
+        // the goal is TLS handshake and HTTP/2 negotiation.
+        let url = self.chat_completions_url();
+        let _ = self
+            .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
+            .send()
+            .await?;
         Ok(())
     }
 }

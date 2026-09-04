@@ -7,9 +7,10 @@ import SettingsHome from '../SettingsHome';
 
 // --- hoisted mocks ---
 
-const { mockNavigate, mockNavigateToSettings } = vi.hoisted(() => ({
+const { mockNavigate, mockNavigateToSettings, mockClearSession } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
   mockNavigateToSettings: vi.fn(),
+  mockClearSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('react-router-dom', async importOriginal => {
@@ -23,7 +24,7 @@ vi.mock('../hooks/useSettingsNavigation', () => ({
 
 vi.mock('../../../providers/CoreStateProvider', () => ({
   useCoreState: () => ({
-    clearSession: vi.fn().mockResolvedValue(undefined),
+    clearSession: mockClearSession,
     snapshot: { auth: { userId: null }, currentUser: null },
   }),
 }));
@@ -243,6 +244,20 @@ describe('SettingsHome', () => {
 
       await user.click(screen.getByText('Developer Options').closest('button')!);
       expect(mockNavigateToSettings).toHaveBeenCalledWith('developer-options');
+    });
+  });
+
+  describe('logout failure feedback', () => {
+    it('shows an error message when the plain Log out action fails', async () => {
+      mockClearSession.mockRejectedValueOnce(new Error('core unreachable'));
+      const user = userEvent.setup();
+      renderSettingsHome();
+
+      await user.click(screen.getByText('Log out').closest('button')!);
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Failed to log out. Please try again.'
+      );
     });
   });
 });

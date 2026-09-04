@@ -266,6 +266,56 @@ async fn apply_model_settings_stores_api_key_and_clears_when_empty() {
 }
 
 #[tokio::test]
+async fn apply_model_settings_resets_hosted_backend_endpoint_to_none() {
+    // Regression: the OpenHuman provider preset used to persist the full
+    // hosted `/chat/completions` endpoint, which broke the hosted-backend
+    // base URL. Saving that shape must reset to the session-based backend.
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let patch = ModelSettingsPatch {
+        api_url: Some("https://api.tinyhumans.ai/openai/v1/chat/completions".into()),
+        api_key: None,
+        default_model: None,
+        default_temperature: None,
+        model_routes: None,
+    };
+    let _ = apply_model_settings(&mut cfg, patch).await.expect("apply");
+    assert!(cfg.api_url.is_none());
+
+    // Staging host gets the same treatment.
+    let mut cfg = tmp_config(&tmp);
+    let patch = ModelSettingsPatch {
+        api_url: Some("https://staging-api.tinyhumans.ai/openai/v1/chat/completions/".into()),
+        api_key: None,
+        default_model: None,
+        default_temperature: None,
+        model_routes: None,
+    };
+    let _ = apply_model_settings(&mut cfg, patch).await.expect("apply");
+    assert!(cfg.api_url.is_none());
+}
+
+#[tokio::test]
+async fn apply_model_settings_keeps_custom_provider_endpoints() {
+    // Full `/chat/completions` endpoints on non-hosted hosts are legitimate
+    // OpenAI-compatible provider URLs and must round-trip untouched.
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let patch = ModelSettingsPatch {
+        api_url: Some("https://openrouter.ai/api/v1/chat/completions".into()),
+        api_key: None,
+        default_model: None,
+        default_temperature: None,
+        model_routes: None,
+    };
+    let _ = apply_model_settings(&mut cfg, patch).await.expect("apply");
+    assert_eq!(
+        cfg.api_url.as_deref(),
+        Some("https://openrouter.ai/api/v1/chat/completions")
+    );
+}
+
+#[tokio::test]
 async fn apply_model_settings_replaces_model_routes_when_some_and_keeps_when_none() {
     // #1342: switching providers writes role->model routes; switching back to
     // OpenHuman sends an empty vec to wipe them. Omitting the field leaves
