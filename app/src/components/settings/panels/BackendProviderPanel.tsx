@@ -154,6 +154,21 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     },
   },
   {
+    id: 'llamacpp',
+    label: 'llama.cpp (local)',
+    // llama-server's OpenAI-compatible endpoint; 127.0.0.1 avoids Windows
+    // resolving `localhost` to an unused IPv6 address.
+    apiUrl: 'http://127.0.0.1:8080/v1/chat/completions',
+    suggestedModel: '',
+    roleModels: { ...EMPTY_ROLE_MODELS },
+    note: 'Connect to a running llama.cpp llama-server (default port 8080, e.g. `llama-server -m model.gguf --port 8080`). No API key needed — the loaded model is used.',
+    tint: {
+      idle: 'border-stone-200 hover:border-stone-400 hover:bg-stone-50',
+      selected: 'border-stone-500 bg-stone-200 ring-2 ring-stone-300 text-stone-900',
+      dot: 'bg-stone-400',
+    },
+  },
+  {
     id: 'custom',
     label: 'Custom',
     apiUrl: '',

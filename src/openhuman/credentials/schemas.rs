@@ -18,6 +18,13 @@ struct AuthStoreSessionParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AuthStoreLocalSessionParams {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthConsumeLoginTokenParams {
     login_token: String,
 }
@@ -115,6 +122,10 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_auth_store_session,
         },
         RegisteredController {
+            schema: schemas("auth_store_local_session"),
+            handler: handle_auth_store_local_session,
+        },
+        RegisteredController {
             schema: schemas("auth_clear_session"),
             handler: handle_auth_clear_session,
         },
@@ -184,6 +195,17 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 optional_json("user_id", "Optional user id hint."),
                 optional_json("user", "Optional user payload."),
             ],
+            outputs: vec![json_output("profile", "Stored auth profile summary.")],
+        },
+        "auth_store_local_session" => ControllerSchema {
+            namespace: "auth",
+            function: "store_local_session",
+            description:
+                "Start a local-only session without a cloud account (no network validation).",
+            inputs: vec![optional_string(
+                "display_name",
+                "Optional display name for the local user.",
+            )],
             outputs: vec![json_output("profile", "Stored auth profile summary.")],
         },
         "auth_clear_session" => ControllerSchema {
@@ -331,6 +353,17 @@ fn handle_auth_store_session(params: Map<String, Value>) -> ControllerFuture {
                 payload.user,
             )
             .await?,
+        )
+    })
+}
+
+fn handle_auth_store_local_session(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let config = config_rpc::load_config_with_timeout().await?;
+        let payload = deserialize_params::<AuthStoreLocalSessionParams>(params)?;
+        to_json(
+            crate::openhuman::credentials::rpc::store_local_session(&config, payload.display_name)
+                .await?,
         )
     })
 }

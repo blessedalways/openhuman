@@ -71,6 +71,22 @@ export async function storeSession(token: string, user: object): Promise<void> {
   await callCoreRpc({ method: 'openhuman.auth_store_session', params: { token, user } });
 }
 
+/**
+ * Start a local-only session: no cloud account, no network validation.
+ * The core mints and stores the session token itself and starts the
+ * login-gated local services (local AI, voice, screen intelligence).
+ */
+export async function startLocalSession(displayName?: string): Promise<CommandResponse<unknown>> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+
+  return await callCoreRpc<CommandResponse<unknown>>({
+    method: 'openhuman.auth_store_local_session',
+    params: displayName ? { displayName } : {},
+  });
+}
+
 export async function openhumanEncryptSecret(plaintext: string): Promise<CommandResponse<string>> {
   if (!isTauri()) {
     throw new Error('Not running in Tauri');

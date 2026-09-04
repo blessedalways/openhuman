@@ -35,6 +35,7 @@ import {
   openhumanUpdateMeetSettings,
   restartApp,
   setOnboardingCompleted,
+  startLocalSession as startLocalSessionRpc,
   storeSession,
   syncMemoryClientToken,
   logout as tauriLogout,
@@ -86,6 +87,8 @@ interface CoreStateContextValue extends CoreState {
   setOnboardingTasks: (value: CoreOnboardingTasks | null) => Promise<void>;
   storeSessionToken: (token: string, user?: object) => Promise<void>;
   clearSession: () => Promise<void>;
+  /** Start a local-only session (no cloud account, no network validation). */
+  startLocalSession: () => Promise<void>;
 }
 
 const CoreStateContext = createContext<CoreStateContextValue | null>(null);
@@ -575,6 +578,16 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
     [commitState]
   );
 
+  const startLocalSession = useCallback(async () => {
+    logoutGuardUntilRef.current = 0;
+    // The core mints and stores the local session token itself (no cloud
+    // validation) and starts the login-gated local services. Refresh picks
+    // up the session snapshot; teams are cloud-only and deliberately not
+    // refreshed in local mode.
+    await startLocalSessionRpc();
+    await refresh();
+  }, [refresh]);
+
   const value = useMemo<CoreStateContextValue>(
     () => ({
       ...state,
@@ -590,6 +603,7 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
       setOnboardingTasks: value => updateLocalState({ onboardingTasks: value }),
       storeSessionToken,
       clearSession,
+      startLocalSession,
     }),
     [
       clearSession,
@@ -601,6 +615,7 @@ export default function CoreStateProvider({ children }: { children: ReactNode })
       setAnalyticsEnabled,
       setMeetAutoOrchestratorHandoff,
       setOnboardingCompletedFlag,
+      startLocalSession,
       state,
       storeSessionToken,
       updateLocalState,

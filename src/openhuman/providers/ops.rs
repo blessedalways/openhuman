@@ -209,22 +209,27 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 }
 
 /// Create the OpenHuman backend inference client (session JWT only).
+///
+/// A configured `api_url` always selects the OpenAI-compatible provider;
+/// `api_key` is optional so key-less local servers (Ollama, llama.cpp, vLLM)
+/// work — requests are simply sent without auth. Only when no URL is set do
+/// we fall back to the hosted OpenHuman backend (which requires a session).
 pub fn create_backend_inference_provider(
     api_url: Option<&str>,
     api_key: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    if let (Some(url), Some(key)) = (api_url, api_key) {
+    if let Some(url) = api_url {
         Ok(Box::new(
             crate::openhuman::providers::compatible::OpenAiCompatibleProvider::new(
                 "custom_openai",
                 url,
-                Some(key),
+                api_key,
                 crate::openhuman::providers::compatible::AuthStyle::Bearer,
             ),
         ))
     } else {
-        if api_key.is_some() && api_url.is_none() {
+        if api_key.is_some() {
             log::warn!(
                 "[providers] api_key provided without api_url — key will be ignored, using default backend provider"
             );
@@ -410,6 +415,29 @@ mod tests {
         assert!(
             create_backend_inference_provider(None, None, &ProviderRuntimeOptions::default())
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_keyless_local_url_uses_compatible_provider() {
+        // Local-first: a configured URL with NO api key must still select the
+        // OpenAI-compatible provider (sent without auth), never the hosted
+        // cloud backend (which would fail with "No backend session").
+        let provider = create_backend_inference_provider(
+            Some("http://127.0.0.1:1"),
+            None,
+            &ProviderRuntimeOptions::default(),
+        )
+        .expect("provider created");
+
+        let err = provider
+            .chat_with_system(None, "hello", "test-model", 0.0)
+            .await
+            .expect_err("connection to closed port fails");
+        let text = err.to_string();
+        assert!(
+            !text.contains("No backend session"),
+            "key-less URL must not fall back to the hosted backend: {text}"
         );
     }
 

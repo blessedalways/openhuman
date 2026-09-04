@@ -3,6 +3,7 @@ import { useState } from 'react';
 import OAuthProviderButton from '../components/oauth/OAuthProviderButton';
 import { oauthProviderConfigs } from '../components/oauth/providerConfigs';
 import RotatingTetrahedronCanvas from '../components/RotatingTetrahedronCanvas';
+import { useCoreState } from '../providers/CoreStateProvider';
 import { clearBackendUrlCache } from '../services/backendUrl';
 import { clearCoreRpcUrlCache, testCoreRpcConnection } from '../services/coreRpcClient';
 import { useDeepLinkAuthState } from '../store/deepLinkAuthState';
@@ -17,12 +18,27 @@ import {
 
 const Welcome = () => {
   const { isProcessing, errorMessage } = useDeepLinkAuthState();
+  const { startLocalSession } = useCoreState();
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [rpcUrl, setRpcUrl] = useState(getStoredRpcUrl());
   const [rpcUrlError, setRpcUrlError] = useState<string | null>(null);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [isStartingLocal, setIsStartingLocal] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const handleStartLocal = async () => {
+    setIsStartingLocal(true);
+    setLocalError(null);
+    try {
+      await startLocalSession();
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : 'Failed to start local session.');
+    } finally {
+      setIsStartingLocal(false);
+    }
+  };
 
   const handleRpcUrlChange = (value: string) => {
     setRpcUrl(value);
@@ -201,6 +217,26 @@ const Welcome = () => {
                       className="!rounded-full !px-4 !py-2"
                     />
                   ))}
+              </div>
+
+              {/* Local-first mode: no cloud account, no network. Everything
+                  (chat via BYOK/local providers, threads, memory) stays on
+                  this device; an account can be linked later in settings. */}
+              <div className="mt-5 flex flex-col items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleStartLocal}
+                  disabled={isStartingLocal}
+                  className="text-xs text-stone-500 underline hover:text-stone-700 disabled:opacity-60">
+                  {isStartingLocal
+                    ? 'Starting local session…'
+                    : 'Continue without an account (local-only)'}
+                </button>
+                {localError ? (
+                  <p role="alert" className="text-xs text-red-600">
+                    {localError}
+                  </p>
+                ) : null}
               </div>
             </>
           )}

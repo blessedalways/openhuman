@@ -52,6 +52,12 @@ vi.mock('../../components/oauth/providerConfigs', () => ({
 
 vi.mock('../../store/deepLinkAuthState', () => ({ useDeepLinkAuthState: vi.fn() }));
 
+const startLocalSessionSpy = vi.fn();
+
+vi.mock('../../providers/CoreStateProvider', () => ({
+  useCoreState: () => ({ startLocalSession: startLocalSessionSpy }),
+}));
+
 vi.mock('../../services/coreRpcClient', () => ({
   clearCoreRpcUrlCache: vi.fn(),
   testCoreRpcConnection: vi.fn(),
@@ -90,6 +96,7 @@ describe('Welcome auth entrypoint', () => {
   beforeEach(() => {
     oauthButtonSpy.mockReset();
     oauthOverrideSpy.mockReset();
+    startLocalSessionSpy.mockReset();
     vi.mocked(useDeepLinkAuthState).mockReturnValue({ isProcessing: false, errorMessage: null });
     vi.mocked(clearCoreRpcUrlCache).mockReset();
     vi.mocked(clearBackendUrlCache).mockReset();
@@ -109,6 +116,29 @@ describe('Welcome auth entrypoint', () => {
     expect(screen.getByRole('button', { name: 'github' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'twitter' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'discord' })).not.toBeInTheDocument();
+  });
+
+  it('offers a local-only session entry that does not touch the cloud', async () => {
+    startLocalSessionSpy.mockResolvedValue(undefined);
+    render(<Welcome />);
+
+    const localButton = screen.getByRole('button', { name: /continue without an account/i });
+    fireEvent.click(localButton);
+
+    await waitFor(() => expect(startLocalSessionSpy).toHaveBeenCalledTimes(1));
+    // Busy state clears once the (instant) mock resolves.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /continue without an account/i })).toBeEnabled()
+    );
+  });
+
+  it('surfaces local session start failures', async () => {
+    startLocalSessionSpy.mockRejectedValue(new Error('core unreachable'));
+    render(<Welcome />);
+
+    fireEvent.click(screen.getByRole('button', { name: /continue without an account/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('core unreachable');
   });
 
   it('delegates OAuth clicks to OAuthProviderButton without an override', () => {
