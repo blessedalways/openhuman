@@ -98,6 +98,7 @@ struct AuthOauthRevokeParams {
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
         schemas("auth_store_session"),
+        schemas("auth_store_local_session"),
         schemas("auth_clear_session"),
         schemas("auth_get_state"),
         schemas("auth_get_session_token"),

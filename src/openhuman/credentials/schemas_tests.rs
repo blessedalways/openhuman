@@ -11,6 +11,35 @@ fn catalog_counts_match() {
 }
 
 #[test]
+fn registered_controllers_and_declared_schemas_are_key_parity() {
+    // Regression guard for the startup panic "invalid controller registry:
+    // registered controller `X` has no declared schema" — a count check
+    // alone can miss name mismatches between the declared catalog and the
+    // registered handlers.
+    let declared: std::collections::BTreeSet<String> = all_controller_schemas()
+        .into_iter()
+        .map(|s| format!("{}.{}", s.namespace, s.function))
+        .collect();
+    let registered: std::collections::BTreeSet<String> = all_registered_controllers()
+        .into_iter()
+        .map(|c| format!("{}.{}", c.schema.namespace, c.schema.function))
+        .collect();
+
+    for key in &registered {
+        assert!(
+            declared.contains(key),
+            "registered controller `{key}` has no declared schema"
+        );
+    }
+    for key in &declared {
+        assert!(
+            registered.contains(key),
+            "declared schema `{key}` has no registered handler"
+        );
+    }
+}
+
+#[test]
 fn all_schemas_use_auth_namespace_and_have_descriptions() {
     for s in all_controller_schemas() {
         assert_eq!(s.namespace, "auth", "function {}", s.function);
@@ -48,6 +77,7 @@ fn every_known_schema_key_returns_a_non_unknown_schema() {
     // to fire off HTTP.
     let keys = [
         "auth_store_session",
+        "auth_store_local_session",
         "auth_clear_session",
         "auth_get_state",
         "auth_get_session_token",
