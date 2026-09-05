@@ -2057,7 +2057,10 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       await waitFor(() =>
         expect(threadApi.appendMessage).toHaveBeenCalledWith(
           threadId,
-          expect.objectContaining({ content: USER_FACING_FALLBACK, sender: 'agent' })
+          expect.objectContaining({
+            content: expect.stringContaining('Something went wrong (type: inference)'),
+            sender: 'agent',
+          })
         )
       );
     });
@@ -2101,7 +2104,10 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
       await waitFor(() =>
         expect(threadApi.appendMessage).toHaveBeenCalledWith(
           threadId,
-          expect.objectContaining({ content: USER_FACING_FALLBACK, sender: 'agent' })
+          expect.objectContaining({
+            content: expect.stringContaining('Something went wrong (type: network'),
+            sender: 'agent',
+          })
         )
       );
     });

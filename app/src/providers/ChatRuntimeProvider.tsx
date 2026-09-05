@@ -85,6 +85,24 @@ const logChatRuntime = debug('openhuman:chat-runtime');
 const USER_FACING_AGENT_ERROR_MESSAGE =
   'Something went wrong. Please try again.\nThis error has been reported. You can also report it on Discord.\n<openhuman-link path="community/discord-report">Report on Discord</openhuman-link>';
 
+/**
+ * Last-resort bubble when the core sends an empty/missing message: keep the
+ * apology but carry the typed metadata (error type, provider) so the failure
+ * stays diagnosable instead of degrading to a blanket apology. The core's
+ * classifier is supposed to always attach a message; when it doesn't, the
+ * type/provider is the only clue the user has.
+ */
+const agentErrorFallback = (event: {
+  error_type?: string;
+  error_provider?: string | null;
+}): string => {
+  const parts: string[] = [];
+  if (event.error_type) parts.push(`type: ${event.error_type}`);
+  if (event.error_provider) parts.push(`provider: ${event.error_provider}`);
+  if (parts.length === 0) return USER_FACING_AGENT_ERROR_MESSAGE;
+  return `Something went wrong (${parts.join(', ')}). Please try again.\nThis error has been reported. Open Settings → System diagnostics → Open logs folder for the exact cause.\n<openhuman-link path="community/discord-report">Report on Discord</openhuman-link>`;
+};
+
 const SEGMENT_DELIVERY_TTL_MS = 5 * 60 * 1000;
 const MAX_SEGMENT_DELIVERIES = 100;
 
@@ -1374,7 +1392,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
             segmentDeliveryKey(event.thread_id, event.request_id)
           );
           if (event.error_type !== 'cancelled') {
-            const errorContent = event.message || USER_FACING_AGENT_ERROR_MESSAGE;
+            const errorContent = event.message || agentErrorFallback(event);
             void dispatch(
               addInferenceResponse({ content: errorContent, threadId: event.thread_id })
             );
@@ -1412,7 +1430,7 @@ const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
           // length-capped server-side via with_provider_detail()/sanitize_api_error()), so
           // surfacing it tells the user *why* the turn failed instead of a blanket apology.
           // The hardcoded constant is only a last-resort fallback for an empty/missing message.
-          const errorContent = event.message || USER_FACING_AGENT_ERROR_MESSAGE;
+          const errorContent = event.message || agentErrorFallback(event);
           // A core-owned failure carries a deterministic id, so dedupe on that
           // rather than on the text. Two runs can fail with byte-identical
           // content — the same upstream provider message, or the generic

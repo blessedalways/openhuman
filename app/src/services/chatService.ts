@@ -182,6 +182,12 @@ export interface ChatErrorEvent {
    */
   client_id?: string;
   message: string;
+  /**
+   * Provider slug the core attached to the classified error
+   * (`WebChannelEvent.error_provider`) — present whenever the classifier
+   * resolved a provider; used by the error-bubble fallback for diagnosis.
+   */
+  error_provider?: string | null;
   error_type:
     | 'network'
     | 'timeout'
