@@ -498,6 +498,31 @@ fn windows_icacls_grant_arg_preserves_valid_characters() {
 }
 
 #[test]
+fn windows_icacls_grant_arg_accepts_qualified_whoami_account() {
+    assert_eq!(
+        build_windows_icacls_grant_arg("DESKTOP-XYZ\\blessed"),
+        Some("DESKTOP-XYZ\\blessed:F".to_string())
+    );
+}
+
+#[test]
+fn parse_whoami_account_takes_first_line_and_trims() {
+    assert_eq!(
+        parse_whoami_account("DESKTOP-XYZ\\blessed\r\n"),
+        "DESKTOP-XYZ\\blessed"
+    );
+    assert_eq!(parse_whoami_account("  alice  \n"), "alice");
+    assert_eq!(parse_whoami_account("laptop\\max"), "laptop\\max");
+}
+
+#[test]
+fn parse_whoami_account_empty_or_blank_yields_empty() {
+    assert_eq!(parse_whoami_account(""), "");
+    assert_eq!(parse_whoami_account("   \r\n"), "");
+    assert_eq!(parse_whoami_account("\n\nsecond-line\n"), "");
+}
+
+#[test]
 fn generate_random_key_correct_length() {
     let key = generate_random_key();
     assert_eq!(key.len(), KEY_LEN);

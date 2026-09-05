@@ -190,11 +190,15 @@ impl SecretStore {
             }
             #[cfg(windows)]
             {
-                // On Windows, use icacls to restrict permissions to current user only
-                let username = std::env::var("USERNAME").unwrap_or_default();
-                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
+                // On Windows, restrict the key file to the current account via icacls.
+                // `/inheritance:d` copies inherited ACEs as explicit entries instead of
+                // removing them: `/inheritance:r` locked users out of their own key file
+                // when it was created under an elevated installer context, because the
+                // stripped ACL granted only the elevating account.
+                let account = current_windows_account();
+                let Some(grant_arg) = build_windows_icacls_grant_arg(&account) else {
                     log::warn!(
-                        "USERNAME environment variable is empty; \
+                        "Could not determine the current Windows account; \
                          cannot restrict key file permissions via icacls"
                     );
                     return Ok(key);
@@ -202,7 +206,7 @@ impl SecretStore {
 
                 match std::process::Command::new("icacls")
                     .arg(&self.key_path)
-                    .args(["/inheritance:r", "/grant:r"])
+                    .args(["/inheritance:d", "/grant:r"])
                     .arg(grant_arg)
                     .output()
                 {
@@ -263,6 +267,34 @@ fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
         return None;
     }
     Some(format!("{normalized}:F"))
+}
+
+/// Resolve the qualified Windows account (e.g. `DESKTOP-XYZ\blessed`) for the
+/// icacls grant. `whoami` matches the actual process token; the `USERNAME` env
+/// var can name a different admin account when the process is elevated.
+/// Falls back to `USERNAME` when `whoami` cannot be run.
+#[cfg(windows)]
+fn current_windows_account() -> String {
+    if let Ok(out) = std::process::Command::new("whoami").output() {
+        if out.status.success() {
+            let account = parse_whoami_account(&String::from_utf8_lossy(&out.stdout));
+            if !account.is_empty() {
+                return account;
+            }
+        }
+    }
+    std::env::var("USERNAME").unwrap_or_default()
+}
+
+/// Extract the account name from the first line of `whoami` stdout.
+#[cfg(any(windows, test))]
+fn parse_whoami_account(stdout: &str) -> String {
+    stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Hex-decode a hex string to bytes.
