@@ -1921,6 +1921,8 @@ const messages: TranslationMap = {
     '로컬 지갑 ID를 복원하려면 아래에 복구 문구를 입력하거나 전체 문구를 아무 입력란에 붙여넣으세요(새 백업은 12단어, 이전 버전의 24단어 문구도 작동합니다).',
   'mnemonic.words': '단어',
   'mnemonic.validPhrase': '유효한 복구 문구',
+  'mnemonic.importOverflowWarning':
+    '단어 {pasted}개를 붙여넣었지만 빈 칸은 {slots}개뿐입니다. 들어가지 못한 단어는 입력되지 않았습니다. 전체 문구를 가져오려면 빈 칸에 통째로 붙여넣으세요.',
   'mnemonic.generateNewPhrase': '대신 새 복구 문구 생성',
   'mnemonic.securingData': '데이터 보호 중...',
   'mnemonic.saveRecoveryPhrase': '복구 문구 저장',

@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 
 import { Button, CheckIcon, ModalShell } from '../ui';
+import type { ModalClosePolicy } from '../ui/ModalShell';
 
 interface SkillSetupModalShellProps {
   children: ReactNode;
@@ -9,6 +10,9 @@ interface SkillSetupModalShellProps {
   titleId: string;
   subtitle?: ReactNode;
   icon: ReactNode;
+  /** Forwarded to `ModalShell`; pass an all-false policy while an enable is
+   * in flight so Escape / backdrop / header-X cannot dismiss mid-operation. */
+  closePolicy?: ModalClosePolicy;
 }
 
 export function SkillSetupModalShell({
@@ -18,9 +22,16 @@ export function SkillSetupModalShell({
   titleId,
   subtitle,
   icon,
+  closePolicy,
 }: SkillSetupModalShellProps) {
   return (
-    <ModalShell onClose={onClose} title={title} titleId={titleId} subtitle={subtitle} icon={icon}>
+    <ModalShell
+      onClose={onClose}
+      title={title}
+      titleId={titleId}
+      subtitle={subtitle}
+      icon={icon}
+      closePolicy={closePolicy}>
       {children}
     </ModalShell>
   );

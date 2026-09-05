@@ -3,7 +3,7 @@ name: Build Windows
 on:
   workflow_dispatch:
   push:
-    branches: [fix/windows, hoplite/hermion-84b28abe]
+    branches: [hoplite/hermion-84b28abe]
 permissions:
   contents: read
 concurrency:
@@ -29,8 +29,8 @@ jobs:
         with:
           node-version: 24.x
           cache: pnpm
-      - name: Install Rust (1.93.0)
-        uses: dtolnay/rust-toolchain@1.93.0
+      - name: Install Rust (1.96.1)
+        uses: dtolnay/rust-toolchain@1.96.1
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -49,28 +49,12 @@ jobs:
           key: Windows-cargo-registry-${{ steps.cargo-lock-fingerprint.outputs.hash }}
           restore-keys: |
             Windows-cargo-registry-
-
-      # CEF runtime auto-downloads via cef-dll-sys / vendored tauri-cli. Cache
-      # it so we don't re-fetch ~400MB every run.
-      - name: Cache CEF binary distribution
-        uses: actions/cache@v4
-        with:
-          path: ~/AppData/Local/tauri-cef
-          key: cef-windows-${{ hashFiles('app/src-tauri/Cargo.toml') }}
-          restore-keys: |
-            cef-windows-
-      - name: Cache vendored tauri-cli binary
-        id: tauri-cli-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-tauri.exe
-          key: vendored-tauri-cli-windows-${{ hashFiles('app/src-tauri/vendor/tauri-cef/crates/tauri-cli/Cargo.toml') }}
-      - name: Install vendored tauri-cli (cef-aware bundler)
-        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: cargo install --locked --path app/src-tauri/vendor/tauri-cef/crates/tauri-cli
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Typecheck (tsc --noEmit)
+        run: pnpm typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
 
       # vite build runs via tauri.conf.json's beforeBuildCommand during the
       # "Build Tauri app" step below — no separate frontend build needed.
@@ -91,7 +75,7 @@ jobs:
             const { default: prepareTauriConfig } = await import(moduleUrl);
             const config = prepareTauriConfig();
             core.setOutput('json', JSON.stringify(config));
-      - name: Build Tauri app (CEF default, vendored CLI)
+      - name: Build Tauri app (Wry system WebView, stock CLI)
         id: tauri-build
         shell: bash
         working-directory: app
@@ -104,7 +88,7 @@ jobs:
           VITE_LATEST_APP_DOWNLOAD_URL: ${{ vars.VITE_LATEST_APP_DOWNLOAD_URL }}
           TAURI_CONFIG_OVERRIDE: ${{ steps.config-overrides.outputs.json }}
         run: |
-          NODE_OPTIONS="--max-old-space-size=8192" cargo tauri build -c "$TAURI_CONFIG_OVERRIDE" --target x86_64-pc-windows-msvc
+          NODE_OPTIONS="--max-old-space-size=8192" pnpm tauri build -c "$TAURI_CONFIG_OVERRIDE" --target x86_64-pc-windows-msvc
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
@@ -119,9 +103,3 @@ jobs:
           path: |
             app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
             target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-      - name: Upload standalone CLI binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-cli
-          path: |-
-            ${{ steps.core-paths.outputs.core_target_dir }}/${{ steps.core-paths.outputs.core_bin_name }}.exe

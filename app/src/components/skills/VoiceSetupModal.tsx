@@ -69,6 +69,7 @@ export default function VoiceSetupModal({ onClose, skillStatus }: Props) {
   return (
     <SkillSetupModalShell
       onClose={onClose}
+      closePolicy={isEnabling ? { escape: false, backdrop: false, button: false } : undefined}
       title={t('skills.setup.voice.title')}
       titleId="voice-setup-title"
       subtitle={
@@ -106,7 +107,12 @@ export default function VoiceSetupModal({ onClose, skillStatus }: Props) {
             <Button variant="primary" size="lg" onClick={handleGoToLocalModel} className="w-full">
               {t('skills.setup.voice.downloadSttBtn')}
             </Button>
-            <Button variant="secondary" size="lg" onClick={onClose} className="w-full">
+            <Button
+              variant="secondary"
+              size="lg"
+              onClick={onClose}
+              disabled={isEnabling}
+              className="w-full">
               {t('common.cancel')}
             </Button>
           </div>

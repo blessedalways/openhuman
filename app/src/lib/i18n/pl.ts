@@ -1976,6 +1976,8 @@ const messages: TranslationMap = {
     'Wprowadź swoją frazę odzyskiwania poniżej, aby przywrócić lokalne tożsamości portfela, lub wklej pełną frazę w dowolne pole (12 słów dla nowych kopii zapasowych; 24-słowne frazy ze starszych wersji nadal działają).',
   'mnemonic.words': 'Słowa',
   'mnemonic.validPhrase': 'Prawidłowa fraza odzyskiwania',
+  'mnemonic.importOverflowWarning':
+    'Wklejono {pasted} słów, ale wolnych pól zostało tylko {slots}. Słowa, które się nie zmieściły, nie zostały wpisane. Wklej całą frazę w puste pole, aby zaimportować ją w całości.',
   'mnemonic.generateNewPhrase': 'Wygeneruj zamiast tego nową frazę odzyskiwania',
   'mnemonic.securingData': 'Zabezpieczanie Twoich danych...',
   'mnemonic.saveRecoveryPhrase': 'Zapisz frazę odzyskiwania',

@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import { useT } from '../../../../lib/i18n/I18nContext';
 import type { AgentProfile } from '../../../../types/agentProfile';
 import type { CoreCronJob, CoreCronRun } from '../../../../utils/tauriCommands';
@@ -32,6 +34,10 @@ const CoreJobList = ({
 }: CoreJobListProps) => {
   const { t } = useT();
 
+  // Removal is destructive (the job is gone from the scheduler), so the first
+  // click arms a confirm state and only the second click deletes.
+  const [removeConfirmId, setRemoveConfirmId] = useState<string | null>(null);
+
   // Resolve a job's attributed profile to a display name, falling back to the
   // raw id when the profile has since been deleted.
   const profileLabel = (profileId: string): string =>
@@ -54,8 +60,10 @@ const CoreJobList = ({
       ? t('settings.cron.jobs.loadingRuns')
       : t('settings.cron.jobs.viewRuns');
 
-  const removeButtonLabel = (jobId: string) =>
-    coreBusyKey === `core-remove:${jobId}` ? t('settings.cron.jobs.removing') : t('common.remove');
+  const removeButtonLabel = (jobId: string) => {
+    if (coreBusyKey === `core-remove:${jobId}`) return t('settings.cron.jobs.removing');
+    return removeConfirmId === jobId ? t('common.confirm') : t('common.remove');
+  };
 
   return (
     // A plain divided list, not a card: the only host (`CronJobsPanel`) already
@@ -178,7 +186,15 @@ const CoreJobList = ({
                   data-testid={`cron-job-remove-${job.id}`}
                   className="whitespace-nowrap"
                   disabled={coreBusyKey === `core-remove:${job.id}`}
-                  onClick={() => onRemoveCoreJob(job.id)}>
+                  onClick={() => {
+                    if (removeConfirmId !== job.id) {
+                      setRemoveConfirmId(job.id);
+                      return;
+                    }
+                    setRemoveConfirmId(null);
+                    onRemoveCoreJob(job.id);
+                  }}
+                  onBlur={() => setRemoveConfirmId(prev => (prev === job.id ? null : prev))}>
                   {removeButtonLabel(job.id)}
                 </Button>
               </div>

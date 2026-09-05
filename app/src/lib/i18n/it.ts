@@ -1986,6 +1986,8 @@ const messages: TranslationMap = {
     'Inserisci la tua frase di recupero qui sotto per ripristinare le identità del wallet locale, oppure incolla la frase completa in qualsiasi campo (12 parole per i nuovi backup; le frasi a 24 parole delle versioni precedenti funzionano ancora).',
   'mnemonic.words': 'Parole',
   'mnemonic.validPhrase': 'Frase di recupero valida',
+  'mnemonic.importOverflowWarning':
+    'Hai incollato {pasted} parole, ma restano solo {slots} campi vuoti. Le parole che non entravano non sono state inserite. Incolla la frase completa in un campo vuoto per importarla per intero.',
   'mnemonic.generateNewPhrase': 'Genera invece una nuova frase di recupero',
   'mnemonic.securingData': 'Protezione dei tuoi dati...',
   'mnemonic.saveRecoveryPhrase': 'Salva frase di recupero',

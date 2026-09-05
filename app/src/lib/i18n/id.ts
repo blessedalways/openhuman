@@ -1958,6 +1958,8 @@ const messages: TranslationMap = {
     'Masukkan frasa pemulihan Anda di bawah untuk memulihkan identitas dompet lokal, atau tempel frasa lengkap ke kolom mana saja (12 kata untuk cadangan baru; frasa 24 kata dari versi lama tetap berfungsi).',
   'mnemonic.words': 'Kata',
   'mnemonic.validPhrase': 'Frasa pemulihan valid',
+  'mnemonic.importOverflowWarning':
+    'Anda menempel {pasted} kata, tetapi hanya tersisa {slots} kotak kosong. Kata yang tidak muat tidak dimasukkan. Tempelkan frasa lengkap ke sebuah kotak kosong untuk mengimpornya seluruhnya.',
   'mnemonic.generateNewPhrase': 'Buat frasa pemulihan baru',
   'mnemonic.securingData': 'Mengamankan Data Anda...',
   'mnemonic.saveRecoveryPhrase': 'Simpan Frasa Pemulihan',

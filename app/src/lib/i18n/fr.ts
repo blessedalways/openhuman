@@ -2007,6 +2007,8 @@ const messages: TranslationMap = {
     "Saisis ta phrase de récupération ci-dessous pour restaurer tes identités de portefeuille locales, ou colle la phrase complète dans n'importe quel champ (12 mots pour les nouvelles sauvegardes ; les phrases de 24 mots des versions antérieures fonctionnent toujours).",
   'mnemonic.words': 'Mots',
   'mnemonic.validPhrase': 'Phrase de récupération valide',
+  'mnemonic.importOverflowWarning':
+    'Vous avez collé {pasted} mots, mais il ne reste que {slots} champs libres. Les mots qui ne tenaient pas n’ont pas été saisis. Collez la phrase complète dans un champ vide pour l’importer en entier.',
   'mnemonic.generateNewPhrase': 'Générer une nouvelle phrase de récupération à la place',
   'mnemonic.securingData': 'Sécurisation de tes données…',
   'mnemonic.saveRecoveryPhrase': 'Enregistrer la phrase de récupération',

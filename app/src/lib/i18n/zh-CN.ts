@@ -1825,6 +1825,8 @@ const messages: TranslationMap = {
     '在下面输入你的恢复短语以恢复本地钱包身份，或将完整的短语粘贴到任意字段中（新备份为 12 个单词；旧版本的 24 个单词短语仍然有效）。',
   'mnemonic.words': '单词数',
   'mnemonic.validPhrase': '有效的恢复短语',
+  'mnemonic.importOverflowWarning':
+    '你粘贴了 {pasted} 个词，但只剩 {slots} 个空位。未能容纳的词不会被填入。请将完整短语粘贴到空字段中，以便全部导入。',
   'mnemonic.generateNewPhrase': '改为生成新的恢复短语',
   'mnemonic.securingData': '正在保护你的数据...',
   'mnemonic.saveRecoveryPhrase': '保存恢复短语',

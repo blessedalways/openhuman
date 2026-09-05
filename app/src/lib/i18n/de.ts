@@ -2006,6 +2006,8 @@ const messages: TranslationMap = {
     'Gib unten deine Wiederherstellungsphrase ein, um deine lokalen Wallet-Identitäten wiederherzustellen, oder füge die vollständige Phrase in ein beliebiges Feld ein (12 Wörter für neue Backups; 24-Wort-Phrasen aus älteren Versionen funktionieren weiterhin).',
   'mnemonic.words': 'Worte',
   'mnemonic.validPhrase': 'Gültige Wiederherstellungsphrase',
+  'mnemonic.importOverflowWarning':
+    'Du hast {pasted} Wörter eingefügt, aber es sind nur noch {slots} Felder frei. Die Wörter, die nicht mehr hineinpassten, wurden nicht übernommen. Füge die vollständige Phrase in ein leeres Feld ein, um sie komplett zu importieren.',
   'mnemonic.generateNewPhrase': 'Generiere stattdessen eine neue Wiederherstellungsphrase',
   'mnemonic.securingData': 'Sicherung deiner Daten...',
   'mnemonic.saveRecoveryPhrase': 'Speichere die Wiederherstellungsphrase',

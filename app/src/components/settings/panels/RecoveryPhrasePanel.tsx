@@ -66,6 +66,11 @@ const RecoveryPhrasePanel = () => {
   const [selectedWordCount, setSelectedWordCount] = useState(IMPORT_SLOTS_INITIAL);
   const [importWords, setImportWords] = useState<string[]>(Array(IMPORT_SLOTS_INITIAL).fill(''));
   const [importValid, setImportValid] = useState<boolean | null>(null);
+  // Set when a paste carried more words than the remaining empty slots could
+  // hold — the overflow is dropped, so the user must be told, not left guessing.
+  const [importOverflow, setImportOverflow] = useState<{ pasted: number; slots: number } | null>(
+    null
+  );
 
   // Shared
   const [loading, setLoading] = useState(false);
@@ -121,6 +126,7 @@ const RecoveryPhrasePanel = () => {
   const handleImportReplace = useCallback(() => {
     setIsReplace(true);
     setImportValid(null);
+    setImportOverflow(null);
     setError(null);
     setSelectedWordCount(IMPORT_SLOTS_INITIAL);
     setImportWords(Array(IMPORT_SLOTS_INITIAL).fill(''));
@@ -177,6 +183,7 @@ const RecoveryPhrasePanel = () => {
       return newWords;
     });
     setImportValid(null);
+    setImportOverflow(null);
     setError(null);
   }, []);
 
@@ -215,16 +222,23 @@ const RecoveryPhrasePanel = () => {
         if (BIP39_IMPORT_LENGTHS.includes(fullPhraseLen as (typeof BIP39_IMPORT_LENGTHS)[number])) {
           setImportWords(pastedWords.map(w => w.toLowerCase()));
           setImportValid(null);
+          setImportOverflow(null);
           inputRefs.current[fullPhraseLen - 1]?.focus();
           return;
         }
         const newWords = [...importWords];
         const slotCount = newWords.length;
-        for (let i = 0; i < Math.min(pastedWords.length, slotCount - index); i++) {
+        const availableSlots = slotCount - index;
+        for (let i = 0; i < Math.min(pastedWords.length, availableSlots); i++) {
           newWords[index + i] = pastedWords[i].toLowerCase();
         }
         setImportWords(newWords);
         setImportValid(null);
+        setImportOverflow(
+          pastedWords.length > availableSlots
+            ? { pasted: pastedWords.length, slots: availableSlots }
+            : null
+        );
         const nextEmpty = newWords.findIndex(w => !w);
         const focusIndex = nextEmpty === -1 ? slotCount - 1 : nextEmpty;
         inputRefs.current[focusIndex]?.focus();
@@ -235,6 +249,7 @@ const RecoveryPhrasePanel = () => {
       newWords[index] = value.toLowerCase().trim();
       setImportWords(newWords);
       setImportValid(null);
+      setImportOverflow(null);
     },
     [importWords]
   );
@@ -426,6 +441,16 @@ const RecoveryPhrasePanel = () => {
                   onWordKeyDown={handleImportKeyDown}
                   onSwitchToGenerate={() => switchMode('generate')}
                 />
+              )}
+
+              {importOverflow && mode === 'import' && (
+                <Alert variant="warning" className="mb-3" density="compact">
+                  <p className="text-xs leading-relaxed">
+                    {t('mnemonic.importOverflowWarning')
+                      .replace('{pasted}', String(importOverflow.pasted))
+                      .replace('{slots}', String(importOverflow.slots))}
+                  </p>
+                </Alert>
               )}
 
               {error && (

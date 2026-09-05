@@ -2175,6 +2175,8 @@ const en: TranslationMap = {
     'Enter your recovery phrase below to restore your local wallet identities, or paste the full phrase into any field (12 words for new backups; 24-word phrases from older versions still work).',
   'mnemonic.words': 'Words',
   'mnemonic.validPhrase': 'Valid recovery phrase',
+  'mnemonic.importOverflowWarning':
+    'You pasted {pasted} words, but only {slots} fields remain. The words that did not fit were not entered. Paste the full phrase into an empty field to import it completely.',
   'mnemonic.generateNewPhrase': 'Generate a new recovery phrase instead',
   'mnemonic.securingData': 'Securing Your Data...',
   'mnemonic.saveRecoveryPhrase': 'Save Recovery Phrase',

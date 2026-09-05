@@ -571,6 +571,31 @@ describe('RecoveryPhrasePanel — import mode word inputs and valid/invalid styl
     expect((wordInputs[0] as HTMLInputElement).value).toBe('abandon');
   });
 
+  // Pasting more words than the remaining empty slots can hold must warn the
+  // user instead of silently dropping the overflow.
+  it('warns when a paste overflows the remaining empty slots', async () => {
+    renderWithProviders(<RecoveryPhrasePanel />);
+    await waitFor(() => screen.getByText(/I already have a recovery phrase/i));
+
+    fireEvent.click(screen.getByText(/I already have a recovery phrase/i));
+    await waitFor(() => screen.getByText(/Enter your recovery phrase below/i));
+
+    const wordInputs = screen.getAllByLabelText(/Recovery phrase word/i);
+    // 13 words into slot 6: only 6 slots remain (12 - 6), so 7 words overflow.
+    const overflowPaste = Array.from({ length: 13 }, (_, i) => `w${i + 1}`).join(' ');
+    fireEvent.change(wordInputs[6], { target: { value: overflowPaste } });
+
+    await waitFor(() =>
+      expect(screen.getByText(/You pasted 13 words, but only 6 fields remain/i)).toBeTruthy()
+    );
+
+    // A full valid-length paste into the first slot takes the reset path and
+    // must not warn.
+    const fullPaste = Array.from({ length: 12 }, (_, i) => `w${i + 1}`).join(' ');
+    fireEvent.change(wordInputs[0], { target: { value: fullPaste } });
+    await waitFor(() => expect(screen.queryByText(/You pasted/i)).not.toBeTruthy());
+  });
+
   // Covers line 638 (onKeyDown on word inputs — Backspace on empty field).
   it('pressing Backspace on an empty word input (onKeyDown coverage)', async () => {
     renderWithProviders(<RecoveryPhrasePanel />);

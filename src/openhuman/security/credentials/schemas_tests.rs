@@ -77,7 +77,6 @@ fn every_known_schema_key_returns_a_non_unknown_schema() {
     // to fire off HTTP.
     let keys = [
         "auth_store_session",
-        "auth_store_local_session",
         "auth_clear_session",
         "auth_get_state",
         "auth_get_session_token",

@@ -1985,6 +1985,8 @@ const messages: TranslationMap = {
     'Insira sua frase de recuperação abaixo para restaurar suas identidades de carteira local, ou cole a frase completa em qualquer campo (12 palavras para novos backups; frases de 24 palavras de versões mais antigas ainda funcionam).',
   'mnemonic.words': 'Palavras',
   'mnemonic.validPhrase': 'Frase de recuperação válida',
+  'mnemonic.importOverflowWarning':
+    'Você colou {pasted} palavras, mas restam apenas {slots} campos vazios. As palavras que não couberam não foram inseridas. Cole a frase completa em um campo vazio para importá-la por completo.',
   'mnemonic.generateNewPhrase': 'Gerar uma nova frase de recuperação',
   'mnemonic.securingData': 'Protegendo Seus Dados...',
   'mnemonic.saveRecoveryPhrase': 'Salvar Frase de Recuperação',

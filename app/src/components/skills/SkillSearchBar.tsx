@@ -31,6 +31,7 @@ export default function SkillSearchBar({ value, onChange, placeholder }: SkillSe
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={effectivePlaceholder}
+        aria-label={effectivePlaceholder}
         className="rounded-xl pl-9 pr-9"
       />
       {value && (

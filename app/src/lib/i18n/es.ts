@@ -1986,6 +1986,8 @@ const messages: TranslationMap = {
     'Ingresa tu frase de recuperación a continuación para restaurar tus identidades de billetera local, o pega la frase completa en cualquier campo (12 palabras para respaldos nuevos; las frases de 24 palabras de versiones anteriores aún funcionan).',
   'mnemonic.words': 'Palabras',
   'mnemonic.validPhrase': 'Frase de recuperación válida',
+  'mnemonic.importOverflowWarning':
+    'Pegaste {pasted} palabras, pero solo quedan {slots} campos libres. Las palabras que no cupieron no se ingresaron. Pega la frase completa en un campo vacío para importarla por completo.',
   'mnemonic.generateNewPhrase': 'Generar una nueva frase de recuperación',
   'mnemonic.securingData': 'Protegiendo tus datos...',
   'mnemonic.saveRecoveryPhrase': 'Guardar frase de recuperación',

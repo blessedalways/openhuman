@@ -1,3 +1,13 @@
+/**
+ * CoreJobList — vitest coverage
+ *
+ * Verifies:
+ * - Renders each core job row with its action buttons.
+ * - Removal is destructive and two-click: the first click arms a Confirm
+ *   state, only the second click invokes onRemoveCoreJob.
+ * - Blur on the armed button disarms it back to Remove.
+ * - While a removal is in flight the button shows Removing… and is disabled.
+ */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -43,15 +53,24 @@ function renderList(
   return props;
 }
 
+const removeButton = () => screen.getByTestId('cron-job-remove-job-1');
+
 describe('CoreJobList — destructive remove safety', () => {
+  it('renders the job row with its actions', () => {
+    renderList();
+    expect(screen.getByText('Hello Job')).toBeTruthy();
+    expect(removeButton()).toBeTruthy();
+  });
+
   it('needs a second click to actually remove a job', () => {
     const onRemove = vi.fn();
     renderList({ onRemove });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    fireEvent.click(removeButton());
     expect(onRemove).not.toHaveBeenCalled();
+    expect(removeButton().textContent).toBe('Confirm');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm remove?' }));
+    fireEvent.click(removeButton());
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith('job-1');
   });
@@ -59,17 +78,17 @@ describe('CoreJobList — destructive remove safety', () => {
   it('cancels the confirm state when focus leaves the button', () => {
     renderList();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
-    fireEvent.blur(screen.getByRole('button', { name: 'Confirm remove?' }));
+    fireEvent.click(removeButton());
+    fireEvent.blur(removeButton());
 
-    expect(screen.queryByRole('button', { name: 'Confirm remove?' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument();
+    expect(removeButton().textContent).toBe('Remove');
   });
 
   it('shows Removing… and disables the button while removal is in flight', () => {
     renderList({ coreBusyKey: 'core-remove:job-1' });
 
-    const removing = screen.getByRole('button', { name: 'Removing…' });
+    const removing = removeButton();
+    expect(removing.textContent).toBe('Removing…');
     expect(removing).toBeDisabled();
   });
 });
