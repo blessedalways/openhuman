@@ -1970,13 +1970,10 @@ describe('ChatRuntimeProvider — dedupe, proactive resolution, mid-turn invaria
   // user-friendly `message` from classify_inference_error() in web_errors.rs,
   // which is forwarded directly so the user sees the real reason (for
   // 'inference' that message is a friendly summary plus the sanitized upstream
-  // provider error as a `> quote` block). The USER_FACING_FALLBACK constant is
-  // only used when the server sends an empty/missing message. 'cancelled'
-  // produces no bubble at all.
+  // provider error as a `> quote` block). The fallback bubble (with error type
+  // and provider) is only used when the server sends an empty/missing message.
+  // 'cancelled' produces no bubble at all.
   describe('inference error classifier — full type set', () => {
-    const USER_FACING_FALLBACK =
-      'Something went wrong. Please try again.\nThis error has been reported. You can also report it on Discord.\n<openhuman-link path="community/discord-report">Report on Discord</openhuman-link>';
-
     it.each([
       ['rate_limited', 'You have been rate limited. Please try again later.'],
       ['auth_error', 'Authentication failed. Please reconnect your account.'],
