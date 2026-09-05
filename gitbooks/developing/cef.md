@@ -17,11 +17,11 @@ Stock Tauri uses each platform's native webview. WKWebView on macOS, WebView2 on
 
 CDP is the load-bearing primitive. Every "watch what's happening inside Slack / WhatsApp / Telegram / Discord / Meet" feature in OpenHuman talks to those embedded apps via CDP, not via injected JavaScript. CDP gives us:
 
-* `Target.getTargets` to discover every page and service worker.
-* `IndexedDB.requestDatabaseNames` / `requestDatabase` / `requestData` to walk a third-party app's local storage.
-* `DOMSnapshot.captureSnapshot` for read-only DOM inspection that doesn't trip framework reactivity.
-* `Runtime.evaluate` for ephemeral one-shot reads (a single fixed JSON serializer, never a persistent bridge).
-* `Page.addScriptToEvaluateOnNewDocument` for the small number of cases where we genuinely need a renderer-side shim before page JS runs.
+- `Target.getTargets` to discover every page and service worker.
+- `IndexedDB.requestDatabaseNames` / `requestDatabase` / `requestData` to walk a third-party app's local storage.
+- `DOMSnapshot.captureSnapshot` for read-only DOM inspection that doesn't trip framework reactivity.
+- `Runtime.evaluate` for ephemeral one-shot reads (a single fixed JSON serializer, never a persistent bridge).
+- `Page.addScriptToEvaluateOnNewDocument` for the small number of cases where we genuinely need a renderer-side shim before page JS runs.
 
 Stock webviews can't give us any of that. So we vendor CEF.
 
@@ -33,15 +33,17 @@ The vendored runtime lives at [`app/src-tauri/vendor/tauri-cef/`](https://github
 
 Every connected provider that runs as a hosted web app gets its own child CEF webview:
 
-* WhatsApp Web
-* Telegram Web
-* Slack
-* Discord
-* Google Meet
-* LinkedIn
-* Gmail
-* Zoom
-* browserscan
+- WhatsApp Web
+- Telegram Web
+- Slack
+- Discord
+- Google Meet
+- LinkedIn
+- Gmail
+- Zoom
+- WeChat
+- Google Messages
+- browserscan
 
 Per-account storage is isolated to `{app_local_data_dir}/webview_accounts/{id}/`. Two Slack workspaces, two browser profiles. Code: [`app/src-tauri/src/webview_accounts/mod.rs`](../../app/src-tauri/src/webview_accounts/mod.rs).
 
@@ -49,14 +51,16 @@ Per-account storage is isolated to `{app_local_data_dir}/webview_accounts/{id}/`
 
 Each provider has a **scanner module** in [`app/src-tauri/src/`](https://github.com/tinyhumansai/openhuman/tree/main/app/src-tauri/src). Every scanner holds a long-lived WebSocket to CEF's `--remote-debugging-port=19222` and ticks on a fixed schedule:
 
-| Scanner            | Cadence                         | What it does                                                         |
-| ------------------ | ------------------------------- | -------------------------------------------------------------------- |
-| `whatsapp_scanner` | 2s DOM tick + 30s full IDB walk | Reads message stores, pulls media metadata                           |
-| `telegram_scanner` | Same                            | Plus QR-login hand-off to native Telegram Desktop                    |
-| `slack_scanner`    | 30s IDB walk                    | Pure IDB - no DOM scrape needed                                      |
-| `discord_scanner`  | Periodic                        | Channel + DM state via CDP                                           |
-| `meet_scanner`     | Periodic                        | Live captions + participant state during calls                       |
-| `imessage_scanner` | Periodic                        | **No webview.** Reads `~/Library/Messages/chat.db` directly on macOS |
+| Scanner             | Cadence                         | What it does                                                         |
+| ------------------- | ------------------------------- | -------------------------------------------------------------------- |
+| `whatsapp_scanner`  | 2s DOM tick + 30s full IDB walk | Reads message stores, pulls media metadata                           |
+| `telegram_scanner`  | Same                            | Plus QR-login hand-off to native Telegram Desktop                    |
+| `slack_scanner`     | 30s IDB walk                    | Pure IDB - no DOM scrape needed                                      |
+| `discord_scanner`   | Periodic                        | Channel + DM state via CDP                                           |
+| `meet_scanner`      | Periodic                        | Live captions + participant state during calls                       |
+| `wechat_scanner`    | Periodic                        | WeChat Web chat list + active conversation DOM scrape via CDP        |
+| `gmessages_scanner` | Periodic                        | Google Messages Web read-only IndexedDB walk                         |
+| `imessage_scanner`  | Periodic                        | **No webview.** Reads `~/Library/Messages/chat.db` directly on macOS |
 
 Each scan emits `webview:event` payloads and POSTs `openhuman.memory_doc_ingest` straight to the core RPC, so memory grows whether the UI window is open or backgrounded.
 
@@ -86,11 +90,11 @@ This matters because anything host-controlled that runs inside a third-party ori
 
 | Provider    | Migrated?     | What loads at startup            |
 | ----------- | ------------- | -------------------------------- |
-| WhatsApp    | ✅             | Zero JS                          |
-| Telegram    | ✅             | Zero JS                          |
-| Slack       | ✅             | Zero JS                          |
-| Discord     | ✅             | Zero JS                          |
-| browserscan | ✅             | Zero JS                          |
+| WhatsApp    | ✅            | Zero JS                          |
+| Telegram    | ✅            | Zero JS                          |
+| Slack       | ✅            | Zero JS                          |
+| Discord     | ✅            | Zero JS                          |
+| browserscan | ✅            | Zero JS                          |
 | Gmail       | grandfathered | Legacy `runtime.js` bridge       |
 | LinkedIn    | grandfathered | Legacy `LINKEDIN_RECIPE_JS`      |
 | Google Meet | grandfathered | Camera + audio + caption bridges |
@@ -100,6 +104,56 @@ Legacy injection should shrink, never grow. New providers go straight onto the C
 ## CEF prewarm
 
 A hidden CEF webview (`cef-prewarm`) boots the browser on app launch so the first child webview spawns instantly when the user clicks. It's torn down before `cef::shutdown()` to avoid races during quit. See `app/src-tauri/src/lib.rs` around the prewarm + close lifecycle.
+
+## Windows startup triage
+
+CEF initializes before the onboarding UI can recover from renderer failures. If
+Windows users report a silent exit, a permanent "Connecting..." spinner, or a
+`tauri-runtime-cef` assertion before the first interactive window appears, ask
+for these details in the issue:
+
+- Windows edition and full build number, especially for Insider builds.
+- OpenHuman version and installer type (`.msi` or `.exe`).
+- Whether `%LOCALAPPDATA%\com.openhuman.app` was moved aside before retrying.
+- Startup log lines from `[startup]`, `[cef-profile]`, and `[cef-startup]`.
+- Any panic text that names `tauri-runtime-cef/src/lib.rs`.
+
+For Windows Insider builds, also confirm whether the same installer launches on
+the current stable Windows release. That separates a profile/cache problem from
+an OS/runtime compatibility regression in CEF startup.
+
+If the logs point to a GPU-process startup failure rather than a stale CEF
+profile lock, set `OPENHUMAN_DISABLE_GPU=1` before launching OpenHuman. On
+Windows this pins CEF to the pure-software ANGLE/SwiftShader GL backend
+(`--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader
+--disable-gpu-compositing`) rather than bare `--disable-gpu`: on NVIDIA Blackwell
+/ RTX 50-series stacks the GPU process fails to initialise and `--disable-gpu`
+alone leaves CEF with no working software GL path, so `cef::initialize` still
+returns 0 (#4294, #4385). SwiftShader needs no hardware driver, so it lets CEF
+start on GPUs the bundled Chromium (currently CEF 146.4.1) doesn't yet support.
+On other platforms the same env var passes `--disable-gpu` and
+`--disable-gpu-compositing` without forwarding arbitrary Chromium flags. Leave it
+unset for normal use because forcing software rendering slows WebGL-heavy surfaces.
+
+## Linux shell fallback for CEF startup crashes
+
+On some Linux desktops, especially NVIDIA proprietary driver setups under Wayland/XWayland, the Tauri/CEF shell can fail during native window configuration before the React app becomes usable. One known symptom is an X11 `BadWindow` error after CEF reports the main browser context.
+
+When the core itself is healthy, you can keep developing by running the core and frontend separately:
+
+```bash
+cargo build --bin openhuman-core
+./target/debug/openhuman-core run --port 7788
+```
+
+In another terminal:
+
+```bash
+cd app
+pnpm dev
+```
+
+Open the Vite URL in a regular browser, choose **Advanced** / remote core mode, set the RPC URL to `http://127.0.0.1:7788/rpc`, and use the bearer token written by the core. This bypasses native-only features such as tray, auto-update, and embedded provider webviews, but keeps the agent, memory, skills, and RPC surface available for debugging.
 
 ## Plugin audit
 
@@ -137,5 +191,4 @@ Each connected account gets its own profile and its own IDB. CDP can snapshot on
 
 ## See also
 
-* [`docs/TAURI_CEF_FINDINGS_AND_CHANGES.md`](../../docs/TAURI_CEF_FINDINGS_AND_CHANGES.md). the notification-permission deep dive.
-* [`CLAUDE.md`](../../CLAUDE.md). the canonical "no new JS injection" rule.
+- [`CLAUDE.md`](../../CLAUDE.md). the canonical "no new JS injection" rule.

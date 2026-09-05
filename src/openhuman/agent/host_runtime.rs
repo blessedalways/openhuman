@@ -1,5 +1,6 @@
 //! Native and Docker shell runtime adapters (`RuntimeAdapter` implementations).
 
+use crate::openhuman::agent::platform_shell;
 use crate::openhuman::config::RuntimeConfig;
 use std::path::{Path, PathBuf};
 
@@ -23,17 +24,24 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> anyhow::Result<tokio::process::Command>;
 }
 
-pub struct NativeRuntime;
-
-impl Default for NativeRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Default)]
+pub struct NativeRuntime {
+    /// When true, shell-family child processes are spawned with the Windows
+    /// `CREATE_NO_WINDOW` flag so no console window flashes. Sourced from
+    /// `[shell] hide_window` (#3727/#3728). No effect on macOS/Linux.
+    hide_window: bool,
 }
 
 impl NativeRuntime {
+    /// A native runtime with default behaviour (no window suppression).
     pub const fn new() -> Self {
-        Self
+        Self { hide_window: false }
+    }
+
+    /// A native runtime that suppresses the Windows console window for spawned
+    /// shell child processes when `hide_window` is true.
+    pub const fn with_hide_window(hide_window: bool) -> Self {
+        Self { hide_window }
     }
 }
 
@@ -70,10 +78,45 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-lc").arg(command).current_dir(workspace_dir);
+        // Shell selection is shared with the sandboxed execution paths in
+        // `sandbox::ops` so all three sites (native, unsandboxed, jailed)
+        // pick the same platform-appropriate shell (#4705).
+        let mut cmd = platform_shell::build_tokio_command(command);
+        // Validate the CWD up front so a missing/bad action_dir produces an
+        // actionable message naming the path, instead of an opaque OS error 267
+        // (ERROR_DIRECTORY) from CreateProcessW on Windows / a raw ENOENT on
+        // Unix when the process is spawned. Covers all three shell-family tools
+        // (shell / node_exec / npm_exec) since they all route through here.
+        // (#3353, Fix 2)
+        crate::openhuman::config::ensure_usable_cwd(workspace_dir)?;
+        cmd.current_dir(workspace_dir);
+        // Optionally suppress the Windows console window for this child process
+        // (`[shell] hide_window`). No-op when disabled and on non-Windows hosts.
+        maybe_hide_window(&mut cmd, self.hide_window);
         Ok(cmd)
     }
+}
+
+/// Suppress the Windows console window for a shell child process when `hide` is
+/// set, by applying the `CREATE_NO_WINDOW` creation flag (`0x08000000`). No-op
+/// when `hide` is false, and on non-Windows hosts the flag does not exist so this
+/// does nothing regardless. Delegates to the shared [`apply_no_window`] helper so
+/// there is a single source of truth for the flag (#3727/#3728).
+fn maybe_hide_window(cmd: &mut tokio::process::Command, hide: bool) {
+    tracing::trace!(
+        hide_window = hide,
+        windows = cfg!(windows),
+        "[agent][runtime] hide_window evaluated for shell child process"
+    );
+    if !hide {
+        return;
+    }
+    crate::openhuman::inference::local::process_util::apply_no_window(cmd);
+    #[cfg(windows)]
+    tracing::debug!(
+        creation_flags = "0x08000000",
+        "[agent][runtime] applied CREATE_NO_WINDOW to shell child process"
+    );
 }
 
 pub struct DockerRuntime {
@@ -143,103 +186,28 @@ impl RuntimeAdapter for DockerRuntime {
         }
 
         cmd.arg(&self.config.image);
+        // No `pipefail` wrapper here (unlike NativeRuntime): the in-container
+        // shell is image-dependent (busybox/dash/bash) so we can't assume
+        // `set -o pipefail` is supported. Container commands keep POSIX `sh`.
         cmd.arg("sh").arg("-lc").arg(command);
         Ok(cmd)
     }
 }
 
-pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+/// Build the runtime adapter for the configured `kind`. `hide_window` comes
+/// from `[shell] hide_window` and only affects the native runtime on Windows
+/// (the docker runtime spawns the `docker` client, out of scope here).
+pub fn create_runtime(
+    config: &RuntimeConfig,
+    hide_window: bool,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     match config.kind.as_str() {
-        "native" => Ok(Box::new(NativeRuntime::new())),
+        "native" => Ok(Box::new(NativeRuntime::with_hide_window(hide_window))),
         "docker" => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
         other => anyhow::bail!("Unsupported runtime kind: {other}"),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::config::{DockerRuntimeConfig, RuntimeConfig};
-
-    #[test]
-    fn native_runtime_reports_capabilities_and_shell_command() {
-        let runtime = NativeRuntime::new();
-        assert_eq!(runtime.name(), "native");
-        assert!(runtime.has_shell_access());
-        assert!(runtime.has_filesystem_access());
-        assert!(runtime.supports_long_running());
-        assert_eq!(runtime.memory_budget(), 0);
-        assert!(runtime.storage_path().ends_with("openhuman/runtime"));
-
-        let command = runtime
-            .build_shell_command("echo hi", Path::new("/tmp"))
-            .unwrap();
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(command.as_std().get_program().to_string_lossy(), "sh");
-        assert_eq!(args, vec!["-lc", "echo hi"]);
-        assert_eq!(command.as_std().get_current_dir(), Some(Path::new("/tmp")));
-    }
-
-    #[test]
-    fn docker_runtime_builds_expected_flags() {
-        let runtime = DockerRuntime::new(DockerRuntimeConfig {
-            image: "alpine:3.20".into(),
-            network: "host".into(),
-            mount_workspace: true,
-            read_only_rootfs: true,
-            memory_limit_mb: Some(512),
-            cpu_limit: Some(1.5),
-            ..DockerRuntimeConfig::default()
-        });
-        assert_eq!(runtime.name(), "docker");
-        assert!(runtime.has_shell_access());
-        assert!(runtime.has_filesystem_access());
-        assert!(!runtime.supports_long_running());
-        assert_eq!(runtime.memory_budget(), 512);
-        assert!(runtime.storage_path().ends_with("openhuman/runtime/docker"));
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let command = runtime.build_shell_command("pwd", tempdir.path()).unwrap();
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        let joined = args.join(" ");
-        assert!(joined.contains("run --rm"));
-        assert!(joined.contains("--network host"));
-        assert!(joined.contains("-m 512m"));
-        assert!(joined.contains("--cpus 1.5"));
-        assert!(joined.contains("--read-only"));
-        assert!(joined.contains(":/workspace"));
-        assert!(joined.contains("-w /workspace"));
-        assert!(joined.contains("alpine:3.20"));
-        assert!(joined.ends_with("sh -lc pwd"));
-    }
-
-    #[test]
-    fn create_runtime_supports_native_and_docker_and_rejects_unknown() {
-        let native = create_runtime(&RuntimeConfig::default()).unwrap();
-        assert_eq!(native.name(), "native");
-
-        let docker = create_runtime(&RuntimeConfig {
-            kind: "docker".into(),
-            docker: DockerRuntimeConfig::default(),
-            ..RuntimeConfig::default()
-        })
-        .unwrap();
-        assert_eq!(docker.name(), "docker");
-
-        let err = create_runtime(&RuntimeConfig {
-            kind: "vm".into(),
-            ..RuntimeConfig::default()
-        })
-        .err()
-        .unwrap();
-        assert!(err.to_string().contains("Unsupported runtime kind: vm"));
-    }
-}
+#[path = "host_runtime_tests.rs"]
+mod tests;

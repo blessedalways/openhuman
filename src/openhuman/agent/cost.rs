@@ -8,7 +8,7 @@
 //!
 //! - emit per-iteration cost telemetry via
 //!   [`crate::openhuman::agent::progress::AgentProgress::TurnCostUpdated`];
-//! - feed an upcoming budget stop-hook (mid-turn USD cap);
+//! - feed budget stop hooks (mid-turn USD cap);
 //! - log accurate end-of-turn cost lines.
 //!
 //! When `charged_amount_usd` is zero (older backend builds, providers
@@ -23,7 +23,7 @@
 //! cents-per-Mtok at the tier level is good enough for client-side
 //! telemetry and budget gating. PRs adding new tiers should add a row.
 
-use crate::openhuman::providers::UsageInfo;
+use crate::openhuman::inference::provider::UsageInfo;
 
 /// Per-million-token rates for a single model tier.
 ///
@@ -33,15 +33,15 @@ use crate::openhuman::providers::UsageInfo;
 /// `input_tokens - cached_input_tokens` are charged at
 /// `input_per_mtok_usd`.
 #[derive(Debug, Clone, Copy)]
-pub struct ModelPricing {
+pub(crate) struct ModelPricing {
     /// Tier identifier, e.g. `"agentic-v1"`.
-    pub model: &'static str,
+    pub(crate) model: &'static str,
     /// Standard prompt rate, USD per million input tokens.
-    pub input_per_mtok_usd: f64,
+    pub(crate) input_per_mtok_usd: f64,
     /// Cached-prefix prompt rate, USD per million cached input tokens.
-    pub cached_input_per_mtok_usd: f64,
+    pub(crate) cached_input_per_mtok_usd: f64,
     /// Completion rate, USD per million output tokens.
-    pub output_per_mtok_usd: f64,
+    pub(crate) output_per_mtok_usd: f64,
 }
 
 /// Conservative fallback when nothing in the table matches. Picked so
@@ -61,48 +61,113 @@ const FALLBACK_PRICING: ModelPricing = ModelPricing {
 /// list at the time of writing for the tiers' default mappings; treat
 /// them as best-effort estimates for cases where the backend doesn't
 /// echo `charged_amount_usd`.
-pub const PRICING_TABLE: &[ModelPricing] = &[
-    // Reasoning tier — currently maps to Claude Opus 4.x family.
+const PRICING_TABLE: &[ModelPricing] = &[
+    // Reasoning tier — managed "Pro" model rates (estimate; the backend's
+    // echoed `charged_amount_usd` is authoritative when present). Shared with
+    // the coding/agentic tiers below. Update when backend pricing changes.
     ModelPricing {
         model: "reasoning-v1",
-        input_per_mtok_usd: 15.00,
-        cached_input_per_mtok_usd: 1.50,
-        output_per_mtok_usd: 75.00,
+        input_per_mtok_usd: 0.435,
+        cached_input_per_mtok_usd: 0.003625,
+        output_per_mtok_usd: 0.87,
     },
-    // Agentic tier — maps to Sonnet-class models.
+    // Chat tier — managed "Flash" model rates (estimate). Cheaper, lower-latency
+    // model used for direct conversational turns.
+    ModelPricing {
+        model: "chat-v1",
+        input_per_mtok_usd: 0.14,
+        cached_input_per_mtok_usd: 0.0028,
+        output_per_mtok_usd: 0.28,
+    },
+    // Legacy chat tier slug retained for older transcripts/configs — "Flash"
+    // rates, same as `chat-v1`.
+    ModelPricing {
+        model: "reasoning-quick-v1",
+        input_per_mtok_usd: 0.14,
+        cached_input_per_mtok_usd: 0.0028,
+        output_per_mtok_usd: 0.28,
+    },
+    // Agentic tier — managed "Pro" model rates (same as reasoning).
     ModelPricing {
         model: "agentic-v1",
-        input_per_mtok_usd: 3.00,
-        cached_input_per_mtok_usd: 0.30,
-        output_per_mtok_usd: 15.00,
+        input_per_mtok_usd: 0.435,
+        cached_input_per_mtok_usd: 0.003625,
+        output_per_mtok_usd: 0.87,
     },
-    // Coding tier — Sonnet-class.
+    // Coding tier — managed "Pro" model rates (same as reasoning).
     ModelPricing {
         model: "coding-v1",
+        input_per_mtok_usd: 0.435,
+        cached_input_per_mtok_usd: 0.003625,
+        output_per_mtok_usd: 0.87,
+    },
+    // Burst tier — high-throughput, low-cost model; flat rate both directions,
+    // no prompt cache (so cached rate mirrors the input rate). Used by fast,
+    // high-fanout workers.
+    ModelPricing {
+        model: "burst-v1",
+        input_per_mtok_usd: 0.208,
+        cached_input_per_mtok_usd: 0.208,
+        output_per_mtok_usd: 0.208,
+    },
+    // Vision tier — multimodal; estimate only. The backend's echoed
+    // `charged_amount_usd` is authoritative when present.
+    ModelPricing {
+        model: "vision-v1",
         input_per_mtok_usd: 3.00,
         cached_input_per_mtok_usd: 0.30,
         output_per_mtok_usd: 15.00,
     },
 ];
 
+/// Whether `model` is one of the managed OpenHuman tier handles (routed and
+/// billed by the OpenHuman backend). Anything else — concrete vendor ids
+/// (`claude-*`, `gpt-*`, OpenRouter slugs) or local model names — is a
+/// custom/BYO-provider model. Used by trace exporters to stamp model
+/// provenance (`gen_ai.provider` = "managed" | "custom").
+pub(crate) fn is_managed_tier(model: &str) -> bool {
+    PRICING_TABLE.iter().any(|row| row.model == model)
+}
+
 /// Look up pricing for a model name, falling back to [`FALLBACK_PRICING`].
 ///
-/// Matching is exact on the canonical tier name and case-insensitive on
-/// concrete vendor names (so `"claude-opus"` still hits the
-/// reasoning-tier row when callers pass an underlying model string).
-pub fn lookup_pricing(model: &str) -> ModelPricing {
+/// Resolution order:
+/// 1. Exact match on a canonical OpenHuman tier name (`agentic-v1`, …).
+/// 2. The concrete-vendor-model pricing catalog
+///    ([`crate::openhuman::platform::cost::catalog`]) — accurate per-model rates for
+///    `claude-*`, `gpt-*`, `gemini-*`, `deepseek-*`, `kimi-*`, `qwen-*`,
+///    `mistral-*`, including OpenRouter-style `vendor/model` ids.
+/// 3. Coarse case-insensitive vendor-name heuristics (so an unrecognised
+///    `"…opus…"` string still maps to the reasoning tier).
+/// 4. [`FALLBACK_PRICING`].
+pub(crate) fn lookup_pricing(model: &str) -> ModelPricing {
     if let Some(row) = PRICING_TABLE.iter().find(|row| row.model == model) {
         return *row;
     }
+    if let Some(price) = crate::openhuman::platform::cost::catalog::lookup(model) {
+        return ModelPricing {
+            model: price.model_id,
+            input_per_mtok_usd: price.input_per_mtok_usd,
+            cached_input_per_mtok_usd: price.cached_input_per_mtok_usd,
+            output_per_mtok_usd: price.output_per_mtok_usd,
+        };
+    }
     let lower = model.to_ascii_lowercase();
+    let by_tier = |tier: &str| {
+        PRICING_TABLE
+            .iter()
+            .find(|row| row.model == tier)
+            .copied()
+            .unwrap_or(FALLBACK_PRICING)
+    };
     if lower.contains("opus") {
-        return PRICING_TABLE[0];
+        return by_tier("reasoning-v1");
     }
     if lower.contains("coding") {
-        return PRICING_TABLE[2];
+        return by_tier("coding-v1");
     }
     if lower.contains("sonnet") || lower.contains("agentic") {
-        return PRICING_TABLE[1];
+        return by_tier("agentic-v1");
     }
     FALLBACK_PRICING
 }
@@ -176,89 +241,5 @@ impl TurnCost {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn usage(input: u64, output: u64, cached: u64, charged: f64) -> UsageInfo {
-        UsageInfo {
-            input_tokens: input,
-            output_tokens: output,
-            cached_input_tokens: cached,
-            charged_amount_usd: charged,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn lookup_pricing_matches_canonical_tiers() {
-        assert_eq!(lookup_pricing("reasoning-v1").input_per_mtok_usd, 15.0);
-        assert_eq!(lookup_pricing("agentic-v1").output_per_mtok_usd, 15.0);
-    }
-
-    #[test]
-    fn lookup_pricing_falls_back_for_unknown_model() {
-        let p = lookup_pricing("totally-unknown-model");
-        assert_eq!(p.model, "<fallback>");
-    }
-
-    #[test]
-    fn lookup_pricing_handles_concrete_vendor_names() {
-        assert_eq!(lookup_pricing("claude-opus-4.7").input_per_mtok_usd, 15.0);
-        assert_eq!(
-            lookup_pricing("claude-sonnet-4-6").output_per_mtok_usd,
-            15.0
-        );
-    }
-
-    #[test]
-    fn lookup_pricing_routes_coding_to_coding_row_not_agentic() {
-        // Pinned per CodeRabbit feedback: when the coding-tier row
-        // diverges from agentic, "coding" model strings must hit
-        // PRICING_TABLE[2], not [1].
-        assert_eq!(lookup_pricing("coding-v1").model, "coding-v1");
-        assert_eq!(lookup_pricing("agentic-v1").model, "agentic-v1");
-    }
-
-    #[test]
-    fn estimate_call_cost_subtracts_cached_input() {
-        // 1M standard input + 1M cached input + 1M output on agentic-v1.
-        let u = usage(2_000_000, 1_000_000, 1_000_000, 0.0);
-        let est = estimate_call_cost_usd("agentic-v1", &u);
-        // 1M * 3 + 1M * 0.3 + 1M * 15 = 18.3
-        assert!((est - 18.3).abs() < 1e-6, "got {est}");
-    }
-
-    #[test]
-    fn call_cost_prefers_charged_when_present() {
-        let u = usage(100_000, 200_000, 0, 0.42);
-        assert_eq!(call_cost_usd("reasoning-v1", &u), 0.42);
-    }
-
-    #[test]
-    fn call_cost_falls_back_to_estimate_when_charged_zero() {
-        let u = usage(1_000_000, 0, 0, 0.0);
-        // 1M input * 3 = 3
-        assert!((call_cost_usd("agentic-v1", &u) - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn turn_cost_accumulates_charged_and_estimated_separately() {
-        let mut tc = TurnCost::new();
-        tc.add_call("reasoning-v1", &usage(0, 0, 0, 0.10));
-        tc.add_call("agentic-v1", &usage(1_000_000, 0, 0, 0.0)); // est: 3.00
-        assert_eq!(tc.call_count, 2);
-        assert!((tc.charged_usd - 0.10).abs() < 1e-6);
-        assert!((tc.estimated_usd - 3.0).abs() < 1e-6);
-        assert!((tc.total_usd() - 3.10).abs() < 1e-6);
-    }
-
-    #[test]
-    fn turn_cost_aggregates_token_counts() {
-        let mut tc = TurnCost::new();
-        tc.add_call("agentic-v1", &usage(100, 50, 20, 0.0));
-        tc.add_call("agentic-v1", &usage(200, 75, 0, 0.0));
-        assert_eq!(tc.input_tokens, 300);
-        assert_eq!(tc.output_tokens, 125);
-        assert_eq!(tc.cached_input_tokens, 20);
-    }
-}
+#[path = "cost_tests.rs"]
+mod tests;

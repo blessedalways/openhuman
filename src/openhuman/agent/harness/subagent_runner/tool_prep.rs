@@ -2,17 +2,15 @@
 //! body before [`super::run_typed_mode`] spins up its tool-loop.
 //!
 //! Kept together because they share a theme (what does the sub-agent
-//! actually see?) and because several of them are exposed `pub(crate)`
-//! so the debug-dump path in
-//! [`crate::openhuman::agent::debug`] can mirror the live runner
-//! byte-for-byte instead of carrying its own drifting copies.
-
-use std::collections::HashSet;
+//! actually see?). Only the text-mode protocol renderer is exposed outside
+//! this module so the debug-dump path in [`crate::openhuman::agent::debug`] can
+//! mirror the live runner byte-for-byte instead of carrying its own drifting
+//! copy.
 
 use super::super::definition::{PromptSource, ToolScope};
 use super::types::SubagentRunError;
-use crate::openhuman::context::prompt::PromptContext;
-use crate::openhuman::tools::{Tool, ToolSpec};
+use crate::openhuman::agent::context::prompt::PromptContext;
+use crate::openhuman::tools::Tool;
 
 // ── Heavy-schema toolkit accounting ─────────────────────────────────────
 
@@ -54,11 +52,14 @@ pub(super) fn top_k_for_toolkit(toolkit: &str) -> usize {
 
 // ── Text-mode protocol block ────────────────────────────────────────────
 
-/// Format a set of `ToolSpec`s as an XML tool-use protocol block
-/// appended to the system prompt in text mode. Mirrors
-/// [`crate::openhuman::agent::dispatcher::XmlToolDispatcher::prompt_instructions`]
-/// — same `<tool_call>{…}</tool_call>` format so the existing
-/// `parse_tool_calls` helper understands what the model emits.
+/// Format the tool-use protocol block appended to the system prompt in text
+/// mode. Teaches **P-Format** first (the same protocol
+/// [`crate::openhuman::agent::dispatcher::PFormatToolDispatcher`] renders and
+/// the tinyagents adapter parses via `parse_tool_calls_with_pformat`), with
+/// the legacy JSON-in-tag form as the documented fallback for nested
+/// arguments. The `## Tools` catalogue already renders `Call as:` p-format
+/// signatures for every tool, so teaching JSON here contradicted the
+/// catalogue and threw away the p-format token savings.
 ///
 /// Per-parameter rendering is intentionally **compact**: name, type, a
 /// "required" marker, and a short one-line description if present. We
@@ -70,7 +71,7 @@ pub(super) fn top_k_for_toolkit(toolkit: &str) -> usize {
 /// correctly while staying within budget. If the model needs deeper
 /// schema detail it can surface the error and the orchestrator will
 /// clarify on the next turn.
-pub(crate) fn build_text_mode_tool_instructions(_specs: &[ToolSpec]) -> String {
+pub(crate) fn build_text_mode_tool_instructions() -> String {
     // The tool catalog is already rendered in the prompt's `## Tools`
     // section (see `prompts::ToolsSection::build`) with full
     // `Call as: NAME[arg|arg]` signatures. We previously also emitted
@@ -83,29 +84,28 @@ pub(crate) fn build_text_mode_tool_instructions(_specs: &[ToolSpec]) -> String {
     let mut out = String::new();
     out.push_str("## Tool Use Protocol\n\n");
     out.push_str(
-        "To use a tool, wrap a JSON object in <tool_call></tool_call> tags. \
-         Do not nest tags. Emit one tag per call; you can emit multiple tags \
-         in the same response if you need to run calls in parallel.\n\n",
+        "Tool calls use **P-Format** (Parameter-Format): compact, positional, \
+         pipe-delimited syntax wrapped in `<tool_call>` tags.\n\n",
     );
+    out.push_str("```\n<tool_call>\nGMAIL_FETCH_EMAILS[ca_123||10]\n</tool_call>\n```\n\n");
     out.push_str(
-        "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n",
+        "**Rules:**\n\
+         - Form: `name[arg1|arg2|...|argN]`. Arguments are positional and must match the \
+           order shown in each tool's `Call as:` signature in the `## Tools` section \
+           (alphabetical by parameter name). Leave a slot empty to omit that argument.\n\
+         - Empty calls: `name[]` for zero-arg tools.\n\
+         - Escapes inside argument values: `\\|` for a literal `|`, `\\]` for `]`, `\\\\` for `\\`.\n\
+         - Do not nest tags. Emit one tag per call; you can emit multiple tags in the same \
+           response to run calls in parallel.\n\
+         - When an argument needs a nested object or array that p-format cannot express, \
+           fall back to the JSON form in the same tags: \
+           `<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>`. \
+           Prefer p-format for everything else.\n",
     );
     out
 }
 
 // ── Tool filtering ──────────────────────────────────────────────────────
-
-/// Tools that must never be visible to any agent except `welcome`.
-///
-/// `complete_onboarding` flips the onboarding-complete flag in
-/// workspace config and is the terminal step of the welcome flow;
-/// every other agent must route the user back to the welcome agent
-/// rather than call it directly. Central list here so both the main
-/// agent builder ([`crate::openhuman::agent::harness::session::builder`])
-/// and the subagent runner apply the same guard.
-pub(crate) fn is_welcome_only_tool(name: &str) -> bool {
-    matches!(name, "complete_onboarding")
-}
 
 /// Tools that spawn a new sub-agent turn. A sub-agent must never be
 /// able to invoke any of these — only the top-level orchestrator
@@ -117,6 +117,12 @@ pub(crate) fn is_welcome_only_tool(name: &str) -> bool {
 /// * every synthesised per-archetype `delegate_*` tool
 ///   ([`crate::openhuman::tools::orchestrator_tools::collect_orchestrator_tools`]
 ///   emits `delegate_researcher`, `delegate_planner`, …).
+/// * `agent_prepare_context` — the context-scout entry point. It reads the
+///   *parent's* visible catalog/session via `current_parent()`, which inside a
+///   nested run is still the top-level orchestrator (the runner does not
+///   install a child-scoped parent context). A wildcard or named sub-agent
+///   calling it would therefore scout against the orchestrator's surface, not
+///   its own. Context preparation is a top-level concern only.
 ///
 /// Kept as a tight prefix/exact match rather than a registry lookup so
 /// the strip is cheap to run inside [`super::ops::run_typed_mode`]'s
@@ -124,7 +130,26 @@ pub(crate) fn is_welcome_only_tool(name: &str) -> bool {
 /// this function and the corresponding generator in
 /// `orchestrator_tools.rs` together.
 pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
-    name == "spawn_subagent" || name.starts_with("delegate_")
+    if name == "spawn_subagent" || name.starts_with("delegate_") || name == "agent_prepare_context"
+    {
+        return true;
+    }
+    // Synthesised delegation tools are named by the target agent's
+    // `delegate_name` override, which mostly does NOT carry the `delegate_`
+    // prefix (`plan`, `run_code`, `research`, `review_code`, `do_crypto`,
+    // `schedule_task`, …). The prefix check above misses every one of them,
+    // which let wildcard-scoped children inherit the orchestrator's spawn
+    // surface. Resolve the override names via the registry so the strip
+    // stays in lockstep with `collect_orchestrator_tools`'s naming.
+    if let Some(registry) =
+        crate::openhuman::agent::harness::definition::AgentDefinitionRegistry::global()
+    {
+        return registry
+            .list()
+            .iter()
+            .any(|def| def.delegate_name.as_deref() == Some(name));
+    }
+    false
 }
 
 /// Returns indices into `parent_tools` for the tools the sub-agent may
@@ -136,16 +161,12 @@ pub(super) fn is_subagent_spawn_tool(name: &str) -> bool {
 /// 2. `skill_filter` — restrict to tools named `{skill}__*`.
 /// 3. `scope` — `Wildcard` (everything remaining) or `Named` allowlist.
 ///
-/// Exposed `pub(crate)` so the debug dump path in
-/// [`crate::openhuman::agent::debug`] shares the exact same
-/// filter logic as the live runner instead of keeping a separate copy.
-pub(crate) fn filter_tool_indices(
+pub(super) fn filter_tool_indices(
     parent_tools: &[Box<dyn Tool>],
     scope: &ToolScope,
     disallowed: &[String],
     skill_filter: Option<&str>,
 ) -> Vec<usize> {
-    let disallow_set: HashSet<&str> = disallowed.iter().map(|s| s.as_str()).collect();
     let skill_prefix = skill_filter.map(|s| format!("{s}__"));
 
     parent_tools
@@ -153,8 +174,17 @@ pub(crate) fn filter_tool_indices(
         .enumerate()
         .filter(|(_, tool)| {
             let name = tool.name();
-            if disallow_set.contains(name) {
+            if disallowed_tool_matches(disallowed, name) {
                 return false;
+            }
+            // The CCR recovery tool is advertised to any agent that has a tool
+            // surface — compaction applies to its tool output, so the retrieve
+            // footer must be actionable regardless of scope/skill filters (an
+            // explicit `disallow` above still wins). A deliberately tool-less
+            // agent (`Named([])`, e.g. the payload summarizer) runs no tools,
+            // produces no compacted output, and so stays tool-less.
+            if crate::openhuman::inference::tokenjuice::is_recovery_tool(name) {
+                return !matches!(scope, ToolScope::Named(allowed) if allowed.is_empty());
             }
             if let Some(prefix) = skill_prefix.as_deref() {
                 if !name.starts_with(prefix) {
@@ -170,6 +200,38 @@ pub(crate) fn filter_tool_indices(
         .collect()
 }
 
+/// Intersect a child definition's tool indices with the tools the parent turn
+/// actually exposes. An empty parent set is the legacy "unknown/unrestricted"
+/// sentinel used by internal callers and older tests.
+pub(super) fn retain_parent_visible_tool_indices(
+    indices: &mut Vec<usize>,
+    parent_tools: &[Box<dyn Tool>],
+    parent_visible: &std::collections::HashSet<String>,
+) {
+    if parent_visible.is_empty() {
+        return;
+    }
+    indices.retain(|&index| parent_visible.contains(parent_tools[index].name()));
+}
+
+pub(super) fn disallowed_tool_matches(disallowed: &[String], name: &str) -> bool {
+    disallowed.iter().any(|entry| {
+        if let Some(prefix) = entry.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            entry == name
+        }
+    })
+}
+
+#[cfg(test)]
+#[path = "tool_prep_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "tool_prep_recovery_visibility_tests_tests.rs"]
+mod recovery_visibility_tests;
+
 // ── Prompt loading ──────────────────────────────────────────────────────
 
 /// Resolve a [`PromptSource`] to its raw markdown body. Inline sources
@@ -177,10 +239,7 @@ pub(crate) fn filter_tool_indices(
 /// [`PromptContext`], `File` sources are read from disk relative to the
 /// workspace `prompts/` directory or the agent crate's bundled prompts.
 ///
-/// Exposed `pub(crate)` so the debug dump path in
-/// [`crate::openhuman::agent::debug`] loads prompts through the
-/// exact same code the runner uses instead of keeping a separate copy.
-pub(crate) fn load_prompt_source(
+pub(super) fn load_prompt_source(
     source: &PromptSource,
     ctx: &PromptContext<'_>,
 ) -> Result<String, SubagentRunError> {
@@ -195,14 +254,24 @@ pub(crate) fn load_prompt_source(
             // Try the workspace's `agent/prompts/` first (so users can
             // override built-in prompts), then fall back to the crate's
             // own bundled prompts via `include_str!`-style lookup.
-            let workspace_path = workspace_dir.join("agent").join("prompts").join(path);
+            let prompt_root = workspace_dir.join("agent").join("prompts");
+            let workspace_path = prompt_root.join(path);
             if workspace_path.is_file() {
-                return std::fs::read_to_string(&workspace_path).map_err(|e| {
-                    SubagentRunError::PromptLoad {
-                        path: workspace_path.display().to_string(),
-                        source: e,
-                    }
-                });
+                if let Ok(resolved) = crate::openhuman::security::validate_path_within_root(
+                    &workspace_path,
+                    &prompt_root,
+                ) {
+                    return std::fs::read_to_string(&resolved).map_err(|e| {
+                        SubagentRunError::PromptLoad {
+                            path: resolved.display().to_string(),
+                            source: e,
+                        }
+                    });
+                }
+                tracing::warn!(
+                    "[subagent_runner] prompt path escapes workspace, skipping: {}",
+                    workspace_path.display()
+                );
             }
             // Built-in prompt fallback. The agent prompts directory is
             // already shipped at `src/openhuman/agent/prompts/` and
@@ -216,12 +285,21 @@ pub(crate) fn load_prompt_source(
             // back to a generic role hint).
             let workspace_root_path = workspace_dir.join(path);
             if workspace_root_path.is_file() {
-                return std::fs::read_to_string(&workspace_root_path).map_err(|e| {
-                    SubagentRunError::PromptLoad {
-                        path: workspace_root_path.display().to_string(),
-                        source: e,
-                    }
-                });
+                if let Ok(resolved) = crate::openhuman::security::validate_path_within_root(
+                    &workspace_root_path,
+                    workspace_dir,
+                ) {
+                    return std::fs::read_to_string(&resolved).map_err(|e| {
+                        SubagentRunError::PromptLoad {
+                            path: resolved.display().to_string(),
+                            source: e,
+                        }
+                    });
+                }
+                tracing::warn!(
+                    "[subagent_runner] fallback prompt path escapes workspace, skipping: {}",
+                    workspace_root_path.display()
+                );
             }
             tracing::warn!(
                 path = %path,

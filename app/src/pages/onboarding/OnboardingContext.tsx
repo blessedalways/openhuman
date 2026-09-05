@@ -1,7 +1,24 @@
 import { createContext, useContext } from 'react';
 
+export type AiMode = 'cloud' | 'custom';
+
+export type CustomStepKey =
+  | 'inference'
+  | 'voice'
+  | 'oauth'
+  | 'search'
+  | 'embeddings'
+  | 'memory'
+  | 'activity'
+  | 'vault';
+export type CustomStepChoice = 'default' | 'configure';
+
 export interface OnboardingDraft {
   connectedSources: string[];
+  /** Which AI provisioning path the user chose on the runtime-choice step. */
+  aiMode?: AiMode;
+  /** Per-domain choices made while walking the Custom wizard. */
+  customChoices?: Partial<Record<CustomStepKey, CustomStepChoice>>;
 }
 
 export interface OnboardingContextValue {
@@ -9,7 +26,7 @@ export interface OnboardingContextValue {
   setDraft: (updater: (prev: OnboardingDraft) => OnboardingDraft) => void;
   /**
    * Persist `onboarding_completed=true`, notify the backend (best-effort), and
-   * navigate to `/home`. Called by the final step.
+   * navigate to `/chat`. Called by the final step.
    */
   completeAndExit: () => Promise<void>;
 }

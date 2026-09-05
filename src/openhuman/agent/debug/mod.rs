@@ -27,16 +27,16 @@ use anyhow::{anyhow, Context, Result};
 pub mod dump_writer;
 pub use dump_writer::{write_prompt_dumps, DumpWriteSummary};
 
+use crate::openhuman::agent::context::prompt::{
+    LearnedContextData, PromptContext, PromptTool, ToolCallFormat,
+};
 use crate::openhuman::agent::harness::definition::{
     AgentDefinition, AgentDefinitionRegistry, PromptSource,
 };
 use crate::openhuman::agent::harness::session::Agent;
-use crate::openhuman::composio::ComposioActionTool;
 use crate::openhuman::config::Config;
-use crate::openhuman::context::prompt::{
-    LearnedContextData, PromptContext, PromptTool, ToolCallFormat,
-};
-use crate::openhuman::tools::{Tool, ToolCategory, ToolSpec};
+use crate::openhuman::integrations::composio::ComposioActionTool;
+use crate::openhuman::tools::{Tool, ToolCategory};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -92,8 +92,31 @@ pub struct DumpedPrompt {
     pub text: String,
     /// Tool names that made it into the rendered prompt, in order.
     pub tool_names: Vec<String>,
-    /// Number of `ToolCategory::Skill` tools in the dump.
+    /// Number of `ToolCategory::Workflow` tools in the dump.
     pub skill_tool_count: usize,
+    /// One `{name, description, parameters}` entry per tool the agent
+    /// exposes, in the same order as [`Self::tool_names`].
+    ///
+    /// The system prompt is only half of a turn's fixed cost: the tool
+    /// schemas ride alongside it in every request, and for an agent with a
+    /// few hundred tools they dominate. Dumping the prompt without them
+    /// measures the smaller half.
+    pub tool_specs: Vec<serde_json::Value>,
+}
+
+fn tool_specs_of<T: std::ops::Deref<Target = dyn crate::openhuman::tools::Tool>>(
+    tools: &[T],
+) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name(),
+                "description": t.description(),
+                "parameters": t.parameters_schema(),
+            })
+        })
+        .collect()
 }
 
 /// Render and return the system prompt for a single agent via the
@@ -202,6 +225,22 @@ async fn load_dump_config(
     if let Some(model) = model_override {
         config.default_model = Some(model);
     }
+
+    // The `agent` CLI dispatches straight to this dumper and never runs the
+    // runtime bootstrap, so nothing else wires the host's memory seams.
+    //
+    // The `tinymemory-core` seams this used to install are gone with the crate
+    // (#5560). The reason they were needed — building a session agent
+    // constructed an in-process memory store whose embedding seam failed loudly
+    // when unwired — no longer holds: `session::builder::factory` stopped
+    // booting one, so `dump-prompt` reaches no engine to call back into.
+    //
+    // The contract event sink still installs, idempotently, for the same reason
+    // as in `runtime::context`: it is a `tinymemory-api` seam with a live
+    // production publisher, and it drops silently rather than loudly when
+    // unwired. Same rationale as `memory_cli` / `subconscious_cli`.
+    crate::openhuman::memory::host::install_memory_event_sink();
+
     Ok(config)
 }
 
@@ -216,6 +255,12 @@ async fn render_via_session(config: &Config, agent_id: &str) -> Result<DumpedPro
     // sees. Best-effort — failures degrade to an empty integration
     // list, same as the live runtime.
     agent.fetch_connected_integrations().await;
+    // Mirror turn-1: synthesise `delegate_*` tools for connected
+    // Composio toolkits now that we know what's actually authorised.
+    // The shared-Arc failure path is unreachable here (this is the
+    // debug dumper running against a freshly-built agent — no
+    // sub-agent has cloned the tool list), so ignore the bool return.
+    let _ = agent.refresh_delegation_tools();
 
     let text = agent
         .build_system_prompt(LearnedContextData::default())
@@ -223,9 +268,10 @@ async fn render_via_session(config: &Config, agent_id: &str) -> Result<DumpedPro
 
     let tools = agent.tools();
     let tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    let tool_specs = tool_specs_of(tools);
     let skill_tool_count = tools
         .iter()
-        .filter(|t| t.category() == ToolCategory::Skill)
+        .filter(|t| t.category() == ToolCategory::Workflow)
         .count();
 
     Ok(DumpedPrompt {
@@ -237,12 +283,13 @@ async fn render_via_session(config: &Config, agent_id: &str) -> Result<DumpedPro
         text,
         tool_names,
         skill_tool_count,
+        tool_specs,
     })
 }
 
 /// Render the integrations_agent prompt bound to a single Composio
 /// toolkit. Mirrors the subagent_runner's per-toolkit path: strips
-/// Skill-category parent tools, injects one [`ComposioActionTool`] per
+/// Workflow-category parent tools, injects one [`ComposioActionTool`] per
 /// action in the toolkit, and narrows the `connected_integrations`
 /// slice to only the requested toolkit before calling the agent's
 /// dynamic prompt builder.
@@ -269,10 +316,17 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
             )
         })?;
 
-    let composio_client = agent
-        .composio_client()
-        .cloned()
-        .ok_or_else(|| anyhow!("composio client unavailable — is the user signed in?"))?;
+    // Resolve the live client kind via the mode-aware factory so a
+    // direct-mode user can still render the prompt even without a
+    // backend session (#1710 Wave 2). Backend mode keeps the existing
+    // `fetch_toolkit_actions` round-trip; direct mode skips the
+    // refresh (no backend allowlist to consult) and keeps the cached
+    // catalogue, mirroring `ComposioListToolsTool`'s short-circuit.
+    use crate::openhuman::integrations::composio::client::{
+        create_composio_client, ComposioClientKind,
+    };
+    let client_kind = create_composio_client(config)
+        .map_err(|e| anyhow!("composio client unavailable — is the user signed in? ({e})"))?;
 
     // Refresh the action catalogue for this toolkit at prompt-generation
     // time so the dump reflects the **current** backend state rather
@@ -281,22 +335,38 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
     // returns actions). Mirrors subagent_runner's typed-mode fallback:
     // an empty fresh list or a network error keeps the cached catalogue
     // rather than blanking it.
-    match crate::openhuman::composio::fetch_toolkit_actions(&composio_client, &integration.toolkit)
-        .await
-    {
-        Ok(actions) if !actions.is_empty() => {
-            integration.tools = actions;
+    match &client_kind {
+        ComposioClientKind::Backend(composio_client) => {
+            match crate::openhuman::integrations::composio::fetch_toolkit_actions(
+                config,
+                composio_client,
+                &integration.toolkit,
+                None,
+            )
+            .await
+            {
+                Ok(actions) if !actions.is_empty() => {
+                    integration.tools = actions;
+                }
+                Ok(_) => {
+                    log::debug!(
+                        "[agent::debug] fresh list_tools for `{}` returned empty; keeping cached catalogue ({} actions)",
+                        integration.toolkit,
+                        integration.tools.len()
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[agent::debug] fresh list_tools for `{}` failed ({e}); keeping cached catalogue ({} actions)",
+                        integration.toolkit,
+                        integration.tools.len()
+                    );
+                }
+            }
         }
-        Ok(_) => {
-            log::debug!(
-                "[agent::debug] fresh list_tools for `{}` returned empty; keeping cached catalogue ({} actions)",
-                integration.toolkit,
-                integration.tools.len()
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "[agent::debug] fresh list_tools for `{}` failed ({e}); keeping cached catalogue ({} actions)",
+        ComposioClientKind::Direct(_) => {
+            log::info!(
+                "[agent::debug][composio-direct] direct mode active — skipping backend list_tools refresh for `{}`; using cached catalogue ({} actions)",
                 integration.toolkit,
                 integration.tools.len()
             );
@@ -327,12 +397,21 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
             .map(|t| clone_tool_as_prompt_proxy(t.as_ref()))
             .collect(),
     };
+    // `ComposioActionTool` takes `Arc<Config>` rather than a pre-baked
+    // `ComposioClient` so the live `composio.mode` toggle is honoured
+    // per execute (#1710). For the debug prompt-dump path we don't
+    // actually execute the tool — we only render its schema /
+    // description into the system prompt — but we still need an
+    // `Arc<Config>` to construct it. The factory-resolved `client_kind`
+    // above is used only for the upstream `fetch_toolkit_actions`
+    // metadata probe (backend mode only).
+    let arc_config = std::sync::Arc::new(config.clone());
     let action_tools: Vec<Box<dyn Tool>> = integration
         .tools
         .iter()
         .map(|action| -> Box<dyn Tool> {
             Box::new(ComposioActionTool::new(
-                composio_client.clone(),
+                arc_config.clone(),
                 action.name.clone(),
                 action.description.clone(),
                 action.parameters.clone(),
@@ -383,7 +462,7 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
         model_name: &model_name,
         agent_id: INTEGRATIONS_AGENT_ID,
         tools: &prompt_tools,
-        skills: agent.skills(),
+        workflows: agent.workflows(),
         dispatcher_instructions: "",
         learned: LearnedContextData::default(),
         visible_tool_names: &empty_visible,
@@ -394,6 +473,11 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
         include_memory_md: !definition.omit_memory_md,
         curated_snapshot: None,
         user_identity: None,
+        personality_soul_md: None,
+        personality_memory_md: None,
+        personality_roster: vec![],
+        agents_md_global: None,
+        agents_md_local: None,
     };
 
     let mut text = build(&ctx)
@@ -405,19 +489,9 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
     // `force_text_mode` branch). Reproduce it here so
     // the dump matches what the LLM actually receives on turn 1.
     if !rendered_tools.is_empty() {
-        let tool_specs: Vec<ToolSpec> = rendered_tools
-            .iter()
-            .map(|t| ToolSpec {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters_schema().clone(),
-            })
-            .collect();
         text.push_str("\n\n");
         text.push_str(
-            &crate::openhuman::agent::harness::subagent_runner::build_text_mode_tool_instructions(
-                &tool_specs,
-            ),
+            &crate::openhuman::agent::harness::subagent_runner::build_text_mode_tool_instructions(),
         );
     }
 
@@ -425,9 +499,10 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    let tool_specs = tool_specs_of(&rendered_tools);
     let skill_tool_count = rendered_tools
         .iter()
-        .filter(|t| t.category() == ToolCategory::Skill)
+        .filter(|t| t.category() == ToolCategory::Workflow)
         .count();
 
     Ok(DumpedPrompt {
@@ -439,6 +514,7 @@ async fn render_integrations_agent(config: &Config, toolkit: &str) -> Result<Dum
         text,
         tool_names,
         skill_tool_count,
+        tool_specs,
     })
 }
 

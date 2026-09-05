@@ -1,8 +1,10 @@
+use super::super::git_operations_config::NULL_CONFIG_PATH;
 use super::*;
 use crate::openhuman::security::SecurityPolicy;
 use tempfile::TempDir;
+use tinyagents_harness::tool::ToolExecutionContext;
 
-fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
+pub(super) fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
     let security = Arc::new(SecurityPolicy {
         autonomy: AutonomyLevel::Supervised,
         ..SecurityPolicy::default()
@@ -80,6 +82,40 @@ fn sanitize_git_allows_safe() {
     assert!(tool.sanitize_git_args("--cached").is_ok());
     assert!(tool.sanitize_git_args("src/main.rs").is_ok());
     assert!(tool.sanitize_git_args(".").is_ok());
+}
+
+/// Parity guard for the worktree-isolation action-dir override (#3376,
+/// #4249 08.5). A worktree-isolated worker's git operation MUST resolve its CWD
+/// from the carried `WorkspaceDescriptor` (the isolated worktree), never the
+/// tool's configured `action_dir`. WITHOUT a descriptor it falls back to
+/// `action_dir` — the non-isolated path, byte-identical to before. This encodes
+/// the behaviour the deleted `worktree_context.rs` task-local used to provide.
+#[test]
+fn git_resolves_cwd_from_workspace_descriptor() {
+    use tinyagents_harness::context::{RunConfig, RunContext};
+    use tinyagents_harness::workspace::WorkspaceDescriptor;
+
+    let action_tmp = TempDir::new().unwrap();
+    let worktree_tmp = TempDir::new().unwrap();
+    let tool = test_tool(action_tmp.path());
+
+    // WITH a descriptor → the worktree root wins.
+    let ws =
+        WorkspaceDescriptor::new(worktree_tmp.path().to_path_buf()).with_policy_id("test-worktree");
+    let ctx: RunContext = RunContext::new(RunConfig::new("test-run"), ()).with_workspace(ws);
+    let tool_ctx = ToolExecutionContext::from_run_context(&ctx);
+    assert_eq!(
+        tool.effective_action_dir_for_context(Some(&tool_ctx)),
+        worktree_tmp.path().to_path_buf(),
+        "git with a WorkspaceDescriptor must resolve CWD to the worktree root"
+    );
+
+    // WITHOUT a descriptor → configured action_dir (non-isolated parity).
+    assert_eq!(
+        tool.effective_action_dir_for_context(None),
+        action_tmp.path().to_path_buf(),
+        "git with no descriptor must fall back to the configured action_dir"
+    );
 }
 
 #[test]
@@ -334,15 +370,28 @@ async fn not_in_git_repo_returns_error() {
     assert!(result.output().contains("Not in a git repository"));
 }
 
+/// Suppress the developer's own system/global git config on a raw
+/// `std::process::Command`, so a machine-local `init.templateDir` or similar
+/// cannot write extra keys into a test repository's `.git/config` and make
+/// these tests depend on ambient environment. Mirrors [`hardened_git`]'s two
+/// env vars; the production code under test applies its own suppression when
+/// it later reads this same config, so this only affects setup.
+pub(super) fn hermetic(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_CONFIG_PATH)
+}
+
 /// Initialise a git repo at `path` and fail the test if `git init`
 /// itself didn't succeed (so we don't misread later assertion failures
 /// as product bugs when the real problem is a missing/broken git).
-fn init_git_repo(path: &std::path::Path) {
-    let output = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(path)
-        .output()
-        .expect("failed to spawn `git init`");
+pub(super) fn init_git_repo(path: &std::path::Path) {
+    let output = hermetic(
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path),
+    )
+    .output()
+    .expect("failed to spawn `git init`");
     assert!(
         output.status.success(),
         "`git init` failed: {}",
@@ -352,7 +401,7 @@ fn init_git_repo(path: &std::path::Path) {
 
 /// Extract the error text from a Result<ToolResult> — whether the
 /// failure came through `Err(anyhow::Error)` or `Ok(ToolResult::error)`.
-fn error_text(result: &anyhow::Result<ToolResult>) -> String {
+pub(super) fn error_text(result: &anyhow::Result<ToolResult>) -> String {
     match result {
         Ok(r) => {
             assert!(r.is_error, "expected a tool-error ToolResult");

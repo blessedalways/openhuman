@@ -1,39 +1,131 @@
-import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 
 import { persistLocalWalletFromMnemonic } from '../../../features/wallet/setupLocalWalletFromMnemonic';
+import { useT } from '../../../lib/i18n/I18nContext';
 import { useCoreState } from '../../../providers/CoreStateProvider';
+import {
+  fetchWalletStatus,
+  revealRecoveryPhrase,
+  type WalletStatus,
+} from '../../../services/walletApi';
 import {
   generateMnemonicPhrase,
   MNEMONIC_GENERATE_WORD_COUNT,
   validateMnemonicPhrase,
 } from '../../../utils/cryptoKeys';
-import SettingsHeader from '../components/SettingsHeader';
+import { Alert } from '../../ui/Alert';
+import Button from '../../ui/Button';
+import { CheckIcon, Spinner } from '../../ui/icons';
+import { CenteredLoadingState } from '../../ui/LoadingState';
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
+import SettingsPanel from '../layout/SettingsPanel';
+import RecoveryPhraseGenerateMode from './RecoveryPhraseGenerateMode';
+import RecoveryPhraseImportMode from './RecoveryPhraseImportMode';
+import RecoveryPhraseReplaceConfirm from './RecoveryPhraseReplaceConfirm';
+import RecoveryPhraseViewMode from './RecoveryPhraseViewMode';
 
 const BIP39_IMPORT_LENGTHS = [12, 15, 18, 21, 24] as const;
 
 const IMPORT_SLOTS_INITIAL = MNEMONIC_GENERATE_WORD_COUNT;
 
+// Panel mode flow:
+// - 'loading': initial — fetching wallet status.
+// - 'view': existing wallet found — shows metadata, no mnemonic displayed.
+// - 'replace-confirm': user clicked "Replace wallet" — shows warning dialog.
+// - 'generate': no wallet (or post-confirm replace) — generate new phrase flow.
+// - 'import': import an existing phrase.
+type PanelMode = 'loading' | 'view' | 'replace-confirm' | 'generate' | 'import';
+
 const RecoveryPhrasePanel = () => {
-  const { navigateBack, breadcrumbs } = useSettingsNavigation();
+  const { t } = useT();
+  const { navigateBack } = useSettingsNavigation();
   const { snapshot, setEncryptionKey } = useCoreState();
   const user = snapshot.currentUser;
 
-  const [mode, setMode] = useState<'generate' | 'import'>('generate');
+  const [mode, setMode] = useState<PanelMode>('loading');
+  const [walletStatus, setWalletStatus] = useState<WalletStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+
+  // Generate mode state
+  const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+
+  // Replace-mode state: tracks that the user went through the replace flow
+  const [isReplace, setIsReplace] = useState(false);
+
+  // View mode: reveal existing phrase
+  const [viewRevealed, setViewRevealed] = useState(false);
+  const [viewMnemonic, setViewMnemonic] = useState<string | null>(null);
+  const [viewRevealLoading, setViewRevealLoading] = useState(false);
+  const [viewRevealError, setViewRevealError] = useState<string | null>(null);
+  const [viewCopied, setViewCopied] = useState(false);
+
+  // Import mode state
+  const [selectedWordCount, setSelectedWordCount] = useState(IMPORT_SLOTS_INITIAL);
+  const [importWords, setImportWords] = useState<string[]>(Array(IMPORT_SLOTS_INITIAL).fill(''));
+  const [importValid, setImportValid] = useState<boolean | null>(null);
+
+  // Shared
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
-  const mnemonic = useMemo(() => generateMnemonicPhrase(), []);
-  const words = useMemo(() => mnemonic.split(' '), [mnemonic]);
-
-  const [selectedWordCount, setSelectedWordCount] = useState(IMPORT_SLOTS_INITIAL);
-  const [importWords, setImportWords] = useState<string[]>(Array(IMPORT_SLOTS_INITIAL).fill(''));
-  const [importValid, setImportValid] = useState<boolean | null>(null);
-  const [importOverflowWarning, setImportOverflowWarning] = useState<string | null>(null);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  // ── On mount: check for existing wallet ──────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    const checkWallet = async () => {
+      try {
+        const status = await fetchWalletStatus();
+        if (cancelled) return;
+        setWalletStatus(status);
+        if (status.configured && status.onboardingCompleted) {
+          setMode('view');
+        } else {
+          // No configured wallet — generate mode. Generate phrase now.
+          const phrase = generateMnemonicPhrase();
+          setMnemonic(phrase);
+          setMode('generate');
+        }
+      } catch (e) {
+        if (cancelled) return;
+        // If status fetch fails, degrade gracefully: show error in view mode.
+        // Do NOT silently generate a phrase that could overwrite an existing wallet.
+        setStatusError(
+          e instanceof Error ? e.message : 'Failed to check wallet status. Please try again.'
+        );
+        setMode('view');
+      }
+    };
+    void checkWallet();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ── Transition into generate mode after replace confirmation ─────────────
+  const handleConfirmReplace = useCallback(() => {
+    const phrase = generateMnemonicPhrase();
+    setMnemonic(phrase);
+    setIsReplace(true);
+    setConfirmed(false);
+    setRevealed(false);
+    setError(null);
+    setMode('generate');
+  }, []);
+
+  // ── Transition into import mode after replace confirmation ────────────────
+  const handleImportReplace = useCallback(() => {
+    setIsReplace(true);
+    setImportValid(null);
+    setError(null);
+    setSelectedWordCount(IMPORT_SLOTS_INITIAL);
+    setImportWords(Array(IMPORT_SLOTS_INITIAL).fill(''));
+    setMode('import');
+  }, []);
 
   useEffect(() => {
     if (copied) {
@@ -43,13 +135,37 @@ const RecoveryPhrasePanel = () => {
   }, [copied]);
 
   useEffect(() => {
+    if (viewCopied) {
+      const timer = setTimeout(() => setViewCopied(false), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [viewCopied]);
+
+  // Security: clear plaintext phrase from state when unmounting.
+  useEffect(() => {
+    return () => {
+      setViewMnemonic(null);
+      setViewRevealed(false);
+    };
+  }, []);
+
+  // Clear phrase when navigating away from view mode.
+  useEffect(() => {
+    if (mode !== 'view') {
+      setViewMnemonic(null);
+      setViewRevealed(false);
+      setViewRevealError(null);
+    }
+  }, [mode]);
+
+  const switchMode = useCallback((nextMode: 'generate' | 'import') => {
+    setMode(nextMode);
     setConfirmed(false);
     setError(null);
     setImportValid(null);
-    setImportOverflowWarning(null);
     setSelectedWordCount(IMPORT_SLOTS_INITIAL);
     setImportWords(Array(IMPORT_SLOTS_INITIAL).fill(''));
-  }, [mode]);
+  }, []);
 
   const handleWordCountChange = useCallback((count: number) => {
     setSelectedWordCount(count);
@@ -61,11 +177,9 @@ const RecoveryPhrasePanel = () => {
       return newWords;
     });
     setImportValid(null);
-    setImportOverflowWarning(null);
     setError(null);
   }, []);
 
-  // Navigate back after success
   useEffect(() => {
     if (success) {
       const timer = setTimeout(() => {
@@ -76,6 +190,7 @@ const RecoveryPhrasePanel = () => {
   }, [success, navigateBack]);
 
   const handleCopy = useCallback(async () => {
+    if (!mnemonic) return;
     try {
       await navigator.clipboard.writeText(mnemonic);
       setCopied(true);
@@ -100,7 +215,6 @@ const RecoveryPhrasePanel = () => {
         if (BIP39_IMPORT_LENGTHS.includes(fullPhraseLen as (typeof BIP39_IMPORT_LENGTHS)[number])) {
           setImportWords(pastedWords.map(w => w.toLowerCase()));
           setImportValid(null);
-          setImportOverflowWarning(null);
           inputRefs.current[fullPhraseLen - 1]?.focus();
           return;
         }
@@ -111,16 +225,6 @@ const RecoveryPhrasePanel = () => {
         }
         setImportWords(newWords);
         setImportValid(null);
-        if (pastedWords.length > slotCount - index) {
-          const dropped = pastedWords.length - (slotCount - index);
-          setImportOverflowWarning(
-            `${pastedWords.length} words pasted, but only ${slotCount - index} fit — ${dropped} extra ${
-              dropped === 1 ? 'word was' : 'words were'
-            } dropped. Paste into an empty field to import the full phrase.`
-          );
-        } else {
-          setImportOverflowWarning(null);
-        }
         const nextEmpty = newWords.findIndex(w => !w);
         const focusIndex = nextEmpty === -1 ? slotCount - 1 : nextEmpty;
         inputRefs.current[focusIndex]?.focus();
@@ -159,13 +263,13 @@ const RecoveryPhrasePanel = () => {
     setImportValid(isValid);
 
     if (!isValid) {
-      setError('Invalid recovery phrase. Please check your words and try again.');
+      setError(t('mnemonic.invalidPhrase'));
       return false;
     }
 
     setError(null);
     return true;
-  }, [importWords]);
+  }, [importWords, t]);
 
   const handleSave = async () => {
     setError(null);
@@ -185,26 +289,67 @@ const RecoveryPhrasePanel = () => {
           setLoading(false);
           return;
         }
+        if (!mnemonic) {
+          setLoading(false);
+          return;
+        }
         phraseToUse = mnemonic;
       }
 
       if (!user?._id) {
-        setError('User not loaded. Please sign in again or refresh the page.');
+        setError(t('mnemonic.userNotLoaded'));
         return;
       }
       await persistLocalWalletFromMnemonic({
         mnemonic: phraseToUse,
         source: mode === 'generate' ? 'generated' : 'imported',
         setEncryptionKey,
+        // Only pass force=true when the user has gone through the replace confirmation flow.
+        force: isReplace ? true : undefined,
       });
       setSuccess(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Something went wrong. Please try again.');
+      setError(e instanceof Error ? e.message : t('mnemonic.somethingWentWrong'));
     } finally {
       setLoading(false);
     }
   };
 
+  const handleViewCopy = useCallback(async () => {
+    if (!viewMnemonic) return;
+    try {
+      await navigator.clipboard.writeText(viewMnemonic);
+      setViewCopied(true);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = viewMnemonic;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      if (ok) setViewCopied(true);
+    }
+  }, [viewMnemonic]);
+
+  const handleRevealExistingPhrase = useCallback(async () => {
+    setViewRevealLoading(true);
+    setViewRevealError(null);
+    setViewMnemonic(null);
+    setViewRevealed(false);
+    try {
+      const result = await revealRecoveryPhrase();
+      setViewMnemonic(result.phrase);
+      setViewRevealed(true);
+    } catch (e) {
+      setViewRevealError(e instanceof Error ? e.message : t('mnemonic.somethingWentWrong'));
+    } finally {
+      setViewRevealLoading(false);
+    }
+  }, [t]);
+
+  const words = mnemonic ? mnemonic.split(' ') : [];
   const importWordCount = importWords.filter(w => w.trim()).length;
   const isImportComplete =
     importWords.every(w => w.trim()) &&
@@ -212,271 +357,104 @@ const RecoveryPhrasePanel = () => {
   const canSave = mode === 'generate' ? confirmed : isImportComplete;
 
   return (
-    <div>
-      <SettingsHeader
-        title="Recovery Phrase"
-        showBackButton
-        onBack={navigateBack}
-        breadcrumbs={breadcrumbs}
-      />
+    <SettingsPanel
+      description={t('pages.settings.account.recoveryPhraseDesc')}
+      testId="recovery-phrase-panel">
+      {success ? (
+        <div className="flex flex-col items-center justify-center gap-3 py-12">
+          <div className="w-12 h-12 rounded-full bg-sage-500/20 flex items-center justify-center">
+            <CheckIcon className="w-6 h-6 text-sage-400" />
+          </div>
+          <p className="text-sm font-medium text-sage-500">{t('mnemonic.phraseSaved')}</p>
+          <p className="text-xs text-content-muted">{t('mnemonic.walletReady')}</p>
+        </div>
+      ) : (
+        <>
+          {mode === 'loading' && (
+            <CenteredLoadingState label={t('mnemonic.loadingWalletStatus')} className="py-12" />
+          )}
 
-      <div>
-        <div className="p-4">
-          {success ? (
-            <div className="flex flex-col items-center justify-center gap-3 py-12">
-              <div className="w-12 h-12 rounded-full bg-sage-500/20 flex items-center justify-center">
-                <svg
-                  className="w-6 h-6 text-sage-400"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-              </div>
-              <p className="text-sm font-medium text-sage-500">Recovery phrase saved</p>
-              <p className="text-xs text-stone-500">
-                Multi-chain wallet identities are ready. Returning to settings...
-              </p>
-            </div>
-          ) : (
+          {mode === 'view' && (
+            <RecoveryPhraseViewMode
+              statusError={statusError}
+              walletStatus={walletStatus}
+              viewMnemonic={viewMnemonic}
+              viewRevealed={viewRevealed}
+              onRevealBlur={() => setViewRevealed(true)}
+              onHide={() => {
+                setViewMnemonic(null);
+                setViewRevealed(false);
+              }}
+              viewRevealLoading={viewRevealLoading}
+              viewRevealError={viewRevealError}
+              onReveal={() => void handleRevealExistingPhrase()}
+              viewCopied={viewCopied}
+              onCopy={() => void handleViewCopy()}
+              onReplaceClick={() => setMode('replace-confirm')}
+            />
+          )}
+
+          {mode === 'replace-confirm' && (
+            <RecoveryPhraseReplaceConfirm
+              onConfirmReplace={handleConfirmReplace}
+              onImportInstead={handleImportReplace}
+              onCancel={() => setMode('view')}
+            />
+          )}
+
+          {(mode === 'generate' || mode === 'import') && (
             <>
               {mode === 'generate' ? (
-                <>
-                  <div className="mb-4 space-y-3">
-                    <p className="text-sm text-stone-600 leading-relaxed">
-                      Write down these {MNEMONIC_GENERATE_WORD_COUNT} words in order and store them
-                      somewhere safe. This phrase secures your local encryption key and your EVM,
-                      BTC, Solana, and Tron wallet identities.
-                    </p>
-                    <div className="flex items-start gap-2.5 p-3 rounded-xl bg-amber-50 border border-amber-200/70">
-                      <svg
-                        className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        strokeWidth={2}>
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
-                        />
-                      </svg>
-                      <p className="text-xs text-amber-800 leading-relaxed">
-                        This phrase can never be recovered if lost and should stay fully local to
-                        your device.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="bg-stone-50 rounded-2xl p-4 mb-4 border border-stone-200">
-                    <div className="grid grid-cols-3 gap-2">
-                      {words.map((word, index) => (
-                        <div
-                          key={index}
-                          className="flex items-center gap-2 bg-white rounded-lg px-3 py-2 text-sm border border-stone-200">
-                          <span className="text-stone-500 font-mono text-xs w-5 text-right">
-                            {index + 1}.
-                          </span>
-                          <span className="font-mono font-medium">{word}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleCopy}
-                    className="w-full flex items-center justify-center gap-2 border border-stone-200 hover:border-stone-300 font-medium py-2.5 text-sm rounded-xl text-stone-700 transition-all duration-200 mb-3">
-                    {copied ? (
-                      <>
-                        <svg
-                          className="w-4 h-4 text-sage-400"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                          strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                        </svg>
-                        <span className="text-sage-400">Copied to Clipboard</span>
-                      </>
-                    ) : (
-                      <>
-                        <svg
-                          className="w-4 h-4"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                          strokeWidth={2}>
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-                          />
-                        </svg>
-                        <span>Copy to Clipboard</span>
-                      </>
-                    )}
-                  </button>
-
-                  <button
-                    onClick={() => setMode('import')}
-                    className="w-full text-center text-sm text-primary-400 hover:text-primary-600 transition-colors mb-3">
-                    I already have a recovery phrase
-                  </button>
-
-                  <label className="flex items-start gap-3 cursor-pointer mb-4">
-                    <input
-                      type="checkbox"
-                      checked={confirmed}
-                      onChange={e => setConfirmed(e.target.checked)}
-                      className="mt-0.5 w-4 h-4 rounded border-stone-500 text-primary-500 focus:ring-primary-500"
-                    />
-                    <span className="text-sm text-stone-700">
-                      I saved this phrase and consent to using it for local wallet setup
-                    </span>
-                  </label>
-                </>
+                <RecoveryPhraseGenerateMode
+                  words={words}
+                  revealed={revealed}
+                  onReveal={() => setRevealed(true)}
+                  copied={copied}
+                  onCopy={() => void handleCopy()}
+                  confirmed={confirmed}
+                  onConfirmedChange={setConfirmed}
+                  onSwitchToImport={() => switchMode('import')}
+                />
               ) : (
-                <>
-                  <div className="mb-4">
-                    <p className="text-sm text-stone-600 leading-relaxed">
-                      Enter your recovery phrase below to restore your local wallet identities, or
-                      paste the full phrase into any field (12 words for new backups; 24-word
-                      phrases from older versions still work).
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-2 mb-3">
-                    <span className="text-xs text-stone-500">Words:</span>
-                    {BIP39_IMPORT_LENGTHS.map(len => (
-                      <button
-                        key={len}
-                        type="button"
-                        onClick={() => handleWordCountChange(len)}
-                        className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-colors ${
-                          selectedWordCount === len
-                            ? 'bg-primary-500/20 border-primary-500/40 text-primary-600 border'
-                            : 'border border-stone-200 text-stone-500 hover:border-stone-300'
-                        }`}>
-                        {len}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="bg-stone-50 rounded-2xl p-4 mb-4 border border-stone-200">
-                    <div className="grid grid-cols-3 gap-2">
-                      {importWords.map((word, index) => (
-                        <div key={index} className="flex items-center gap-1.5">
-                          <span className="text-stone-500 font-mono text-xs w-5 text-right shrink-0">
-                            {index + 1}.
-                          </span>
-                          <input
-                            aria-label={`Recovery phrase word ${index + 1}`}
-                            ref={el => {
-                              inputRefs.current[index] = el;
-                            }}
-                            type="text"
-                            value={word}
-                            onChange={e => handleImportWordChange(index, e.target.value)}
-                            onKeyDown={e => handleImportKeyDown(index, e)}
-                            autoComplete="off"
-                            spellCheck={false}
-                            className={`w-full font-mono text-sm font-medium px-2 py-1.5 rounded-lg border bg-white text-stone-900 outline-none transition-colors ${
-                              importValid === false && word.trim()
-                                ? 'border-coral-400 focus:border-coral-300'
-                                : importValid === true
-                                  ? 'border-sage-400 focus:border-sage-300'
-                                  : 'border-stone-200 focus:border-primary-400'
-                            }`}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  {importOverflowWarning && (
-                    <div
-                      role="alert"
-                      className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 leading-relaxed">
-                      {importOverflowWarning}
-                    </div>
-                  )}
-
-                  {importValid === true && (
-                    <div className="flex items-center gap-2 text-sage-400 text-sm mb-3 justify-center">
-                      <svg
-                        className="w-4 h-4"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                      </svg>
-                      <span>Valid recovery phrase</span>
-                    </div>
-                  )}
-
-                  <button
-                    onClick={() => setMode('generate')}
-                    className="w-full text-center text-sm text-primary-400 hover:text-primary-600 transition-colors mb-3">
-                    Generate a new recovery phrase instead
-                  </button>
-                </>
+                <RecoveryPhraseImportMode
+                  importWords={importWords}
+                  selectedWordCount={selectedWordCount}
+                  importValid={importValid}
+                  inputRefs={inputRefs}
+                  onWordCountChange={handleWordCountChange}
+                  onWordChange={handleImportWordChange}
+                  onWordKeyDown={handleImportKeyDown}
+                  onSwitchToGenerate={() => switchMode('generate')}
+                />
               )}
 
               {error && (
-                <div
-                  role="alert"
-                  className="flex items-start gap-2.5 p-3 mb-3 rounded-xl bg-coral-50 border border-coral-200/70">
-                  <svg
-                    className="w-4 h-4 text-coral-500 flex-shrink-0 mt-0.5"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}>
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
-                    />
-                  </svg>
-                  <p className="text-xs text-coral-700 leading-relaxed">{error}</p>
-                </div>
+                <Alert variant="destructive" className="mb-3">
+                  <p className="text-xs leading-relaxed">{error}</p>
+                </Alert>
               )}
 
-              <button
+              <Button
                 type="button"
+                variant="primary"
+                size="lg"
                 onClick={() => void handleSave()}
                 disabled={!canSave || loading}
-                className="btn-primary w-full py-3 text-sm font-medium rounded-xl disabled:opacity-60 flex items-center justify-center gap-2">
+                className="w-full">
                 {loading ? (
                   <>
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                      />
-                      <path
-                        className="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                      />
-                    </svg>
-                    <span>Securing Your Data...</span>
+                    <Spinner className="w-4 h-4" />
+                    <span>{t('mnemonic.securingData')}</span>
                   </>
                 ) : (
-                  'Save Recovery Phrase'
+                  t('mnemonic.saveRecoveryPhrase')
                 )}
-              </button>
+              </Button>
             </>
           )}
-        </div>
-      </div>
-    </div>
+        </>
+      )}
+    </SettingsPanel>
   );
 };
 

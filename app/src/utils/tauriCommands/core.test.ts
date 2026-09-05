@@ -2,20 +2,26 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { afterEach, beforeEach, describe, expect, type Mock, test, vi } from 'vitest';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn() }));
-vi.mock('../../services/coreRpcClient', () => ({ callCoreRpc: vi.fn() }));
+vi.mock('../../services/coreRpcClient', () => ({
+  callCoreRpc: vi.fn(),
+  clearCoreRpcTokenCache: vi.fn(),
+}));
 
 describe('tauriCommands/core', () => {
   const mockIsTauri = isTauri as Mock;
   const mockInvoke = invoke as Mock;
   let restartApp: typeof import('./core').restartApp;
-  let scheduleCefProfilePurge: typeof import('./core').scheduleCefProfilePurge;
+  let restartCoreProcess: typeof import('./core').restartCoreProcess;
+  let mockClearCoreRpcTokenCache: Mock;
 
   beforeEach(async () => {
     vi.clearAllMocks();
     mockIsTauri.mockReturnValue(true);
     const actual = await vi.importActual<typeof import('./core')>('./core');
     restartApp = actual.restartApp;
-    scheduleCefProfilePurge = actual.scheduleCefProfilePurge;
+    restartCoreProcess = actual.restartCoreProcess;
+    const { clearCoreRpcTokenCache } = await import('../../services/coreRpcClient');
+    mockClearCoreRpcTokenCache = clearCoreRpcTokenCache as Mock;
   });
 
   describe('restartApp', () => {
@@ -72,14 +78,12 @@ describe('tauriCommands/core', () => {
       debug.mockRestore();
     });
 
-    test('invokes restart_app in production mode (IS_DEV=false)', async () => {
-      // setup.ts globally mocks ../config with IS_DEV: true. Override with
-      // doMock + resetModules so a fresh import of ./core sees IS_DEV=false
-      // and runs the production branch (#1068 dev workaround should be inert).
-      vi.doMock('../config', () => ({
-        IS_DEV: false,
-        // Re-export anything else core.ts might end up using; today just IS_DEV.
-      }));
+    test('invokes restart_app in production mode (IS_DEV_LIKE=false)', async () => {
+      // setup.ts globally mocks ../config with IS_DEV_LIKE: true (because
+      // IS_DEV: true → derived IS_DEV_LIKE). Override with doMock +
+      // resetModules so a fresh import of ./core sees IS_DEV_LIKE=false and
+      // runs the production branch (#1068 dev workaround should be inert).
+      vi.doMock('../config', () => ({ IS_DEV: false, IS_DEV_LIKE: false }));
       vi.resetModules();
       const prodCore = await import('./core');
 
@@ -89,6 +93,53 @@ describe('tauriCommands/core', () => {
       expect(reloadSpy).not.toHaveBeenCalled();
 
       vi.doUnmock('../config');
+    });
+  });
+
+  describe('restartCoreProcess', () => {
+    test('no-ops when not in Tauri (#1922 — no cache clear either)', async () => {
+      mockIsTauri.mockReturnValue(false);
+      const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+
+      await restartCoreProcess();
+
+      expect(mockInvoke).not.toHaveBeenCalled();
+      // No invoke → no cache clear. A defensive clear here would mask
+      // genuine "core never rotated" cases when the helper is called
+      // outside Tauri (e.g. test harness).
+      expect(mockClearCoreRpcTokenCache).not.toHaveBeenCalled();
+      expect(debug).toHaveBeenCalledWith(
+        expect.stringContaining('restartCoreProcess: skipped — not running in Tauri')
+      );
+      debug.mockRestore();
+    });
+
+    test('invokes restart_core_process then clears the RPC token cache (#1922)', async () => {
+      // Deferred Promise — proves the cache clear happens AFTER the IPC
+      // resolves, not merely after invoke() was called. A concurrent
+      // getCoreRpcToken() racing across an `await` boundary could
+      // otherwise repopulate from the dead core before the new one mints
+      // a fresh bearer.
+      let resolveInvoke!: () => void;
+      mockInvoke.mockImplementationOnce(
+        () =>
+          new Promise<void>(resolve => {
+            resolveInvoke = resolve;
+          })
+      );
+
+      const pending = restartCoreProcess();
+
+      // Yield the microtask queue so `await invoke(...)` parks. Cache MUST
+      // still be untouched.
+      await Promise.resolve();
+      expect(mockInvoke).toHaveBeenCalledWith('restart_core_process');
+      expect(mockClearCoreRpcTokenCache).not.toHaveBeenCalled();
+
+      resolveInvoke();
+      await pending;
+
+      expect(mockClearCoreRpcTokenCache).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -167,49 +218,6 @@ describe('tauriCommands/core', () => {
       mockInvoke.mockResolvedValueOnce(undefined);
       await applyAppUpdate();
       expect(mockInvoke).toHaveBeenCalledWith('apply_app_update');
-    });
-  });
-
-  describe('scheduleCefProfilePurge', () => {
-    test('returns null and does not invoke when not in Tauri', async () => {
-      mockIsTauri.mockReturnValue(false);
-      const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
-
-      const out = await scheduleCefProfilePurge('x');
-
-      expect(out).toBeNull();
-      expect(mockInvoke).not.toHaveBeenCalled();
-      expect(debug).toHaveBeenCalledWith(
-        expect.stringContaining('scheduleCefProfilePurge: skipped — not running in Tauri')
-      );
-      debug.mockRestore();
-    });
-
-    test('invoke with userId null when argument is undefined', async () => {
-      mockInvoke.mockResolvedValueOnce('/path');
-
-      const out = await scheduleCefProfilePurge();
-
-      expect(mockInvoke).toHaveBeenCalledWith('schedule_cef_profile_purge', { userId: null });
-      expect(out).toBe('/path');
-    });
-
-    test('invoke with userId null when argument is null', async () => {
-      mockInvoke.mockResolvedValueOnce('/path');
-
-      const out = await scheduleCefProfilePurge(null);
-
-      expect(mockInvoke).toHaveBeenCalledWith('schedule_cef_profile_purge', { userId: null });
-      expect(out).toBe('/path');
-    });
-
-    test('invoke with userId string when provided', async () => {
-      mockInvoke.mockResolvedValueOnce('/other');
-
-      const out = await scheduleCefProfilePurge('user-9');
-
-      expect(mockInvoke).toHaveBeenCalledWith('schedule_cef_profile_purge', { userId: 'user-9' });
-      expect(out).toBe('/other');
     });
   });
 });

@@ -6,8 +6,8 @@
 //! `http_request.allowed_domains` so there is one allowlist to reason
 //! about.
 
-use super::url_guard::{normalize_allowed_domains, validate_url};
-use crate::openhuman::security::SecurityPolicy;
+use super::url_guard::{normalize_allowed_domains, validate_url_with_dns_check};
+use crate::openhuman::security::{CommandClass, GateDecision, SecurityPolicy};
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -85,8 +85,8 @@ impl CurlTool {
         Ok(resolved)
     }
 
-    fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        validate_url(raw_url, &self.allowed_domains)
+    async fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
+        validate_url_with_dns_check(raw_url, &self.allowed_domains).await
     }
 
     fn default_filename_from_url(url: &str) -> String {
@@ -145,6 +145,13 @@ impl Tool for CurlTool {
         })
     }
 
+    /// Downloading from the network is the always-ask `Network` bucket — it
+    /// prompts the human in both ask-before-edit and Full; read-only is blocked
+    /// in `execute`.
+    fn external_effect_with_args(&self, _args: &serde_json::Value) -> bool {
+        self.security.gate_decision(CommandClass::Network) == GateDecision::Prompt
+    }
+
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Write
     }
@@ -163,20 +170,63 @@ impl Tool for CurlTool {
 
         if !self.security.can_act() {
             tracing::debug!(target: "[curl]", url = %url, "blocked: autonomy read-only");
-            return Ok(ToolResult::error("Action blocked: autonomy is read-only"));
+            return Ok(ToolResult::error(
+                "[policy-blocked] Action blocked: autonomy is read-only",
+            ));
         }
         if !self.security.record_action() {
             tracing::debug!(target: "[curl]", url = %url, "blocked: rate limit");
             return Ok(ToolResult::error("Action blocked: rate limit exceeded"));
         }
 
-        let url = match self.validate_url(url) {
+        // Local-only enforcement (privacy epic S7, #4441): mirror the read-only
+        // `can_act()` deny above — under LocalOnly, refuse the download before
+        // URL validation / DNS so nothing leaves the device.
+        {
+            let host = reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Some(msg) = crate::openhuman::security::egress::local_only_tool_block(
+                &crate::openhuman::security::egress::EgressDescriptor::network_fetch(host.clone()),
+            ) {
+                // Log only the host, never the full URL: a raw URL can carry
+                // secrets in its query string (pre-signed links, tokens). The
+                // gate helper already logs `desc.service` (host only) too.
+                tracing::debug!(target: "[curl]", host = %host, "blocked: local-only privacy mode");
+                return Ok(ToolResult::error(msg));
+            }
+        }
+
+        let url = match self.validate_url(url).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(target: "[curl]", url = %url, reason = %e, "url validation failed");
                 return Ok(ToolResult::error(e.to_string()));
             }
         };
+
+        // Egress spine (privacy epic S2/S7, #4436/#4441): a curl download
+        // contacts an external host — disclose the destination (and that custom
+        // headers ride along) before the request. Enforcement already ran at the
+        // top of `execute`; this is the observe-only disclosure for permitted
+        // downloads.
+        {
+            use crate::openhuman::security::egress::{DataKind, EgressDescriptor};
+            let host = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            let has_headers = headers_val
+                .as_object()
+                .map(|h| !h.is_empty())
+                .unwrap_or(false);
+            let mut desc = EgressDescriptor::network_fetch(host);
+            if has_headers {
+                desc = desc.with_data_kind(DataKind::Metadata);
+            }
+            crate::openhuman::security::egress::emit_external_transfer(desc);
+        }
 
         let dest = match dest_arg {
             Some(d) => d.to_string(),
@@ -357,197 +407,5 @@ fn sanitize_dest_subdir(raw: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::security::SecurityPolicy;
-    use tempfile::TempDir;
-    fn slash_norm(s: String) -> String {
-        s.replace('\\', "/")
-    }
-
-    fn tool(tmp: &TempDir, allow: Vec<&str>) -> CurlTool {
-        CurlTool::new(
-            Arc::new(SecurityPolicy::default()),
-            allow.into_iter().map(String::from).collect(),
-            tmp.path().to_path_buf(),
-            "downloads".into(),
-            1024 * 1024,
-            30,
-        )
-    }
-
-    #[test]
-    fn sanitize_dest_subdir_strips_absolute_paths() {
-        assert_eq!(
-            slash_norm(sanitize_dest_subdir("/etc/passwd")),
-            "etc/passwd"
-        );
-        assert_eq!(sanitize_dest_subdir("//foo"), "foo");
-    }
-
-    #[test]
-    fn sanitize_dest_subdir_strips_parent_segments() {
-        assert_eq!(sanitize_dest_subdir("../../etc"), "etc");
-        assert_eq!(slash_norm(sanitize_dest_subdir("a/../b")), "a/b");
-    }
-
-    #[test]
-    fn sanitize_dest_subdir_falls_back_to_downloads() {
-        assert_eq!(sanitize_dest_subdir(""), "downloads");
-        assert_eq!(sanitize_dest_subdir("   "), "downloads");
-        assert_eq!(sanitize_dest_subdir(".."), "downloads");
-        assert_eq!(sanitize_dest_subdir("/"), "downloads");
-    }
-
-    #[test]
-    fn sanitize_dest_subdir_keeps_normal_paths() {
-        assert_eq!(sanitize_dest_subdir("downloads"), "downloads");
-        assert_eq!(
-            slash_norm(sanitize_dest_subdir("artifacts/build")),
-            "artifacts/build"
-        );
-    }
-
-    #[test]
-    fn new_sanitizes_malicious_dest_subdir() {
-        let tmp = TempDir::new().unwrap();
-        let t = CurlTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            tmp.path().to_path_buf(),
-            "../../etc".into(),
-            1024,
-            30,
-        );
-        let resolved = t.resolve_dest("file.txt").unwrap();
-        // Sanitizer reduced "../../etc" to "etc"; resolution must stay under workspace.
-        assert!(resolved.starts_with(tmp.path().join("etc")));
-        assert!(resolved.starts_with(tmp.path()));
-    }
-
-    #[test]
-    fn resolve_dest_normal() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let p = t.resolve_dest("foo/bar.txt").unwrap();
-        assert!(p.starts_with(tmp.path().join("downloads")));
-        assert!(p.ends_with("foo/bar.txt"));
-    }
-
-    #[test]
-    fn resolve_dest_rejects_absolute() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let err = t.resolve_dest("/etc/passwd").unwrap_err().to_string();
-        assert!(err.contains("relative"));
-    }
-
-    #[test]
-    fn resolve_dest_rejects_parent_dir() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let err = t.resolve_dest("../etc/passwd").unwrap_err().to_string();
-        assert!(err.contains(".."));
-    }
-
-    #[test]
-    fn resolve_dest_rejects_nested_parent_dir() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let err = t.resolve_dest("a/../../b").unwrap_err().to_string();
-        assert!(err.contains(".."));
-    }
-
-    #[test]
-    fn resolve_dest_rejects_empty() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        assert!(t.resolve_dest("").is_err());
-        assert!(t.resolve_dest("   ").is_err());
-    }
-
-    #[test]
-    fn default_filename_from_url_basic() {
-        assert_eq!(
-            CurlTool::default_filename_from_url("https://example.com/foo/bar.zip"),
-            "bar.zip"
-        );
-    }
-
-    #[test]
-    fn default_filename_from_url_query_stripped() {
-        assert_eq!(
-            CurlTool::default_filename_from_url("https://example.com/file.tar.gz?token=x"),
-            "file.tar.gz"
-        );
-    }
-
-    #[test]
-    fn default_filename_from_url_root_falls_back() {
-        assert_eq!(
-            CurlTool::default_filename_from_url("https://example.com/"),
-            "download.bin"
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_when_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let t = CurlTool::new(
-            security,
-            vec!["example.com".into()],
-            tmp.path().into(),
-            "downloads".into(),
-            1024,
-            30,
-        );
-        let result = t
-            .execute(serde_json::json!({"url": "https://example.com/x"}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("rate limit"));
-    }
-
-    /// Live integration smoke: downloads example.com (a tiny, stable
-    /// public page). Gated behind `OPENHUMAN_CURL_LIVE_TEST=1` so CI /
-    /// offline runs don't depend on the network.
-    #[tokio::test]
-    async fn live_download_example_com() {
-        if std::env::var("OPENHUMAN_CURL_LIVE_TEST").ok().as_deref() != Some("1") {
-            return;
-        }
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let result = t
-            .execute(serde_json::json!({
-                "url": "https://example.com/",
-                "dest_path": "example.html"
-            }))
-            .await
-            .unwrap();
-        assert!(!result.is_error, "live curl errored: {}", result.output());
-        let payload: serde_json::Value = serde_json::from_str(&result.output()).unwrap();
-        let bytes = payload["bytes_written"].as_u64().unwrap();
-        assert!(bytes > 100, "unexpectedly small download: {bytes} bytes");
-        let path = payload["path"].as_str().unwrap();
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.to_lowercase().contains("example domain"));
-    }
-
-    #[tokio::test]
-    async fn execute_rejects_allowlist_miss() {
-        let tmp = TempDir::new().unwrap();
-        let t = tool(&tmp, vec!["example.com"]);
-        let result = t
-            .execute(serde_json::json!({"url": "https://other.example.org/x"}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("allowed_domains"));
-    }
-}
+#[path = "curl_tests.rs"]
+mod tests;

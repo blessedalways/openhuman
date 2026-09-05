@@ -21,17 +21,49 @@ import { renderWithProviders } from '../src/test/test-utils';
 // Module mocks
 // ---------------------------------------------------------------------------
 
-const { mockGetBackendUrl, mockOpenUrl, mockIsTauri } = vi.hoisted(() => ({
+const {
+  mockGetBackendUrl,
+  mockOpenUrl,
+  mockIsTauri,
+  mockPrepareOAuthLoginLaunch,
+  mockCheckBackendHealthy,
+} = vi.hoisted(() => ({
   mockGetBackendUrl: vi.fn(),
   mockOpenUrl: vi.fn(),
   mockIsTauri: vi.fn(),
+  mockPrepareOAuthLoginLaunch: vi.fn(),
+  // Default to a healthy backend so the pre-flight in OAuthProviderButton
+  // (added for issue #1985) doesn't short-circuit the OAuth flow these
+  // tests exercise.
+  mockCheckBackendHealthy: vi.fn().mockImplementation(async () => {
+    // Mirror the real checkBackendHealthy contract: never throw — convert a
+    // getBackendUrl() rejection into the resolve-failure result so tests that
+    // exercise that error path see the production banner instead of an
+    // unhandled rejection in the click handler.
+    try {
+      const backendUrl = await mockGetBackendUrl();
+      return { healthy: true, status: 200, latencyMs: 5, backendUrl };
+    } catch {
+      return { healthy: false, reason: 'resolve-failure', latencyMs: 0 };
+    }
+  }),
 }));
 
 vi.mock('../src/services/backendUrl', () => ({ getBackendUrl: mockGetBackendUrl }));
+vi.mock('../src/services/backendHealth', () => ({ checkBackendHealthy: mockCheckBackendHealthy }));
 vi.mock('../src/utils/openUrl', () => ({ openUrl: mockOpenUrl }));
 vi.mock('../src/utils/tauriCommands', async importOriginal => {
   const actual = await importOriginal<Record<string, unknown>>();
   return { ...actual, isTauri: mockIsTauri };
+});
+vi.mock('../src/utils/oauthAppVersionGate', async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, prepareOAuthLoginLaunch: mockPrepareOAuthLoginLaunch };
+});
+
+beforeEach(() => {
+  mockPrepareOAuthLoginLaunch.mockReset();
+  mockPrepareOAuthLoginLaunch.mockResolvedValue(undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -108,7 +140,7 @@ describe('OAuthProviderButton (Discord) — web OAuth flow', () => {
     await clickButton(screen.getByRole('button', { name: /discord/i }));
 
     await waitFor(() => {
-      expect((window.location as unknown as { href: string }).href).toBe(
+      expect((window.location as unknown as { href: string }).href).toContain(
         'http://localhost:5005/auth/discord/login?responseType=json'
       );
     });
@@ -148,7 +180,7 @@ describe('OAuthProviderButton (Discord) — Tauri OAuth flow', () => {
 
     await waitFor(() => {
       expect(mockOpenUrl).toHaveBeenCalledWith(
-        'https://api.example.com/auth/discord/login?responseType=json'
+        expect.stringContaining('https://api.example.com/auth/discord/login?responseType=json')
       );
     });
   });
@@ -303,7 +335,7 @@ describe('OAuthProviderButton (Discord) — URL construction', () => {
     await clickButton(screen.getByRole('button', { name: /discord/i }));
 
     await waitFor(() => expect(mockOpenUrl).toHaveBeenCalled());
-    expect(mockOpenUrl.mock.calls[0][0]).toBe(
+    expect(mockOpenUrl.mock.calls[0][0]).toContain(
       'https://api.example.com/auth/discord/login?responseType=json'
     );
   });

@@ -3,10 +3,16 @@
 //! The orchestrator agent is direct-first and only delegates specialised
 //! work. Rather than exposing a single generic
 //! `spawn_subagent(agent_id, prompt)` mega-tool, we synthesise one named
-//! tool per entry in the orchestrator's `subagents = [...]` TOML field,
-//! so the LLM's function-calling schema contains discoverable, well-named
-//! tools like `research`, `plan`, `run_code`, `delegate_gmail`,
-//! `delegate_github`, etc.
+//! tool per [`SubagentEntry::AgentId`] in the orchestrator's
+//! `[subagents] allowlist = [...]` TOML section, so the LLM's function-calling schema
+//! contains discoverable, well-named tools like `research`, `plan`,
+//! `run_code`, etc.
+//!
+//! For [`SubagentEntry::Skills`] wildcard expansions (#1335) we synthesise
+//! a single collapsed `delegate_to_integrations_agent` tool that takes the
+//! toolkit slug as an argument — keeping the orchestrator's schema cost
+//! constant in the integration dimension instead of scaling with the
+//! number of connected toolkits.
 //!
 //! Each synthesised tool's description is pulled live from the target
 //! agent's [`AgentDefinition::when_to_use`] (for
@@ -24,12 +30,16 @@
 //! [`SubagentEntry::AgentId`]: crate::openhuman::agent::harness::definition::SubagentEntry::AgentId
 //! [`SubagentEntry::Skills`]: crate::openhuman::agent::harness::definition::SubagentEntry::Skills
 
+use crate::openhuman::agent::context::prompt::ConnectedIntegration;
 use crate::openhuman::agent::harness::definition::{
     AgentDefinition, AgentDefinitionRegistry, SubagentEntry,
 };
-use crate::openhuman::context::prompt::ConnectedIntegration;
 
-use super::{ArchetypeDelegationTool, SkillDelegationTool, SpawnWorkerThreadTool, Tool};
+// SpawnWorkerThreadTool import kept commented while the worker-thread spawn is
+// temporarily disabled (see tinyhumansai/openhuman#1624).
+#[allow(unused_imports)]
+use super::SpawnWorkerThreadTool;
+use super::{ArchetypeDelegationTool, SkillDelegationTool, Tool};
 
 /// Synthesise the delegation tool list for an agent based on its
 /// declarative `subagents` field.
@@ -41,18 +51,23 @@ use super::{ArchetypeDelegationTool, SkillDelegationTool, SpawnWorkerThreadTool,
 /// `when_to_use` — so editing an agent's TOML description immediately
 /// updates the tool schema the orchestrator LLM sees, with zero drift.
 ///
-/// Each [`SubagentEntry::Skills`] wildcard expands to one
-/// [`SkillDelegationTool`] per connected Composio integration in
-/// `connected_integrations`. The synthesised tool routes to the generic
-/// `integrations_agent` with `skill_filter = Some("{toolkit_slug}")` pre-set.
+/// Each [`SubagentEntry::Skills`] wildcard expands to a single
+/// collapsed [`SkillDelegationTool`] named
+/// `delegate_to_integrations_agent` whose `toolkit` argument selects
+/// among the slugs of every connected Composio integration in
+/// `connected_integrations`. The tool routes to the generic
+/// `integrations_agent` with the chosen toolkit's slug passed as
+/// `skill_filter`. The collapsed form keeps the orchestrator's
+/// function-calling schema constant in the integration dimension
+/// (#1335).
 ///
 /// Entries that reference unknown agent ids (not in the registry) are
 /// logged at `warn` and skipped — the orchestrator still builds, just
 /// without the broken delegation. Entries that reference Skills wildcards
 /// with an empty `connected_integrations` slice produce zero tools, which
 /// is the correct behaviour when the user has not yet connected any
-/// integrations (the LLM should not see phantom `delegate_gmail` tools
-/// for unconnected toolkits).
+/// integrations (the LLM should not see a `delegate_to_integrations_agent`
+/// tool with an empty enum).
 ///
 /// Returns an empty Vec when `definition.subagents` is empty — callers
 /// (notably the builder) handle this by not extending the visible-tool
@@ -66,9 +81,12 @@ pub fn collect_orchestrator_tools(
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
     // Orchestrator-only tool: spawn_worker_thread.
-    if definition.id == "orchestrator" {
-        tools.push(Box::new(SpawnWorkerThreadTool::new()));
-    }
+    // Temporarily disabled — worker threads do not yet have a proper UI
+    // showcase (see tinyhumansai/openhuman#1624). Re-enable once the
+    // dedicated worker-thread surface lands.
+    // if definition.id == "orchestrator" {
+    //     tools.push(Box::new(SpawnWorkerThreadTool::new()));
+    // }
 
     for entry in &definition.subagents {
         match entry {
@@ -104,14 +122,19 @@ pub fn collect_orchestrator_tools(
                     tool_name,
                     target.id
                 );
-                let direct_first_description = format!(
-                    "Use only when direct response/direct tools are insufficient. {}",
-                    target.when_to_use
-                );
+                // The description is the target's `when_to_use` verbatim.
+                //
+                // It used to be prefixed with "Use only when direct
+                // response/direct tools are insufficient. " — 13 tokens
+                // repeated once per delegate tool, ~250 per turn on the Master
+                // Agent, restating a rule its prompt already carries as
+                // "**Direct-first always**". A parent whose prompt does not
+                // state that rule should gain it there, once, rather than
+                // paying for it on every delegate schema on every turn.
                 tools.push(Box::new(ArchetypeDelegationTool {
                     tool_name,
                     agent_id: target.id.clone(),
-                    tool_description: direct_first_description,
+                    tool_description: target.when_to_use.clone(),
                 }));
             }
             SubagentEntry::Skills(wildcard) => {
@@ -123,11 +146,27 @@ pub fn collect_orchestrator_tools(
                     );
                     continue;
                 }
+                // Collapsed delegation tool (#1335). Previously this loop
+                // emitted one `delegate_<toolkit>` tool per connected
+                // integration. Every one of those tools dispatched to the
+                // same `integrations_agent` with a different `skill_filter`,
+                // so the fan-out cost the orchestrator schema bytes without
+                // buying any new routing capability. We now emit at most
+                // one `delegate_to_integrations_agent` tool that takes the
+                // toolkit slug as an argument; the description enumerates
+                // the connected toolkits so the orchestrator still
+                // discovers which integrations are routable.
+                // `sanitise_slug` is lossy — `Slack.Bot` and `Slack-Bot`
+                // both collapse to `slack_bot`. Once the raw id is
+                // discarded, one upstream integration would silently
+                // shadow the other. Detect the collision here, drop
+                // every duplicate after the first, and warn so routing
+                // stays unambiguous (the first arrival keeps the slug;
+                // later arrivals are unreachable through this enum and
+                // safer to omit than silently re-target).
+                let mut connected: Vec<(String, String)> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for integration in connected_integrations {
-                    // Only emit a delegate_* tool for integrations that are
-                    // actually connected — exposing unconnected entries would
-                    // let the orchestrator call a tool whose pre-flight
-                    // will immediately reject with "not connected".
                     if !integration.connected {
                         log::debug!(
                             "[orchestrator_tools] skipping unconnected integration: {}",
@@ -135,38 +174,50 @@ pub fn collect_orchestrator_tools(
                         );
                         continue;
                     }
-                    // Slug the toolkit name into a tool-name-safe form.
-                    // Composio toolkit slugs are already lowercase / dash-
-                    // separated (e.g. "gmail", "google_calendar"), but
-                    // we guard against surprises so a quirky slug can
-                    // never produce an invalid function-calling schema.
+                    // Slug the toolkit name into a tool-name-safe
+                    // (and argument-safe) form so the LLM-facing
+                    // enum stays predictable across odd toolkit
+                    // names (dashes, dots, spaces, mixed case).
                     let slug = sanitise_slug(&integration.toolkit);
-                    let tool_name = format!("delegate_{}", slug);
-                    // Prefer the toolkit's own one-line description when
-                    // available; fall back to a generic template so the
-                    // LLM still gets a meaningful tool description even
-                    // on brand-new or poorly-populated toolkits.
+                    if !seen.insert(slug.clone()) {
+                        log::warn!(
+                            "[orchestrator_tools] duplicate sanitised slug '{slug}' from raw \
+                             toolkit '{raw}' — dropping to keep collapsed delegation routing \
+                             unambiguous",
+                            raw = integration.toolkit
+                        );
+                        continue;
+                    }
+                    // Empty integration descriptions otherwise render as a
+                    // bare ` - slug` line in the collapsed tool description,
+                    // which gives the orchestrator LLM no hint about what
+                    // the toolkit actually does. Fall back to the
+                    // generic per-toolkit phrasing the old fan-out path
+                    // used so brand-new or under-populated toolkits stay
+                    // informative.
                     let description = if integration.description.trim().is_empty() {
                         format!(
-                            "Use only when direct response/direct tools are insufficient and the task truly requires external integration actions. Delegate to the integrations_agent with the `{}` integration pre-selected.",
+                            "External integration via {} — see the toolkit docs for available actions.",
                             integration.toolkit
                         )
                     } else {
-                        format!(
-                            "Use only when direct response/direct tools are insufficient and the task truly requires external integration actions. Delegate to the integrations_agent using `{}`. {}",
-                            integration.toolkit, integration.description
-                        )
+                        integration.description.clone()
                     };
-                    log::debug!(
-                        "[orchestrator_tools] registering skill delegation tool: {} -> integrations_agent (skill_filter={})",
-                        tool_name,
-                        slug
-                    );
-                    tools.push(Box::new(SkillDelegationTool {
-                        tool_name,
-                        skill_id: slug,
-                        tool_description: description,
-                    }));
+                    connected.push((slug, description));
+                }
+                match SkillDelegationTool::for_connected(connected) {
+                    Some(tool) => {
+                        log::debug!(
+                            "[orchestrator_tools] registering collapsed integrations delegation tool ({} toolkits)",
+                            tool.connected_toolkits.len()
+                        );
+                        tools.push(Box::new(tool));
+                    }
+                    None => {
+                        log::debug!(
+                            "[orchestrator_tools] no connected integrations — collapsed delegation tool omitted"
+                        );
+                    }
                 }
             }
         }
@@ -203,207 +254,5 @@ pub(crate) fn sanitise_slug(raw: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::agent::harness::definition::{
-        DefinitionSource, ModelSpec, PromptSource, SandboxMode, SkillsWildcard, ToolScope,
-    };
-
-    fn def(id: &str, when_to_use: &str, delegate_name: Option<&str>) -> AgentDefinition {
-        AgentDefinition {
-            id: id.into(),
-            when_to_use: when_to_use.into(),
-            display_name: None,
-            system_prompt: PromptSource::Inline(String::new()),
-            omit_identity: true,
-            omit_memory_context: true,
-            omit_safety_preamble: true,
-            omit_skills_catalog: true,
-            omit_profile: true,
-            omit_memory_md: true,
-            model: ModelSpec::Inherit,
-            temperature: 0.4,
-            tools: ToolScope::Wildcard,
-            disallowed_tools: vec![],
-            skill_filter: None,
-            extra_tools: vec![],
-            max_iterations: 8,
-            max_result_chars: None,
-            timeout_secs: None,
-            sandbox_mode: SandboxMode::None,
-            background: false,
-            subagents: vec![],
-            delegate_name: delegate_name.map(String::from),
-            source: DefinitionSource::Builtin,
-        }
-    }
-
-    /// A real orchestrator definition that delegates to two named agents
-    /// (one with an explicit `delegate_name`, one without) plus a skills
-    /// wildcard. Exercises every branch of `collect_orchestrator_tools`.
-    fn sample_orchestrator() -> AgentDefinition {
-        let mut orch = def("orchestrator", "Routes work to the right specialist", None);
-        orch.subagents = vec![
-            SubagentEntry::AgentId("researcher".into()),
-            SubagentEntry::AgentId("archivist".into()),
-            SubagentEntry::Skills(SkillsWildcard { skills: "*".into() }),
-        ];
-        orch
-    }
-
-    fn registry_with_targets() -> AgentDefinitionRegistry {
-        let mut reg = AgentDefinitionRegistry::default();
-        reg.insert(def(
-            "researcher",
-            "Web & docs crawler — reads real documentation",
-            Some("research"),
-        ));
-        // `archivist` has no `delegate_name` override — tool name should
-        // fall back to `delegate_archivist`.
-        reg.insert(def(
-            "archivist",
-            "Background librarian — extracts lessons from a completed session",
-            None,
-        ));
-        reg
-    }
-
-    fn integration(toolkit: &str, description: &str) -> ConnectedIntegration {
-        ConnectedIntegration {
-            toolkit: toolkit.into(),
-            description: description.into(),
-            tools: vec![],
-            connected: true,
-        }
-    }
-
-    /// Baseline: an orchestrator with 2 AgentId entries + a Skills
-    /// wildcard, against a registry that knows both targets and a
-    /// connected_integrations list with three toolkits, should produce
-    /// 2 + 3 = 5 delegation tools, each with the expected name and
-    /// description source.
-    #[test]
-    fn collects_agentid_entries_and_expands_skills_wildcard() {
-        let orch = sample_orchestrator();
-        let reg = registry_with_targets();
-        let integrations = vec![
-            integration("gmail", "Send and read email via Gmail."),
-            integration("github", "Manage repos, issues, and pull requests."),
-            integration("notion", "Read and write pages and databases."),
-        ];
-
-        let tools = collect_orchestrator_tools(&orch, &reg, &integrations);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-
-        assert_eq!(
-            names,
-            vec![
-                "spawn_worker_thread",   // orchestrator-only, prepended in collect_orchestrator_tools
-                "research",              // researcher's delegate_name override
-                "delegate_archivist",    // archivist has no delegate_name → default
-                "delegate_gmail",
-                "delegate_github",
-                "delegate_notion",
-            ],
-            "tool names should come from delegate_name overrides, id fallbacks, and sanitised toolkit slugs"
-        );
-
-        // Descriptions should come from when_to_use for archetype tools,
-        // and from a templated string mentioning the toolkit display name
-        // for skill tools.
-        let research_tool = tools.iter().find(|t| t.name() == "research").unwrap();
-        assert!(research_tool.description().contains("crawler"));
-
-        let gmail_tool = tools.iter().find(|t| t.name() == "delegate_gmail").unwrap();
-        assert!(gmail_tool.description().contains("gmail"));
-        assert!(gmail_tool.description().contains("email"));
-    }
-
-    /// An orchestrator with a Skills wildcard but no connected
-    /// integrations should produce zero skill delegation tools — the LLM
-    /// must not be shown phantom `delegate_*` tools for toolkits that
-    /// aren't authorised.
-    #[test]
-    fn skills_wildcard_with_no_integrations_produces_no_tools() {
-        let orch = sample_orchestrator();
-        let reg = registry_with_targets();
-        let tools = collect_orchestrator_tools(&orch, &reg, &[]);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(
-            names,
-            vec!["spawn_worker_thread", "research", "delegate_archivist"]
-        );
-    }
-
-    /// An AgentId entry that points at an id not present in the registry
-    /// should be logged and silently skipped, rather than panicking or
-    /// aborting tool assembly. The orchestrator still builds.
-    #[test]
-    fn unknown_subagent_id_is_skipped_not_fatal() {
-        let mut orch = def("orchestrator", "test", None);
-        orch.subagents = vec![
-            SubagentEntry::AgentId("researcher".into()),
-            SubagentEntry::AgentId("ghost_agent_nope".into()),
-        ];
-        let reg = registry_with_targets();
-        let tools = collect_orchestrator_tools(&orch, &reg, &[]);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["spawn_worker_thread", "research"]);
-    }
-
-    /// An empty `subagents` list should produce zero tools — regular
-    /// non-delegating agents (welcome, code_executor, etc.) reach this
-    /// path without any subagents and must not pick up stray tools.
-    #[test]
-    fn empty_subagents_produces_no_tools() {
-        let orch = def("welcome", "First agent", None);
-        let reg = registry_with_targets();
-        let tools = collect_orchestrator_tools(&orch, &reg, &[]);
-        assert!(tools.is_empty());
-    }
-
-    /// Toolkit slugs with dashes, spaces, or mixed case should be
-    /// normalised to `[a-z0-9_]` before being used as part of a function
-    /// name — the OpenAI tool-calling schema has strict character rules.
-    #[test]
-    fn sanitise_slug_lowercases_and_replaces_invalid_chars() {
-        assert_eq!(sanitise_slug("Gmail"), "gmail");
-        assert_eq!(sanitise_slug("google-calendar"), "google_calendar");
-        assert_eq!(sanitise_slug("slack.bot"), "slack_bot");
-        assert_eq!(sanitise_slug("weird name!"), "weird_name_");
-    }
-
-    /// Unconnected integrations must be silently skipped — exposing a
-    /// `delegate_*` tool for a toolkit whose OAuth token is absent would
-    /// let the orchestrator call a tool whose pre-flight check immediately
-    /// rejects with "not connected".
-    #[test]
-    fn unconnected_integrations_are_skipped() {
-        let orch = sample_orchestrator();
-        let reg = registry_with_targets();
-        let integrations = vec![
-            integration("gmail", "Send and read email."),
-            ConnectedIntegration {
-                toolkit: "github".into(),
-                description: "GitHub access.".into(),
-                tools: vec![],
-                connected: false, // not connected — must not produce a tool
-            },
-            integration("notion", "Read and write pages."),
-        ];
-        let tools = collect_orchestrator_tools(&orch, &reg, &integrations);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(
-            names.contains(&"delegate_gmail"),
-            "connected gmail must produce a tool"
-        );
-        assert!(
-            !names.contains(&"delegate_github"),
-            "unconnected github must NOT produce a tool"
-        );
-        assert!(
-            names.contains(&"delegate_notion"),
-            "connected notion must produce a tool"
-        );
-    }
-}
+#[path = "orchestrator_tools_tests.rs"]
+mod tests;

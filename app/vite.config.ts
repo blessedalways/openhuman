@@ -10,6 +10,12 @@ import { nodePolyfills } from "vite-plugin-node-polyfills";
 
 const host = process.env.TAURI_DEV_HOST;
 
+// Optional override so parallel `dev:app:win` runs across worktrees can
+// avoid the hardcoded 1420 collision. Default 1420 preserves prior behavior;
+// HMR companion port is dev port + 1 (used only when TAURI_DEV_HOST is set).
+const devPort = Number(process.env.OPENHUMAN_DEV_PORT) || 1420;
+const hmrPort = devPort + 1;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(
   readFileSync(resolve(__dirname, "package.json"), "utf8"),
@@ -35,6 +41,10 @@ function maybeSentryPlugin(): PluginOption | null {
   if (!authToken) return null;
   return sentryVitePlugin({
     authToken,
+    // Self-hosted Sentry — without `url`, the plugin defaults to sentry.io
+    // and silently no-ops the upload. Falls back to sentry.io if unset for
+    // local builds against the SaaS instance.
+    url: process.env.SENTRY_URL,
     org: process.env.SENTRY_ORG,
     project: process.env.SENTRY_PROJECT,
     release: {
@@ -84,6 +94,95 @@ function guardCefRelListSupportsPlugin(): PluginOption {
   };
 }
 
+// Dev-server-only route that hands the browser the credentials it needs to
+// talk to a local `openhuman-core` before the SPA boots.
+//
+// In the desktop app the shell injects the per-launch bearer over IPC
+// (`core_rpc_token`), so the renderer never needs one on disk. A plain browser
+// has no such channel: `coreRpcClient` falls back to `getStoredCoreToken()` /
+// `peekStoredRpcUrl()`, which read `localStorage`. Without seeding those the
+// first RPC is a 401 and the app is stuck on the boot gate.
+//
+// `apply: "serve"` keeps this out of every production bundle — the route only
+// exists while the dev server is running. The token is read from the dev
+// server's own environment and never accepted from the query string, so a
+// stray link cannot point a running dev session at an attacker's core.
+//
+// `server.host` defaults to `true` above (binds every adapter, not just
+// loopback) to work around the Windows dual-stack `localhost` proxy issue,
+// so this route is reachable from the LAN even though it needs no auth of
+// its own. Restrict it to loopback callers: a LAN peer that can reach this
+// port must not be able to read `OPENHUMAN_CORE_TOKEN` back out of it,
+// especially when combined with the documented `OPENHUMAN_CORE_HOST=0.0.0.0`
+// setup, where that token would then work against the core directly.
+//
+// Keys must stay in sync with `app/src/utils/configPersistence.ts`.
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  // Strip an IPv4-mapped-IPv6 prefix (`::ffff:127.0.0.1`) before comparing.
+  const normalized = address.replace(/^::ffff:/, "");
+  return normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function devConnectPlugin(): PluginOption {
+  return {
+    name: "openhuman:dev-connect",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use("/__dev-connect", (req, res) => {
+        if (!isLoopbackAddress(req.socket.remoteAddress)) {
+          res.statusCode = 403;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.end("Forbidden: /__dev-connect is only reachable from loopback.");
+          return;
+        }
+
+        const token = (process.env.OPENHUMAN_CORE_TOKEN ?? "").trim();
+        const rpcUrl = (
+          process.env.VITE_OPENHUMAN_CORE_RPC_URL ?? ""
+        ).trim();
+
+        // These are the same three keys BootCheckGate's picker writes on a
+        // cloud-mode confirm. The mode marker matters: without it
+        // `getStoredCoreMode()` returns null, which reads as "the picker has
+        // not run yet", and the gate parks the app on the Connect-to-Your-
+        // Runtime screen. A local core reached over an explicit URL + bearer
+        // is exactly what "cloud" means to that picker.
+        //
+        // `</script>` inside a JSON string would close the block early.
+        const json = (value: string) =>
+          JSON.stringify(value).replace(/</g, "\\u003c");
+
+        const html = `<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>Connecting…</title></head>
+  <body style="font:14px system-ui;padding:2rem">
+    <p>Connecting to local openhuman-core…</p>
+    <script>
+      try {
+        var url = ${json(rpcUrl)};
+        var token = ${json(token)};
+        if (url) localStorage.setItem("openhuman_core_rpc_url", url);
+        if (token) localStorage.setItem("openhuman_core_rpc_token", token);
+        if (url && token) localStorage.setItem("openhuman_core_mode", "cloud");
+      } catch (err) {
+        document.body.textContent =
+          "localStorage unavailable: " + err + " — cannot seed core credentials.";
+        throw err;
+      }
+      location.replace("/");
+    </script>
+  </body>
+</html>`;
+
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.end(html);
+      });
+    },
+  };
+}
+
 // `VITE_OPENHUMAN_TARGET=web` switches the build to the browser-hosted
 // flavor: output lands in `dist-web/` so the desktop build artifact in
 // `dist/` (consumed by `cargo tauri build`) is never clobbered, and the
@@ -109,6 +208,24 @@ export default defineConfig(async () => ({
   build: {
     outDir: isWebTarget ? "../dist-web" : "../dist",
     emptyOutDir: true,
+    // Compatibility floor for the Wry system WebView (#5571). Since the
+    // CEF→Wry migration (#5456) the desktop app renders in the OS-provided
+    // engine (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux),
+    // so the bundle must not emit syntax newer than the oldest supported
+    // engine. macOS 12 (Monterey) ships WebKit ~15.x, so Safari 15 is the
+    // JS/CSS floor — without it Vite emits untranspiled ES2022+ that fails to
+    // parse before React mounts, and the window (revealed unconditionally by
+    // the Rust shell) is shown blank. Safari 15 is a strict subset of
+    // WebView2/WebKitGTK, so the Windows/Linux bundles lose nothing.
+    //
+    // The target lowers *syntax* only; it never polyfills runtime methods. The
+    // bundle still calls WebKit-15.4 APIs (structuredClone, Object.hasOwn,
+    // Array.prototype.at), so the real mount floor is WebKit 15.4 = macOS 12.3
+    // (bundle.macOS.minimumSystemVersion). The one WebKit-16.4 feature we use
+    // in-source — a RegExp lookbehind — is rewritten to a lookahead at its call
+    // site (features/share/shareContent.ts) since no Monterey WebKit ships it.
+    target: "safari15",
+    cssTarget: "safari15",
     // Desktop CEF has surfaced a runtime where `link.relList.supports` is
     // truthy but not callable. Vite calls it both in the modulepreload
     // polyfill and the dynamic-import preload helper, before React mounts.
@@ -128,6 +245,7 @@ export default defineConfig(async () => ({
       },
     }),
     guardCefRelListSupportsPlugin(),
+    devConnectPlugin(),
     react(),
     maybeSentryPlugin(),
   ].filter(Boolean) as PluginOption[],
@@ -138,7 +256,7 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    port: devPort,
     strictPort: true,
     // `false` lets Vite pick its own loopback default; on Windows that lands
     // on `::1` only, leaving 127.0.0.1 unbound. The Tauri dev-server proxy
@@ -161,7 +279,7 @@ export default defineConfig(async () => ({
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: hmrPort,
         }
       : {
           // Tauri CEF loads the app from tauri.localhost; without this the
@@ -169,8 +287,8 @@ export default defineConfig(async () => ({
           // Force the client to connect to the Vite dev server directly.
           protocol: "ws",
           host: "localhost",
-          port: 1420,
-          clientPort: 1420,
+          port: devPort,
+          clientPort: devPort,
         },
     watch: {
       // 3. tell Vite to ignore watching `src-tauri` directory (includes src-tauri/ai)
@@ -179,6 +297,7 @@ export default defineConfig(async () => ({
   },
   resolve: {
     alias: {
+      "@": resolve(__dirname, "src"),
       buffer: "buffer",
       process: "process/browser",
       util: "util",

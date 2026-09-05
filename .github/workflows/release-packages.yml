@@ -13,6 +13,10 @@ name: Release Packages
 on:
   workflow_dispatch:
 permissions:
+  # `actions: read` lets scripts/ci-cancel-aware.sh poll the run status so
+  # cancelled builds inside container jobs stop themselves (docker exec
+  # swallows the runner's signals).
+  actions: read
   contents: write
   pages: write
   id-token: write
@@ -21,7 +25,6 @@ concurrency:
   group: release-packages-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 jobs:
-
   # ────────────────────────────────────────────────────────────────────────────
   # 1. Build Linux arm64 CLI tarball (native runner)
   #    Requires: ubuntu-24.04-arm GitHub-hosted runner (free for public repos).
@@ -32,15 +35,19 @@ jobs:
   build-cli-linux-arm64:
     name: Build Linux arm64 CLI tarball
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      # Consumed by scripts/ci-cancel-aware.sh's cancellation watchdog.
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 1
-          submodules: true
+          submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.96.1
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -76,7 +83,7 @@ jobs:
           OPENHUMAN_BUILD_SHA: ${{ github.sha }}
           OPENHUMAN_APP_ENV: production
         run: |
-          cargo build --release --bin openhuman-core
+          bash scripts/ci-cancel-aware.sh cargo build --release --bin openhuman-core
           VERSION="${{ github.event.release.tag_name }}"
           bash scripts/release/package-cli-tarball.sh \
             target/release/openhuman-core \
@@ -91,15 +98,16 @@ jobs:
   update-homebrew:
     name: Update Homebrew tap formula
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [build-cli-linux-arm64]
     steps:
       - name: Checkout main repo (for formula template)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           path: src
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: tinyhumansai/homebrew-openhuman
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -122,10 +130,11 @@ jobs:
   build-apt-repo:
     name: Build apt repository
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     needs: [build-cli-linux-arm64]
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 1
@@ -141,7 +150,7 @@ jobs:
           echo "$APT_SIGNING_KEY" | gpg --batch --import
           gpg --list-secret-keys
       - name: Checkout gh-pages branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: gh-pages
           path: gh-pages
@@ -162,17 +171,23 @@ jobs:
   publish-npm:
     name: Publish npm package
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 1
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.10.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Set version and publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -184,6 +199,7 @@ jobs:
   smoke-homebrew:
     name: Smoke — Homebrew (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     needs: [update-homebrew]
     continue-on-error: true
     strategy:
@@ -209,6 +225,7 @@ jobs:
   smoke-apt:
     name: Smoke — apt (ubuntu-22.04)
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: [build-apt-repo]
     continue-on-error: true
     steps:
@@ -232,6 +249,7 @@ jobs:
   smoke-npm:
     name: Smoke — npm (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     needs: [publish-npm]
     continue-on-error: true
     strategy:
@@ -240,7 +258,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24.x
       - name: Wait for npm propagation, then install
@@ -260,9 +278,10 @@ jobs:
   create-backlog-issue:
     name: Create backlog issue (once)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Create issue if it doesn't exist
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |-
             const { owner, repo } = context.repo;

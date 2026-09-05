@@ -1,92 +1,180 @@
 import * as Sentry from '@sentry/react';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { Provider } from 'react-redux';
-import { HashRouter as Router, useLocation, useNavigate } from 'react-router-dom';
+import {
+  HashRouter as Router,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+} from 'react-router-dom';
 import { PersistGate } from 'redux-persist/integration/react';
 
 import AppRoutes from './AppRoutes';
+import { AnalyticsPageTracker } from './components/analytics';
+import AnnouncementGate from './components/Announcement/AnnouncementGate';
+import AppBackground from './components/AppBackground';
 import AppUpdatePrompt from './components/AppUpdatePrompt';
 import BootCheckGate from './components/BootCheckGate/BootCheckGate';
-import BottomTabBar from './components/BottomTabBar';
 import CommandProvider from './components/commands/CommandProvider';
 import ServiceBlockingGate from './components/daemon/ServiceBlockingGate';
 import DictationHotkeyManager from './components/DictationHotkeyManager';
 import ErrorFallbackScreen from './components/ErrorFallbackScreen';
+import HarnessInitOverlay from './components/InitProgressScreen/HarnessInitOverlay';
+import KeyringConsentOverlay from './components/keyring/KeyringConsentOverlay';
+import AppSidebar from './components/layout/shell/AppSidebar';
+import RootShellLayout from './components/layout/shell/RootShellLayout';
+import { SidebarSlotProvider } from './components/layout/shell/SidebarSlot';
 import LocalAIDownloadSnackbar from './components/LocalAIDownloadSnackbar';
-import MeshGradient from './components/MeshGradient';
+import SecretPromptDialog from './components/mcp-setup/SecretPromptDialog';
+import NoticeCenter from './components/notices/NoticeCenter';
 import OpenhumanLinkModal from './components/OpenhumanLinkModal';
 import PersistRehydrationScreen from './components/PersistRehydrationScreen';
-import GlobalUpsellBanner from './components/upsell/GlobalUpsellBanner';
+import PttHotkeyManager from './components/PttHotkeyManager';
+import SecurityBanner from './components/SecurityBanner';
 import AppWalkthrough from './components/walkthrough/AppWalkthrough';
-import { MascotFrameProducer } from './features/meet/MascotFrameProducer';
-// [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-// import { isWelcomeLocked } from './lib/coreState/store';
-import { startNativeNotificationsService } from './lib/nativeNotifications';
-import { startWebviewNotificationsService } from './lib/webviewNotifications';
+import { useNotchBootSync } from './hooks/useNotchBootSync';
+import { I18nProvider } from './lib/i18n/I18nContext';
+import {
+  startNativeNotificationsService,
+  stopNativeNotificationsService,
+} from './lib/nativeNotifications';
+import { getIsMobile } from './lib/platform';
 import ChatRuntimeProvider from './providers/ChatRuntimeProvider';
 import CoreStateProvider, { useCoreState } from './providers/CoreStateProvider';
 import SocketProvider from './providers/SocketProvider';
-import { startWebviewAccountService } from './services/webviewAccountService';
+import ThemeProvider from './providers/ThemeProvider';
+import { startCoreHealthMonitor, stopCoreHealthMonitor } from './services/coreHealthMonitor';
+import {
+  startInternetStatusListener,
+  stopInternetStatusListener,
+} from './services/internetStatusListener';
 import { persistor, store } from './store';
-// [#1123] useAppDispatch commented out — welcome-agent onboarding replaced by Joyride walkthrough
-import { useAppSelector } from './store/hooks';
-// [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-// import { clearSelectedThread, deleteThread, setWelcomeThreadId } from './store/threadSlice';
-import { isAccountsFullscreen } from './utils/accountsFullscreen';
 import { DEV_FORCE_ONBOARDING } from './utils/config';
 
-// Attach the `webview:event` listener at app boot so background recipe
-// events (Google Meet captions → transcript flush, WhatsApp ingest, …)
-// are handled even when the user hasn't navigated to /accounts yet.
-// Idempotent — the service uses a `started` singleton guard.
-startWebviewAccountService();
-startWebviewNotificationsService();
 startNativeNotificationsService();
+// Connectivity status (#1527): wire navigator.onLine + start core sidecar
+// health poll. Both idempotent via internal `started` guards.
+startInternetStatusListener();
+startCoreHealthMonitor();
+
+export function stopBootServicesForHmr(): void {
+  stopNativeNotificationsService();
+  stopInternetStatusListener();
+  stopCoreHealthMonitor();
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(stopBootServicesForHmr);
+}
 
 function App() {
+  const onMobile = getIsMobile();
+
+  // On mobile (iOS or Android) the SocketProvider would try to connect to the
+  // local core HTTP socket, which does not exist on device (the core runs on
+  // the remote desktop). Gate it out to prevent spurious connection errors —
+  // chat events arrive through TunnelTransport's socket.io relay instead.
+  // NOTE: useHumanMascot's subscribeChatEvents() still returns a no-op unsub
+  // when the socket is absent — mascot state falls back to 'idle'.
+  const socketWrapped = (children: React.ReactNode) =>
+    onMobile ? <>{children}</> : <SocketProvider>{children}</SocketProvider>;
+
+  /*
+   * @generated-source:provider-chain
+   * Authoritative top-level provider / gate nesting for the desktop shell,
+   * outermost first. Keep this list in sync with the JSX returned below;
+   * `scripts/generate-architecture-docs.mjs` renders it into
+   * `gitbooks/developing/architecture/frontend.md` and CI (`pnpm docs:check`)
+   * fails if the doc drifts. Refresh the doc with `pnpm docs:generate`.
+   * Format per line: `<order>. <Component> — <role>` (role must not contain " — ").
+   * 1. Sentry.ErrorBoundary — Crash boundary; renders ErrorFallbackScreen
+   * 2. Provider — Redux store; enables useAppSelector / dispatch app-wide
+   * 3. PersistGate — Holds UI until persisted Redux slices rehydrate
+   * 4. ThemeProvider — Theme tokens and dark-mode handling
+   * 5. I18nProvider — Localization context consumed via useT
+   * 6. BootCheckGate — Blocks render until the core boot snapshot resolves
+   * 7. CoreStateProvider — Core app snapshot: auth, session, onboarding state
+   * 8. SocketProvider — Core socket.io events; desktop only (mobile uses the TunnelTransport relay)
+   * 9. ChatRuntimeProvider — Chat runtime events, tool timeline, and approvals
+   * 10. Router — HashRouter navigation for all routes
+   * 11. CommandProvider — Command palette context
+   * 12. ServiceBlockingGate — Blocks the shell until required services are configured
+   * @end-source:provider-chain
+   */
   return (
     <Sentry.ErrorBoundary
-      fallback={({ error, componentStack, resetError }) => (
-        <ErrorFallbackScreen error={error} componentStack={componentStack} onReset={resetError} />
+      fallback={({ error, componentStack, resetError, eventId }) => (
+        <ErrorFallbackScreen
+          error={error}
+          componentStack={componentStack}
+          eventId={eventId}
+          onReset={resetError}
+        />
       )}>
       <Provider store={store}>
         <PersistGate loading={<PersistRehydrationScreen />} persistor={persistor}>
-          <BootCheckGate>
-            <CoreStateProvider>
-              <SocketProvider>
-                <ChatRuntimeProvider>
-                  <Router>
-                    <CommandProvider>
-                      <ServiceBlockingGate>
-                        <AppShell />
-                        <DictationHotkeyManager />
-                        <LocalAIDownloadSnackbar />
-                        <AppUpdatePrompt />
-                      </ServiceBlockingGate>
-                    </CommandProvider>
-                  </Router>
-                </ChatRuntimeProvider>
-              </SocketProvider>
-            </CoreStateProvider>
-          </BootCheckGate>
+          <ThemeProvider>
+            <I18nProvider>
+              <BootCheckGate>
+                <CoreStateProvider>
+                  {socketWrapped(
+                    <ChatRuntimeProvider>
+                      <Router>
+                        <CommandProvider>
+                          <ServiceBlockingGate>
+                            <AnalyticsPageTracker />
+                            <AppShell />
+                            <SecurityBanner />
+                            {!onMobile && <DictationHotkeyManager />}
+                            {!onMobile && <PttHotkeyManager />}
+                            {!onMobile && <LocalAIDownloadSnackbar />}
+                            {!onMobile && <AppUpdatePrompt />}
+                            <KeyringConsentOverlay />
+                            <HarnessInitOverlay />
+                            <AnnouncementGate />
+                            <SecretPromptDialog />
+                          </ServiceBlockingGate>
+                        </CommandProvider>
+                      </Router>
+                    </ChatRuntimeProvider>
+                  )}
+                </CoreStateProvider>
+              </BootCheckGate>
+            </I18nProvider>
+          </ThemeProvider>
         </PersistGate>
       </Provider>
     </Sentry.ErrorBoundary>
   );
 }
 
-/** Inner shell — lives inside the Router so it can use useLocation. */
+/** Minimal mobile shell — renders routes only, no desktop chrome. */
+function AppShellMobile() {
+  return (
+    <div className="relative h-screen flex flex-col overflow-hidden bg-[#0f1117]">
+      <AppRoutes />
+    </div>
+  );
+}
+
+/**
+ * Top-level shell router — chooses mobile or desktop shell at render time.
+ * Must NOT call hooks before the branch because each sub-component has its
+ * own hook calls that obey the rules-of-hooks within their own scope.
+ */
 function AppShell() {
+  const onMobile = getIsMobile();
+  if (onMobile) {
+    return <AppShellMobile />;
+  }
+  return <AppShellDesktop />;
+}
+
+/** Desktop inner shell — lives inside the Router so it can use useLocation. */
+export function AppShellDesktop() {
   const location = useLocation();
   const navigate = useNavigate();
   const { snapshot, isBootstrapping } = useCoreState();
-  const activeAccountId = useAppSelector(state => state.accounts.activeAccountId);
-  // On /accounts, only the agent view keeps the tab bar + its reserved
-  // bottom padding. Any other selected "app" (e.g. WhatsApp) takes the
-  // full viewport so the embedded webview goes edge-to-edge.
-  const fullscreen = isAccountsFullscreen(location.pathname, activeAccountId);
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // const welcomeLocked = isWelcomeLocked(snapshot);
   const onOnboardingRoute = location.pathname.startsWith('/onboarding');
   const onboardingPending =
     !!snapshot.sessionToken && (DEV_FORCE_ONBOARDING || !snapshot.onboardingCompleted);
@@ -103,9 +191,9 @@ function AppShell() {
       navigate('/onboarding', { replace: true });
     } else if (!onboardingPending && onOnboardingRoute) {
       console.debug(
-        `[onboarding-gate] redirecting ${location.pathname} -> /home (onboarding complete)`
+        `[onboarding-gate] redirecting ${location.pathname} -> /chat (onboarding complete)`
       );
-      navigate('/home', { replace: true });
+      navigate('/chat', { replace: true });
     }
   }, [
     isBootstrapping,
@@ -116,81 +204,77 @@ function AppShell() {
     navigate,
   ]);
 
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // After the welcome agent calls `complete_onboarding` and
-  // `chat_onboarding_completed` flips false→true, discard the transient
-  // welcome thread we created in `OnboardingLayout`. The next user
-  // message will route to the orchestrator and create its own thread.
-  // const dispatch = useAppDispatch();
-  // const welcomeThreadId = useAppSelector(state => state.thread.welcomeThreadId);
-  // const chatOnboardingCompleted = snapshot.chatOnboardingCompleted;
-  // useEffect(() => {
-  //   if (!chatOnboardingCompleted || !welcomeThreadId) return;
-  //   let cancelled = false;
-  //   console.debug(
-  //     `[welcome-cleanup] chat_onboarding_completed=true — deleting welcome thread ${welcomeThreadId}`
-  //   );
-  //   // Await the delete before dropping the local id so a backend failure
-  //   // leaves `welcomeThreadId` set for retry on the next render. Without
-  //   // the await, a 500 from `threads.delete` would leave a stale row in
-  //   // the user's thread list while the renderer thinks it's gone.
-  //   (async () => {
-  //     try {
-  //       await dispatch(deleteThread(welcomeThreadId)).unwrap();
-  //       if (cancelled) return;
-  //       dispatch(clearSelectedThread());
-  //       dispatch(setWelcomeThreadId(null));
-  //     } catch (err) {
-  //       console.warn('[welcome-cleanup] deleteThread failed; will retry on next render', err);
-  //     }
-  //   })();
-  //   return () => {
-  //     cancelled = true;
-  //   };
-  // }, [chatOnboardingCompleted, welcomeThreadId, dispatch]);
-  //
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // Welcome lockdown (#883) — force any route other than `/chat` back to
-  // `/chat` while the welcome-agent conversation is still in progress.
-  // Skipped while onboarding is still pending (the onboarding gate above
-  // owns the route during that phase).
-  // useEffect(() => {
-  //   if (!welcomeLocked || isBootstrapping) return;
-  //   if (onboardingPending) return;
-  //   if (location.pathname === '/chat') return;
-  //   console.debug(
-  //     `[welcome-lock] redirecting ${location.pathname} -> /chat (chat onboarding incomplete)`
-  //   );
-  //   navigate('/chat', { replace: true });
-  // }, [welcomeLocked, isBootstrapping, onboardingPending, location.pathname, navigate]);
+  // Sync the notch indicator to the persisted always-on listening state once
+  // the core is ready (once per boot). Extracted to a hook so it's testable.
+  useNotchBootSync(isBootstrapping);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const navType = useNavigationType();
+
+  useEffect(() => {
+    if (navType !== 'POP') {
+      scrollRef.current?.scrollTo(0, 0);
+    }
+  }, [location.pathname, navType]);
+
+  // Routes that own the full viewport with no app chrome: the public
+  // welcome/login screens, the onboarding stepper, and any pre-auth state.
+  // Everything else renders inside the root two-pane shell (sidebar + main).
+  const token = snapshot.sessionToken;
+  const onHiddenChromePath = ['/', '/login'].some(
+    path => location.pathname === path || location.pathname.startsWith(`${path}/`)
+  );
+  // The workflow graph canvas (`/flows/:id`, `/flows/draft`) used to be listed
+  // here too, as "a focused builder — no app sidebar". It is back in the shell:
+  // going chromeless cost it the app nav AND the sidebar slot, so the builder
+  // had to hand-roll its own 240px run-history rail inside the page (`hidden
+  // lg:flex w-60 border-r`) — a second sidebar sitting where the real one would
+  // have been. It now projects that rail through `SidebarContent` like every
+  // other page, and a user who wants the focused view collapses the sidebar,
+  // which is what `collapsible="icon"` is for.
+  const chromeless = !token || onOnboardingRoute || onHiddenChromePath;
+
+  const content = (
+    <div ref={scrollRef} className="relative h-full overflow-y-auto">
+      {/* The plan-usage upsell and the #5324 memory-embedding warning used to
+          be full-width banners here, pushing every route down. Both are
+          notices in `NoticeCenter` now — see its docs for why. */}
+      <AppRoutes />
+    </div>
+  );
 
   return (
-    <div className="relative h-screen flex flex-col overflow-hidden">
-      <MeshGradient />
-      <div className="app-dotted-canvas relative z-10 flex-1 flex flex-col overflow-hidden">
-        <div
-          className={`flex-1 overflow-y-auto ${
-            // [#1123] welcomeLocked removed — welcome-agent onboarding replaced by Joyride walkthrough
-            fullscreen || onOnboardingRoute ? '' : 'pb-16'
-          }`}>
-          <GlobalUpsellBanner />
-          <AppRoutes />
+    <SidebarSlotProvider>
+      <div className="relative h-screen flex flex-col overflow-hidden">
+        <AppBackground />
+        <div className="relative z-10 flex-1 min-h-0 flex flex-col overflow-hidden">
+          {chromeless ? (
+            content
+          ) : (
+            // Nothing sets `unframed` today. It existed for live CEF provider
+            // webviews — WebviewHost handed the Rust side a plain rectangle and
+            // CEF composited that child view above the whole HTML layer, so a
+            // rounded card under it showed four square corners punching through
+            // the radius. That surface was removed upstream along with
+            // WebviewHost, so no route needs the escape hatch right now; the
+            // prop stays on the primitive for the next full-bleed surface.
+            <RootShellLayout sidebar={<AppSidebar />}>{content}</RootShellLayout>
+          )}
         </div>
-        {!onOnboardingRoute && <BottomTabBar />}
+        <OpenhumanLinkModal />
+        {/* Every notice the app raises, in one bottom-left FAB: classified
+            runtime errors (#3931), the memory-embedding budget (#5324), plan
+            usage limits. Mounted outside the routes so entries survive route
+            changes and background-job completion. */}
+        <NoticeCenter />
+        {/* Post-onboarding Joyride walkthrough — mounted here (outside routes) so
+            it persists across tab navigations. Joyride targets span Home + the
+            sidebar nav so it must stay mounted while the user moves between routes. */}
+        {!isBootstrapping && !onOnboardingRoute && (
+          <AppWalkthrough onboarded={!!snapshot.onboardingCompleted} />
+        )}
       </div>
-      <OpenhumanLinkModal />
-      {/* Hidden Remotion-driven producer for the Meet camera. Mounts a
-          640×480 JPEG frame stream to the Rust frame bus while a meet
-          call is active; idle no-op otherwise. See
-          features/meet/MascotFrameProducer.tsx. */}
-      <MascotFrameProducer />
-      {/* Post-onboarding Joyride walkthrough — mounted here (outside routes) so
-          it persists across tab navigations. Joyride targets span Home + BottomTabBar
-          tabs so it must stay mounted while the user moves between routes. */}
-      {!isBootstrapping && !onOnboardingRoute && (
-        <AppWalkthrough onboarded={!!snapshot.onboardingCompleted} />
-      )}
-    </div>
+    </SidebarSlotProvider>
   );
 }
 

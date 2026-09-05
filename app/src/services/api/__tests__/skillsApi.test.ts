@@ -4,7 +4,7 @@ import { skillsApi } from '../skillsApi';
 
 vi.mock('../../coreRpcClient', () => ({ callCoreRpc: vi.fn() }));
 
-describe('skillsApi.createSkill', () => {
+describe('skillsApi.createWorkflow', () => {
   beforeEach(async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockReset();
@@ -13,7 +13,7 @@ describe('skillsApi.createSkill', () => {
   it('forwards inputs to skills_create and rekeys allowedTools', async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockResolvedValueOnce({
-      skill: {
+      workflow: {
         id: 'my-skill',
         name: 'my-skill',
         description: 'does stuff',
@@ -30,7 +30,7 @@ describe('skillsApi.createSkill', () => {
       },
     });
 
-    const result = await skillsApi.createSkill({
+    const result = await skillsApi.createWorkflow({
       name: 'My Skill',
       description: 'does stuff',
       scope: 'user',
@@ -55,7 +55,7 @@ describe('skillsApi.createSkill', () => {
   it('omits optional fields when not provided', async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockResolvedValueOnce({
-      skill: {
+      workflow: {
         id: 'minimal',
         name: 'minimal',
         description: 'd',
@@ -72,7 +72,7 @@ describe('skillsApi.createSkill', () => {
       },
     });
 
-    await skillsApi.createSkill({ name: 'minimal', description: 'd' });
+    await skillsApi.createWorkflow({ name: 'minimal', description: 'd' });
 
     const call = vi.mocked(callCoreRpc).mock.calls[0][0];
     expect(call.params).toEqual({ name: 'minimal', description: 'd' });
@@ -82,7 +82,7 @@ describe('skillsApi.createSkill', () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockResolvedValueOnce({
       data: {
-        skill: {
+        workflow: {
           id: 'env',
           name: 'env',
           description: 'e',
@@ -99,13 +99,13 @@ describe('skillsApi.createSkill', () => {
         },
       },
     });
-    const result = await skillsApi.createSkill({ name: 'env', description: 'e' });
+    const result = await skillsApi.createWorkflow({ name: 'env', description: 'e' });
     expect(result.id).toBe('env');
     expect(result.scope).toBe('project');
   });
 });
 
-describe('skillsApi.installSkillFromUrl', () => {
+describe('skillsApi.installWorkflowFromUrl', () => {
   beforeEach(async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockReset();
@@ -117,10 +117,10 @@ describe('skillsApi.installSkillFromUrl', () => {
       url: 'https://example.com/my-skill.tgz',
       stdout: 'added my-skill',
       stderr: '',
-      new_skills: ['my-skill'],
+      new_workflows: ['my-skill'],
     });
 
-    const result = await skillsApi.installSkillFromUrl({
+    const result = await skillsApi.installWorkflowFromUrl({
       url: 'https://example.com/my-skill.tgz',
       timeoutSecs: 120,
     });
@@ -129,33 +129,236 @@ describe('skillsApi.installSkillFromUrl', () => {
       method: 'openhuman.skills_install_from_url',
       params: { url: 'https://example.com/my-skill.tgz', timeout_secs: 120 },
     });
-    expect(result.newSkills).toEqual(['my-skill']);
+    expect(result.newWorkflows).toEqual(['my-skill']);
     expect(result.stdout).toBe('added my-skill');
   });
 
-  it('omits timeout_secs when not provided and normalizes missing new_skills', async () => {
+  it('omits timeout_secs when not provided and normalizes missing new_workflows', async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockResolvedValueOnce({
       url: 'https://example.com/x',
       stdout: '',
       stderr: '',
-      new_skills: undefined,
+      new_workflows: undefined,
     });
 
-    const result = await skillsApi.installSkillFromUrl({ url: 'https://example.com/x' });
+    const result = await skillsApi.installWorkflowFromUrl({ url: 'https://example.com/x' });
 
     const call = vi.mocked(callCoreRpc).mock.calls[0][0];
     expect(call.params).toEqual({ url: 'https://example.com/x' });
-    expect(result.newSkills).toEqual([]);
+    expect(result.newWorkflows).toEqual([]);
   });
 
   it('unwraps an envelope response', async () => {
     const { callCoreRpc } = await import('../../coreRpcClient');
     vi.mocked(callCoreRpc).mockResolvedValueOnce({
-      data: { url: 'https://example.com/y', stdout: 'ok', stderr: 'warn', new_skills: ['y-skill'] },
+      data: {
+        url: 'https://example.com/y',
+        stdout: 'ok',
+        stderr: 'warn',
+        new_workflows: ['y-skill'],
+      },
     });
-    const result = await skillsApi.installSkillFromUrl({ url: 'https://example.com/y' });
-    expect(result.newSkills).toEqual(['y-skill']);
+    const result = await skillsApi.installWorkflowFromUrl({ url: 'https://example.com/y' });
+    expect(result.newWorkflows).toEqual(['y-skill']);
     expect(result.stderr).toBe('warn');
+  });
+});
+
+describe('skillsApi.updateWorkflow', () => {
+  beforeEach(async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockReset();
+  });
+
+  it('forwards every optional field and rekeys allowedTools', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({
+      workflow: { id: 'wf', name: 'WF', description: 'd', scope: 'user' as const },
+    });
+
+    await skillsApi.updateWorkflow({
+      name: 'WF',
+      description: 'd',
+      whenToUse: 'when X happens',
+      scope: 'user',
+      license: 'MIT',
+      author: 'me',
+      tags: ['t'],
+      allowedTools: ['mcp/fs'],
+      inputs: [{ name: 'n', required: true }],
+    });
+
+    expect(callCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.skills_update',
+      params: {
+        name: 'WF',
+        description: 'd',
+        when_to_use: 'when X happens',
+        scope: 'user',
+        license: 'MIT',
+        author: 'me',
+        tags: ['t'],
+        'allowed-tools': ['mcp/fs'],
+        inputs: [{ name: 'n', required: true }],
+      },
+    });
+  });
+});
+
+describe('skillsApi.listWorkflows', () => {
+  beforeEach(async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockReset();
+  });
+
+  it('reads the `workflows` result field', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({
+      workflows: [
+        { id: 'a', name: 'A', description: '', scope: 'user' as const },
+        { id: 'b', name: 'B', description: '', scope: 'project' as const },
+      ],
+    });
+
+    const result = await skillsApi.listWorkflows();
+
+    expect(callCoreRpc).toHaveBeenCalledWith({ method: 'openhuman.skills_list' });
+    expect(result.map(w => w.id)).toEqual(['a', 'b']);
+  });
+
+  it('unwraps an envelope and defaults to [] when the field is absent', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({ data: {} });
+    const result = await skillsApi.listWorkflows();
+    expect(result).toEqual([]);
+  });
+
+  it('normalizes snake_case and legacy discovered workflow fields', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({
+      workflows: [
+        {
+          id: 'hermes-demo',
+          name: 'Hermes Demo',
+          description: 'Reads Hermes metadata.',
+          version: '',
+          author: null,
+          tags: [],
+          related_skills: ['browser-automation'],
+          source_format: 'hermes',
+          tools: [],
+          prompts: [],
+          location: null,
+          resources: [],
+          scope: 'user',
+          legacy: false,
+          warnings: [],
+        },
+        {
+          id: 'legacy-demo',
+          name: 'Legacy Demo',
+          description: 'Old package.',
+          version: '',
+          author: null,
+          tags: [],
+          tools: [],
+          prompts: [],
+          location: null,
+          resources: [],
+          scope: 'user',
+          legacy: true,
+          warnings: [],
+        },
+      ],
+    });
+
+    const result = await skillsApi.listWorkflows();
+
+    expect(callCoreRpc).toHaveBeenCalledWith({ method: 'openhuman.skills_list' });
+    expect(result[0].relatedSkills).toEqual(['browser-automation']);
+    expect(result[0].sourceFormat).toBe('hermes');
+    expect(result[0].platforms).toEqual([]);
+    expect(result[1].sourceFormat).toBe('legacy');
+  });
+
+  it('omits params by default (automations-only view)', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({ workflows: [] });
+    await skillsApi.listWorkflows();
+    const call = vi.mocked(callCoreRpc).mock.calls[0][0];
+    expect(call.method).toBe('openhuman.skills_list');
+    expect(call.params).toBeUndefined();
+  });
+
+  it('passes include_skills when includeSkills is set', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({ workflows: [] });
+    await skillsApi.listWorkflows({ includeSkills: true });
+    expect(callCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.skills_list',
+      params: { include_skills: true },
+    });
+  });
+});
+
+describe('skillsApi.readWorkflowResource', () => {
+  beforeEach(async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockReset();
+  });
+
+  it('rekeys params to snake_case and normalizes the response', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({
+      workflow_id: 'wf',
+      relative_path: 'scripts/run.sh',
+      content: '#!/bin/sh\n',
+      bytes: 10,
+    });
+
+    const result = await skillsApi.readWorkflowResource({
+      workflowId: 'wf',
+      relativePath: 'scripts/run.sh',
+    });
+
+    expect(callCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.skills_read_resource',
+      params: { workflow_id: 'wf', relative_path: 'scripts/run.sh' },
+    });
+    expect(result).toEqual({
+      workflowId: 'wf',
+      relativePath: 'scripts/run.sh',
+      content: '#!/bin/sh\n',
+      bytes: 10,
+    });
+  });
+});
+
+describe('skillsApi.uninstallWorkflow', () => {
+  beforeEach(async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockReset();
+  });
+
+  it('forwards the name and normalizes removed_path → removedPath', async () => {
+    const { callCoreRpc } = await import('../../coreRpcClient');
+    vi.mocked(callCoreRpc).mockResolvedValueOnce({
+      name: 'weather-helper',
+      removed_path: '/home/u/.openhuman/skills/weather-helper',
+      scope: 'user',
+    });
+
+    const result = await skillsApi.uninstallWorkflow('weather-helper');
+
+    expect(callCoreRpc).toHaveBeenCalledWith({
+      method: 'openhuman.skill_registry_uninstall',
+      params: { name: 'weather-helper' },
+    });
+    expect(result).toEqual({
+      name: 'weather-helper',
+      removedPath: '/home/u/.openhuman/skills/weather-helper',
+      scope: 'user',
+    });
   });
 });

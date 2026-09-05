@@ -9,7 +9,6 @@ fn make_def(id: &str) -> AgentDefinition {
         omit_identity: true,
         omit_memory_context: true,
         omit_safety_preamble: true,
-        omit_skills_catalog: true,
         omit_profile: true,
         omit_memory_md: true,
         model: ModelSpec::Inherit,
@@ -19,13 +18,20 @@ fn make_def(id: &str) -> AgentDefinition {
         skill_filter: None,
         extra_tools: vec![],
         max_iterations: 8,
+        iteration_policy: Default::default(),
         max_result_chars: None,
+        max_turn_output_tokens: None,
         timeout_secs: None,
         sandbox_mode: SandboxMode::None,
         background: false,
+        trigger_memory_agent: Default::default(),
+        tokenjuice_compression:
+            crate::openhuman::inference::tokenjuice::AgentTokenjuiceCompression::Auto,
         subagents: vec![],
         delegate_name: None,
+        agent_tier: crate::openhuman::agent::harness::definition::AgentTier::Worker,
         source: DefinitionSource::Builtin,
+        graph: Default::default(),
     }
 }
 
@@ -70,6 +76,14 @@ fn model_spec_resolve_exact_uses_name() {
 fn model_spec_resolve_hint_appends_v1() {
     let spec = ModelSpec::Hint("coding".into());
     assert_eq!(spec.resolve("parent-model"), "coding-v1");
+}
+
+#[test]
+fn model_spec_resolve_vision_hint_yields_vision_v1() {
+    // The vision sub-agent's `hint = "vision"` must resolve to the `vision-v1`
+    // tier alias — which `oh_tier_supports_vision` reports as image-capable.
+    let spec = ModelSpec::Hint("vision".into());
+    assert_eq!(spec.resolve("parent-model"), "vision-v1");
 }
 
 #[test]
@@ -127,19 +141,48 @@ named = ["query_memory"]
     );
 }
 
+#[test]
+fn subagents_section_parses_allowlist_entries() {
+    let toml_src = r#"
+id = "orchestrator"
+when_to_use = "Routes work to the right specialist"
+temperature = 0.4
+max_iterations = 15
+
+[subagents]
+allowlist = [
+    "researcher",
+    "code_executor",
+    { skills = "*" },
+]
+
+[tools]
+named = ["query_memory"]
+"#;
+    let def: AgentDefinition = toml::from_str(toml_src).expect("toml parse");
+    assert_eq!(
+        def.subagents,
+        vec![
+            SubagentEntry::AgentId("researcher".into()),
+            SubagentEntry::AgentId("code_executor".into()),
+            SubagentEntry::Skills(SkillsWildcard { skills: "*".into() }),
+        ]
+    );
+}
+
 /// `subagents` is optional — omitting it should yield an empty Vec
 /// rather than a deserialization error. Most non-delegating agents
-/// (welcome, archivist, code_executor, etc.) will not list any.
+/// (archivist, code_executor, etc.) will not list any.
 #[test]
 fn subagents_defaults_to_empty_when_omitted() {
     let toml_src = r#"
-id = "welcome"
-when_to_use = "First agent a new user speaks to"
+id = "code_executor"
+when_to_use = "Runs code and shell commands"
 temperature = 0.7
 max_iterations = 6
 
 [tools]
-named = ["complete_onboarding", "memory_recall"]
+named = ["shell", "file_read"]
 "#;
     let def: AgentDefinition = toml::from_str(toml_src).expect("toml parse");
     assert!(def.subagents.is_empty());
@@ -176,4 +219,261 @@ fn skills_wildcard_only_star_matches_all() {
         skills: "gmail".into(),
     };
     assert!(!specific.matches_all());
+}
+
+// ── iteration policy ─────────────────────────────────────────────
+
+#[test]
+fn strict_policy_returns_max_iterations_unchanged() {
+    let mut def = make_def("summarizer");
+    def.max_iterations = 2;
+    def.iteration_policy = IterationPolicy::Strict;
+    assert_eq!(def.effective_max_iterations(), 2);
+}
+
+#[test]
+fn extended_policy_raises_cap_to_at_least_extended_constant() {
+    let mut def = make_def("code_executor");
+    def.max_iterations = 10;
+    def.iteration_policy = IterationPolicy::Extended;
+    assert_eq!(
+        def.effective_max_iterations(),
+        super::EXTENDED_MAX_TOOL_ITERATIONS
+    );
+    assert!(def.effective_max_iterations() > def.max_iterations);
+}
+
+#[test]
+fn extended_policy_preserves_custom_cap_when_higher_than_constant() {
+    let mut def = make_def("custom_agent");
+    def.max_iterations = 100;
+    def.iteration_policy = IterationPolicy::Extended;
+    assert_eq!(def.effective_max_iterations(), 100);
+}
+
+#[test]
+fn iteration_policy_defaults_to_strict() {
+    let def = make_def("test");
+    assert_eq!(def.iteration_policy, IterationPolicy::Strict);
+}
+
+#[test]
+fn iteration_policy_parses_from_toml() {
+    let toml_src = r#"
+id = "code_executor"
+when_to_use = "Runs code"
+max_iterations = 10
+iteration_policy = "extended"
+"#;
+    let def: AgentDefinition = toml::from_str(toml_src).expect("toml parse");
+    assert_eq!(def.iteration_policy, IterationPolicy::Extended);
+    assert_eq!(
+        def.effective_max_iterations(),
+        super::EXTENDED_MAX_TOOL_ITERATIONS
+    );
+}
+
+#[test]
+fn iteration_policy_omitted_defaults_strict() {
+    let toml_src = r#"
+id = "summarizer"
+when_to_use = "Summarizes"
+max_iterations = 1
+"#;
+    let def: AgentDefinition = toml::from_str(toml_src).expect("toml parse");
+    assert_eq!(def.iteration_policy, IterationPolicy::Strict);
+    assert_eq!(def.effective_max_iterations(), 1);
+}
+
+// ── Spawn-hierarchy tier rule (validate_tier_transition) ────────────────────
+// Single source of truth shared by the boot loader walk and the runtime
+// spawn gate in `run_subagent` (issue #4098).
+
+#[test]
+fn tier_transition_allows_legal_descending_handoffs() {
+    // chat → reasoning, chat → worker, reasoning → worker are the only
+    // legal hops; each strictly descends the hierarchy.
+    assert!(validate_tier_transition(AgentTier::Chat, AgentTier::Reasoning).is_ok());
+    assert!(validate_tier_transition(AgentTier::Chat, AgentTier::Worker).is_ok());
+    assert!(validate_tier_transition(AgentTier::Reasoning, AgentTier::Worker).is_ok());
+}
+
+#[test]
+fn tier_transition_rejects_chat_to_chat() {
+    let err = validate_tier_transition(AgentTier::Chat, AgentTier::Chat)
+        .expect_err("chat→chat must be rejected");
+    // Wording must carry the substrings the loader diagnostics rely on.
+    assert!(err.contains("chat") && err.contains("leaf"), "got: {err}");
+}
+
+#[test]
+fn tier_transition_rejects_reasoning_to_reasoning() {
+    let err = validate_tier_transition(AgentTier::Reasoning, AgentTier::Reasoning)
+        .expect_err("reasoning→reasoning must be rejected");
+    assert!(err.contains("reasoning"), "got: {err}");
+}
+
+#[test]
+fn tier_transition_allows_upward_reasoning_to_chat() {
+    // Upward delegation is intentionally legal: the `subconscious` reasoner
+    // hands follow-ups back to the `orchestrator` chat agent. Only same-tier
+    // and worker-as-parent hops are forbidden.
+    assert!(validate_tier_transition(AgentTier::Reasoning, AgentTier::Chat).is_ok());
+}
+
+#[test]
+fn tier_transition_rejects_worker_as_parent() {
+    // A worker is a leaf executor — it may not spawn any tier, including
+    // another worker.
+    for child in [AgentTier::Chat, AgentTier::Reasoning, AgentTier::Worker] {
+        let err = validate_tier_transition(AgentTier::Worker, child)
+            .expect_err("worker must not spawn any tier");
+        assert!(
+            err.contains("worker") && err.contains("leaf"),
+            "worker→{} reason should call out the worker-leaf rule, got: {err}",
+            child.as_str()
+        );
+    }
+}
+
+#[test]
+fn tier_display_matches_as_str() {
+    assert_eq!(AgentTier::Chat.to_string(), "chat");
+    assert_eq!(AgentTier::Reasoning.to_string(), "reasoning");
+    assert_eq!(AgentTier::Worker.to_string(), "worker");
+}
+
+// ── Issue #4868 audit snapshot ──────────────────────────────────────────────
+//
+// The systemic fix in `build_session_agent_inner` makes every direct-
+// invocation call site (flows_build, flows_discover, agent-node runtime,
+// cron, MCP server, …) honor each agent's own `effective_max_iterations()`
+// instead of the global `config.agent.max_tool_iterations` default (10).
+// That changes the *runtime* iteration cap for every agent in the registry —
+// some go up (extended policy), some go down (declared max_iterations < 10),
+// most stay the same. This test pins the exact expected cap for every
+// built-in agent so an accidental `agent.toml` edit (or a new agent landing
+// with an unreviewed cap) shows up as a diff here rather than silently
+// changing runtime behavior. See PLAN/PR #4868 for the full before/after
+// audit table this list mirrors.
+#[test]
+fn all_builtin_agent_definitions_have_expected_effective_max_iterations() {
+    let defs = crate::openhuman::agent::registry::agents::load_builtins()
+        .expect("built-in agent TOML must always parse");
+
+    let expected: &[(&str, usize)] = &[
+        // Extended policy (or high `max_iterations`) -> effective cap raised.
+        ("orchestrator", 15),
+        ("code_executor", 50),
+        ("context_scout", 50),
+        // #5204: general-purpose read-only flow context/memory retrieval
+        // agent — `iteration_policy = "extended"` so it can loop across
+        // several retrievals in one turn. `#[cfg(feature = "flows")]`-gated
+        // (like the other flow agents), so this audit entry is too.
+        #[cfg(feature = "flows")]
+        ("flow_memory_agent", 50),
+        ("integrations_agent", 50),
+        // `mcp_agent` is compiled out with the `mcp` feature (#4799).
+        // `mcp_setup` is NOT — only its five tools are gated, so the agent
+        // definition still loads in both builds.
+        #[cfg(feature = "mcp")]
+        ("mcp_agent", 50),
+        ("mcp_setup", 50),
+        ("planner", 50),
+        ("researcher", 50),
+        ("skill_creator", 50),
+        ("task_manager_agent", 50),
+        ("tools_agent", 50),
+        // Gated with `flows` (#4797) — absent from a slim build.
+        #[cfg(feature = "flows")]
+        ("flow_discovery", 50),
+        #[cfg(feature = "flows")]
+        ("workflow_builder", 50),
+        // Compiled out with the `skills` gate — see `openhuman::skills::stub`.
+        #[cfg(feature = "skills")]
+        ("skill_executor", 50),
+        // Strict policy, declared `max_iterations` below the old global
+        // default (10) -> effective cap lowered.
+        ("agent_memory", 6),
+        ("archivist", 3),
+        ("critic", 5),
+        ("crypto_agent", 8),
+        ("goals_agent", 5),
+        ("help", 6),
+        ("image_agent", 8),
+        ("morning_briefing", 8),
+        ("profile_memory_agent", 8),
+        ("scheduler_agent", 8),
+        ("settings_agent", 8),
+        ("summarizer", 1),
+        ("tool_maker", 2),
+        ("trigger_reactor", 6),
+        ("trigger_triage", 2),
+        ("video_agent", 8),
+        ("vision_agent", 6),
+        // Compiled out with the `documents` gate — see `openhuman::agent::registry::agents::loader::builtin_enabled`.
+        #[cfg(feature = "documents")]
+        ("presentation_agent", 10),
+        // Compiled out with the `skills` gate — see `openhuman::skills::stub`.
+        #[cfg(feature = "skills")]
+        ("skill_setup", 10),
+    ];
+
+    for (id, expected_cap) in expected {
+        let def = defs
+            .iter()
+            .find(|d| d.id == *id)
+            .unwrap_or_else(|| panic!("missing built-in agent definition: {id}"));
+        assert_eq!(
+            def.effective_max_iterations(),
+            *expected_cap,
+            "agent '{id}' effective_max_iterations() mismatch — expected {expected_cap}, got {} \
+             (max_iterations={}, iteration_policy={:?}). If this agent's cap was intentionally \
+             changed, update this snapshot; otherwise an agent.toml edit just silently changed \
+             its runtime iteration budget.",
+            def.effective_max_iterations(),
+            def.max_iterations,
+            def.iteration_policy,
+        );
+    }
+
+    // Exhaustiveness: every built-in id must appear in the expected list
+    // above (and vice versa) so a newly-added agent can't slip in with an
+    // unreviewed cap.
+    let mut expected_ids: Vec<&str> = expected.iter().map(|(id, _)| *id).collect();
+    expected_ids.sort_unstable();
+    let mut actual_ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+    actual_ids.sort_unstable();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "the set of built-in agent ids changed — add/remove the new agent from this audit \
+         snapshot's `expected` list with a deliberate effective_max_iterations() entry"
+    );
+}
+
+/// A definition written before `omit_skills_catalog` was removed (#5699) must
+/// still load. `AgentDefinition` does not set `#[serde(deny_unknown_fields)]`,
+/// so the retired key is ignored rather than rejected — that is what makes the
+/// removal a non-breaking change for custom TOML definitions already on disk.
+/// This pins it, so a future `deny_unknown_fields` cannot silently break them.
+#[test]
+fn a_definition_carrying_the_retired_skills_catalog_key_still_loads() {
+    let toml_src = r#"
+id = "legacy_agent"
+display_name = "Legacy"
+when_to_use = "A definition written before the flag was retired."
+omit_identity = true
+omit_skills_catalog = true
+omit_safety_preamble = true
+
+[tools]
+named = []
+"#;
+    let def: AgentDefinition =
+        toml::from_str(toml_src).expect("a definition carrying the retired key must still parse");
+    assert_eq!(def.id, "legacy_agent");
+    // The neighbouring flags still land, so the retired key is being skipped
+    // rather than derailing the rest of the parse.
+    assert!(def.omit_identity);
+    assert!(def.omit_safety_preamble);
 }

@@ -1,332 +1,93 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 
-import AddAccountModal from '../components/accounts/AddAccountModal';
-import { AgentIcon, ProviderIcon } from '../components/accounts/providerIcons';
-// import RespondQueuePanel from '../components/accounts/RespondQueuePanel';
-import WebviewHost from '../components/accounts/WebviewHost';
-// [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-// import { isWelcomeLocked } from '../lib/coreState/store';
-// [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-// import { useCoreState } from '../providers/CoreStateProvider';
-import { usePrewarmMostRecentAccount } from '../hooks/usePrewarmMostRecentAccount';
+import { ConversationsPage } from '../features/conversations/Conversations';
 import {
-  hideWebviewAccount,
-  purgeWebviewAccount,
-  showWebviewAccount,
-  startWebviewAccountService,
-} from '../services/webviewAccountService';
-import {
-  addAccount,
-  removeAccount,
-  setActiveAccount,
-  setLastActiveAccount,
-} from '../store/accountsSlice';
-import { useAppDispatch, useAppSelector } from '../store/hooks';
-import { fetchRespondQueue } from '../store/providerSurfaceSlice';
-import type { Account, AccountProvider, ProviderDescriptor } from '../types/accounts';
-import { AGENT_ACCOUNT_ID as AGENT_ID } from '../utils/accountsFullscreen';
-import { AgentChatPanel } from './Conversations';
+  ChatMascotOverlay,
+  ChatMascotProvider,
+  ChatMascotStage,
+  MASCOT_TRANSITION_MS,
+  prefersReducedMotion,
+} from '../features/human/chatMascot';
+import { useAppSelector } from '../store/hooks';
+import { selectChatMascotDismissed, selectChatMascotExpanded } from '../store/mascotSlice';
 
-function makeAccountId(): string {
-  const c = globalThis.crypto;
-  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  if (c && typeof c.getRandomValues === 'function') {
-    const bytes = new Uint8Array(4);
-    c.getRandomValues(bytes);
-    const suffix = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-    return `acct-${Date.now().toString(36)}-${suffix}`;
-  }
-  return `acct-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
+/**
+ * Width of the mascot's voice stage. Used twice on purpose: the outer column
+ * animates between `0` and this width (which is what makes the transcript
+ * reflow), while the inner panel keeps it fixed and right-anchored so the stage
+ * slides in from the edge instead of being squashed open.
+ */
+const STAGE_WIDTH = 'min(38vw, 520px)';
 
-interface RailButtonProps {
-  active: boolean;
-  onClick: () => void;
-  onContextMenu?: (e: React.MouseEvent) => void;
-  tooltip: string;
-  badge?: number;
-  children: React.ReactNode;
-}
+/** Shared with the mascot's own travel so the column and the mascot land together. */
+const STAGE_TRANSITION = `width ${MASCOT_TRANSITION_MS}ms cubic-bezier(0.2, 0.7, 0.2, 1)`;
 
-const RailButton = ({
-  active,
-  onClick,
-  onContextMenu,
-  tooltip,
-  badge,
-  children,
-}: RailButtonProps) => (
-  <button
-    onClick={onClick}
-    onContextMenu={onContextMenu}
-    // Issue #1284 — `hover:z-50` lifts the entire button (and its tooltip
-    // child) above sibling rail buttons during hover. Without it, the
-    // `hover:scale-105` transform on a non-active button establishes its
-    // own stacking context that traps the tooltip's `z-50` inside it,
-    // and a later sibling button (next in DOM order) paints over the
-    // tooltip rectangle. Belt-and-suspenders for the active-button case
-    // too, where ring-2 + bg-primary-50 don't transform but the lifted
-    // z still helps tooltips render cleanly above neighbours.
-    className={`group relative flex h-11 w-11 items-center justify-center rounded-xl transition-all hover:z-50 ${
-      active ? 'bg-primary-50 ring-2 ring-primary-500' : 'hover:bg-stone-100 hover:scale-105'
-    }`}
-    aria-label={tooltip}>
-    {children}
-    {badge && badge > 0 ? (
-      <span className="absolute -right-0.5 -top-0.5 flex min-w-[16px] items-center justify-center rounded-full bg-coral-500 px-1 text-[9px] font-semibold text-white">
-        {badge > 99 ? '99+' : badge}
-      </span>
-    ) : null}
-    {/* Issue #1284 — tooltip sits BELOW the icon (`top-full`) so it stays
-        inside the HTML-only rail region. The native CEF webview is
-        composited above the HTML layer to the right of the rail, so a
-        right-anchored tooltip is hidden behind the webview the moment a
-        provider is open and DOM z-index can't lift it. Below-icon keeps
-        the tooltip near the cursor and never blocks the icon being
-        hovered (it briefly overlays the next icon down, which clears as
-        soon as the user moves the cursor). */}
-    <span className="pointer-events-none absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap rounded-md bg-stone-900 px-2 py-1 text-xs text-white opacity-0 shadow-md transition-opacity group-hover:opacity-100 z-50">
-      {tooltip}
-    </span>
-  </button>
-);
-
-interface ContextMenuState {
-  accountId: string;
-  x: number;
-  y: number;
-}
-
+/**
+ * The unified chat surface (`/chat`).
+ *
+ * Merges what used to be two tabs. The mascot lives here full-time: docked as a
+ * small figure standing on the composer, or — one click later — scaled up into
+ * the right-hand voice stage that replaced the standalone Human page. The
+ * transcript and the text composer stay live in both states, so voice and text
+ * are the same conversation rather than two places to have it.
+ *
+ * [ui-flow] chat: docked mascot ⇄ voice stage (right column, animated width)
+ */
 const Accounts = () => {
-  const dispatch = useAppDispatch();
-  const accountsById = useAppSelector(state => state.accounts.accounts);
-  const order = useAppSelector(state => state.accounts.order);
-  const activeAccountId = useAppSelector(state => state.accounts.activeAccountId);
-  const unreadByAccount = useAppSelector(state => state.accounts.unread);
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // const { snapshot } = useCoreState();
-  // const welcomeLocked = isWelcomeLocked(snapshot);
-  // Respond-queue selectors disabled while RespondQueuePanel is hidden.
-  // const respondQueue = useAppSelector(state => state.providerSurfaces.queue);
-  // const respondQueueCount = useAppSelector(state => state.providerSurfaces.count);
-  // const respondQueueStatus = useAppSelector(state => state.providerSurfaces.status);
-  // const respondQueueError = useAppSelector(state => state.providerSurfaces.error);
+  const mascotDismissed = useAppSelector(selectChatMascotDismissed);
+  // Dismissing hides the dock, which would leave the overlay parked off-screen
+  // at opacity 0 — an invisible Rive canvas still re-rendering on every lipsync
+  // frame, and a poll hunting for an anchor that will never mount. Unmount it.
+  const mascotExpanded = useAppSelector(selectChatMascotExpanded) && !mascotDismissed;
+  // Read per render rather than once: the OS setting can change while the app
+  // is open, and every toggle re-renders this component anyway.
+  const reduceMotion = prefersReducedMotion();
 
-  const [addOpen, setAddOpen] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
-
-  useEffect(() => {
-    startWebviewAccountService();
-  }, []);
-
-  // Issue #1233 — prewarm the MRU account once on mount so its CEF profile
-  // and provider page are warm before the user actually clicks the rail.
-  // Skipped for power users with many accounts to bound the spawn cost.
-  // The accounts array snapshot is captured by the hook at first render.
-  const accounts: Account[] = useMemo(
-    () => order.map(id => accountsById[id]).filter((a): a is Account => Boolean(a)),
-    [order, accountsById]
-  );
-  usePrewarmMostRecentAccount({ accounts, accountsById, activeAccountId });
-
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // Welcome lockdown (#883) — force the Agent pane while the welcome
-  // conversation is in progress so the user cannot jump to a connected
-  // account webview. The rail is hidden below, so this is belt-and-
-  // suspenders in case an external caller toggles `activeAccountId`.
-  // useEffect(() => {
-  //   if (welcomeLocked && activeAccountId !== AGENT_ID) {
-  //     dispatch(setActiveAccount(AGENT_ID));
-  //   }
-  // }, [welcomeLocked, activeAccountId, dispatch]);
-
-  useEffect(() => {
-    void dispatch(fetchRespondQueue());
-    const id = window.setInterval(() => {
-      void dispatch(fetchRespondQueue({ silent: true }));
-    }, 10_000);
-    return () => window.clearInterval(id);
-  }, [dispatch]);
-
-  const connectedProviders = useMemo(
-    () => new Set<AccountProvider>(accounts.map(a => a.provider)),
-    [accounts]
-  );
-
-  // [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
-  // While welcome-locked, derive the effective selection directly from
-  // `welcomeLocked` so the first paint after a lock flip never renders the
-  // stale `activeAccountId`. The post-paint `useEffect` above still
-  // syncs Redux so other consumers observe the forced selection.
-  // const selectedId = welcomeLocked ? AGENT_ID : (activeAccountId ?? AGENT_ID);
-  const selectedId = activeAccountId ?? AGENT_ID;
-  const active = selectedId === AGENT_ID ? null : (accountsById[selectedId] ?? null);
-  const isAgentSelected = selectedId === AGENT_ID;
-
-  // The child Tauri webview is a native view composited above the HTML
-  // canvas, so DOM z-index can't put React overlays on top of it. Hide
-  // the active webview while any overlay (add-account modal or the
-  // right-click context menu) is open and restore it on close. No-op
-  // when the agent pane is selected (pure HTML).
-  const activeId = active?.id ?? null;
-  const overlayOpen = addOpen || ctxMenu !== null;
-  useEffect(() => {
-    if (!activeId) return;
-    if (overlayOpen) {
-      void hideWebviewAccount(activeId);
-    } else {
-      void showWebviewAccount(activeId);
-    }
-  }, [overlayOpen, activeId]);
-
-  const handlePickProvider = (p: ProviderDescriptor) => {
-    setAddOpen(false);
-    const id = makeAccountId();
-    const acct: Account = {
-      id,
-      provider: p.id,
-      label: p.label,
-      createdAt: new Date().toISOString(),
-      status: 'pending',
-    };
-    dispatch(addAccount(acct));
-    dispatch(setActiveAccount(id));
-    // Issue #1233 — record this real-account selection in the persisted
-    // MRU pointer so the next session can prewarm it. Agent selections
-    // never reach this code path (separate `selectAgent` callback below).
-    dispatch(setLastActiveAccount(id));
-  };
-
-  const selectAgent = () => dispatch(setActiveAccount(AGENT_ID));
-  const selectAccount = (id: string) => {
-    dispatch(setActiveAccount(id));
-    dispatch(setLastActiveAccount(id));
-  };
-
-  const openContextMenu = (accountId: string, e: React.MouseEvent) => {
-    e.preventDefault();
-    setCtxMenu({ accountId, x: e.clientX, y: e.clientY });
-  };
-
-  const handleLogout = async (accountId: string) => {
-    setCtxMenu(null);
-    try {
-      await purgeWebviewAccount(accountId);
-    } catch {
-      // Purge failures are already logged by the service; still drop the
-      // account from the UI so the user isn't stuck with a zombie icon.
-    }
-    dispatch(removeAccount({ accountId }));
-  };
-
-  // Close the context menu on Escape or any outside click.
-  useEffect(() => {
-    if (!ctxMenu) return;
-    const close = () => setCtxMenu(null);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
-    };
-    window.addEventListener('mousedown', close);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', close);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [ctxMenu]);
+  // Stable element so toggling the stage — and the mascot's ~60fps lipsync
+  // re-render if it ever reaches this subtree — never reconciles the (heavy)
+  // chat tree. Same guard the Human page needed in #5357; its props are constant.
+  const chatPanel = useMemo(() => <ConversationsPage />, []);
 
   return (
-    <div className="relative flex h-full gap-3 overflow-hidden">
-      {/* Narrow icon rail — always rendered. */}
-      {/* [#1123] welcomeLocked guard removed — welcome-agent onboarding replaced by Joyride walkthrough */}
-      <aside className="z-30 flex w-16 flex-none flex-col items-center gap-2 bg-white/60 py-3 backdrop-blur-md my-3 ml-3 rounded-2xl border border-stone-200/70 shadow-soft">
-        <RailButton active={isAgentSelected} onClick={selectAgent} tooltip="Agent">
-          <AgentIcon className="h-9 w-9 rounded-lg" />
-        </RailButton>
-
-        {accounts.map(acct => (
-          <RailButton
-            key={acct.id}
-            active={acct.id === selectedId}
-            onClick={() => selectAccount(acct.id)}
-            onContextMenu={e => openContextMenu(acct.id, e)}
-            tooltip={acct.label}
-            badge={unreadByAccount[acct.id]}>
-            <ProviderIcon provider={acct.provider} className="h-8 w-8 rounded-md" />
-          </RailButton>
-        ))}
-
-        <button
-          onClick={() => setAddOpen(true)}
-          className="group relative mt-2 flex h-11 w-11 items-center justify-center rounded-xl border border-dashed border-stone-300 text-stone-400 hover:z-50 hover:bg-stone-50 hover:text-stone-600"
-          aria-label="Add app">
-          <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-          </svg>
-          {/* Issue #1284 — see RailButton for why the tooltip sits below
-              the icon instead of to the right. */}
-          <span className="pointer-events-none absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap rounded-md bg-stone-900 px-2 py-1 text-xs text-white opacity-0 shadow-md transition-opacity group-hover:opacity-100 z-50">
-            Add app
-          </span>
-        </button>
-      </aside>
-
-      {/* Main pane */}
-      <main className="flex min-w-0 flex-1 flex-col">
-        {isAgentSelected ? (
-          <div className="flex h-full min-w-0">
-            <div className="min-w-0 flex-1">
-              <AgentChatPanel />
-            </div>
-            {/* Respond queue side panel hidden for now — bring back when
-                the cross-provider surface is ready to ship. */}
-            {/* <RespondQueuePanel
-              items={respondQueue}
-              count={respondQueueCount}
-              status={respondQueueStatus}
-              error={respondQueueError}
-              onRefresh={() => {
-                void dispatch(fetchRespondQueue());
-              }}
-            /> */}
+    <div
+      // `h-full` makes this page fill the shell's content box edge-to-edge.
+      className="relative flex h-full overflow-hidden"
+      data-testid="accounts-page"
+      data-analytics-id="chat-right-sidebar">
+      <ChatMascotProvider>
+        <main className="relative flex min-w-0 flex-1 flex-row overflow-hidden">
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {chatPanel}
           </div>
-        ) : active ? (
-          <div className="flex-1 py-3 pr-3">
-            <WebviewHost accountId={active.id} provider={active.provider} />
-          </div>
-        ) : (
-          <div className="flex flex-1 items-center justify-center text-sm text-stone-400">
-            Select or add an app to get started.
-          </div>
-        )}
-      </main>
 
-      <AddAccountModal
-        open={addOpen}
-        onClose={() => setAddOpen(false)}
-        onPick={handlePickProvider}
-        connectedProviders={connectedProviders}
-      />
-
-      {ctxMenu && (
-        <div
-          className="fixed z-50 min-w-[140px] rounded-lg border border-stone-200 bg-white py-1 shadow-strong"
-          style={{ left: ctxMenu.x, top: ctxMenu.y }}
-          onMouseDown={e => e.stopPropagation()}>
-          <button
-            onClick={() => void handleLogout(ctxMenu.accountId)}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-coral-600 hover:bg-stone-100">
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
-              />
-            </svg>
-            Logout
-          </button>
-        </div>
-      )}
+          <div
+            className="relative flex-none overflow-hidden"
+            // The transition is inline rather than a class because it shares
+            // MASCOT_TRANSITION_MS with the mascot's own travel. That means a
+            // `motion-reduce:` class cannot switch it off — an inline
+            // declaration wins — so the preference is applied here instead,
+            // matching `prefersReducedMotion()` in ChatMascotOverlay. Without
+            // this the mascot snaps while the column slides.
+            style={{
+              width: mascotExpanded ? STAGE_WIDTH : '0px',
+              transition: reduceMotion ? undefined : STAGE_TRANSITION,
+            }}
+            data-testid="chat-mascot-stage-column"
+            data-expanded={mascotExpanded ? 'true' : 'false'}>
+            {/* Unmounted while docked rather than merely clipped: a
+                  zero-width column would otherwise leave the mic button and the
+                  speak-replies switch off-screen but still in the tab order,
+                  and would keep MicComposer enumerating audio devices for a
+                  surface nobody can see. */}
+            {mascotExpanded && (
+              <div className="absolute inset-y-0 right-0 py-3 pl-3" style={{ width: STAGE_WIDTH }}>
+                <ChatMascotStage />
+              </div>
+            )}
+          </div>
+        </main>
+        {!mascotDismissed && <ChatMascotOverlay />}
+      </ChatMascotProvider>
     </div>
   );
 };

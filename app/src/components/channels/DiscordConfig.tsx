@@ -1,10 +1,13 @@
 import debug from 'debug';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { AUTH_MODE_LABELS } from '../../lib/channels/definitions';
+import { useOAuthConnectionListener } from '../../hooks/useOAuthConnectionListener';
+import { useT } from '../../lib/i18n/I18nContext';
+import { useCoreState } from '../../providers/CoreStateProvider';
 import { channelConnectionsApi } from '../../services/api/channelConnectionsApi';
 import { callCoreRpc } from '../../services/coreRpcClient';
 import {
+  clearOtherPendingForChannel,
   disconnectChannelConnection,
   setChannelConnectionStatus,
   upsertChannelConnection,
@@ -16,10 +19,18 @@ import type {
   ChannelConnectionStatus,
   ChannelDefinition,
 } from '../../types/channels';
+import { isLocalSessionToken } from '../../utils/localSession';
 import { openUrl } from '../../utils/openUrl';
 import { restartCoreProcess } from '../../utils/tauriCommands/core';
-import ChannelFieldInput from './ChannelFieldInput';
-import ChannelStatusBadge from './ChannelStatusBadge';
+import Button from '../ui/Button';
+import Checkbox from '../ui/Checkbox';
+import {
+  ChannelAuthFields,
+  ChannelAuthModeCard,
+  ChannelConfigError,
+  ChannelConnectActions,
+  useChannelAuthFormState,
+} from './channelConfigPrimitives';
 import DiscordServerChannelPicker from './DiscordServerChannelPicker';
 
 const log = debug('channels:discord');
@@ -31,35 +42,24 @@ interface DiscordConfigProps {
 }
 
 const DiscordConfig = ({ definition }: DiscordConfigProps) => {
+  const { t } = useT();
   const dispatch = useAppDispatch();
   const channelConnections = useAppSelector(state => state.channelConnections);
+  const { snapshot } = useCoreState();
+  const isLocalSession = isLocalSessionToken(snapshot.sessionToken);
+  const visibleAuthModes = definition.auth_modes.filter(
+    spec => !isLocalSession || (spec.mode !== 'managed_dm' && spec.mode !== 'oauth')
+  );
 
-  const [busyKeys, setBusyKeys] = useState<Record<string, boolean>>({});
-  const [fieldValues, setFieldValues] = useState<Record<string, Record<string, string>>>({});
-  const [error, setError] = useState<string | null>(null);
+  const [clearMemoryOnDisconnect, setClearMemoryOnDisconnect] = useState<Record<string, boolean>>(
+    {}
+  );
+  const { busyKeys, fieldValues, error, setError, runBusy, updateField } =
+    useChannelAuthFormState();
   /** Pending link tokens, keyed by compositeKey (discord:managed_dm). Only present while polling. */
   const [linkToken, setLinkToken] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const pollAbort = useRef<AbortController | null>(null);
-
-  const runBusy = useCallback(async (key: string, task: () => Promise<void>) => {
-    setBusyKeys(prev => ({ ...prev, [key]: true }));
-    setError(null);
-    try {
-      await task();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusyKeys(prev => ({ ...prev, [key]: false }));
-    }
-  }, []);
-
-  const updateField = useCallback((compositeKey: string, fieldKey: string, value: string) => {
-    setFieldValues(prev => ({
-      ...prev,
-      [compositeKey]: { ...(prev[compositeKey] ?? {}), [fieldKey]: value },
-    }));
-  }, []);
 
   // Stop polling on unmount
   useEffect(() => {
@@ -68,27 +68,11 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
     };
   }, []);
 
-  useEffect(() => {
-    const handleOauthSuccess = (event: Event) => {
-      const customEvent = event as CustomEvent<{ toolkit?: string }>;
-      const toolkit = customEvent.detail?.toolkit?.toLowerCase();
-      if (toolkit !== 'discord') return;
-
-      log('discord oauth success deep link received');
-      dispatch(
-        upsertChannelConnection({
-          channel: 'discord',
-          authMode: 'oauth',
-          patch: { status: 'connected', lastError: undefined, capabilities: ['read', 'write'] },
-        })
-      );
-    };
-
-    window.addEventListener('oauth:success', handleOauthSuccess);
-    return () => {
-      window.removeEventListener('oauth:success', handleOauthSuccess);
-    };
-  }, [dispatch]);
+  // Centralised OAuth deep-link bridge — also handles `oauth:error` so failed
+  // sign-ins transition out of `connecting` instead of pinning the badge. See
+  // useOAuthConnectionListener.ts for the per-channel matching contract. Fixes
+  // the Discord half of #2128.
+  useOAuthConnectionListener({ channel: 'discord', authMode: 'oauth' });
 
   const startLinkPolling = useCallback(
     (token: string) => {
@@ -139,18 +123,28 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
           upsertChannelConnection({
             channel: 'discord',
             authMode: 'managed_dm',
-            patch: { status: 'error', lastError: 'Link token expired. Please try again.' },
+            patch: { status: 'error', lastError: t('channels.discord.linkTokenExpired') },
           })
         );
       })();
     },
-    [dispatch]
+    [dispatch, t]
   );
 
   const handleConnect = useCallback(
     (spec: AuthModeSpec) => {
       const key = `discord:${spec.mode}`;
       void runBusy(key, async () => {
+        // Cancel any in-flight managed-link poll before clearing sibling
+        // state. Without this, a stale poll completion could later dispatch
+        // `managed_dm` back to connected/error, reviving a flow the user
+        // just switched away from. (CodeRabbit on PR #2256.)
+        pollAbort.current?.abort();
+        setLinkToken(null);
+
+        // Drop any sibling auth mode that's still mid-`connecting` so the
+        // panel doesn't show two methods pinned simultaneously (#2128).
+        dispatch(clearOtherPendingForChannel({ channel: 'discord', exceptAuthMode: spec.mode }));
         dispatch(
           setChannelConnectionStatus({
             channel: 'discord',
@@ -162,19 +156,34 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
 
         const credentials: Record<string, string> = {};
         for (const field of spec.fields) {
-          const val = fieldValues[key]?.[field.key]?.trim() ?? '';
+          // `rawVal` is `undefined` only when the user never touched the field;
+          // an empty string means they entered something and then cleared it.
+          const rawVal = fieldValues[key]?.[field.key];
+          const val = rawVal?.trim() ?? '';
           if (field.required && !val) {
             dispatch(
               setChannelConnectionStatus({
                 channel: 'discord',
                 authMode: spec.mode,
                 status: 'error',
-                lastError: `${field.label} is required`,
+                lastError: t('channels.fieldRequired', '{field} is required').replace(
+                  '{field}',
+                  t(`channels.discord.fields.${field.key}.label`, field.label || field.key)
+                ),
               })
             );
             return;
           }
-          if (val) credentials[field.key] = val;
+          if (val) {
+            credentials[field.key] = val;
+          } else if (rawVal !== undefined) {
+            // Field was edited and then cleared — submit an explicit empty value
+            // instead of omitting it, so the backend can distinguish "cleared"
+            // from "never entered". For the allowlist this is what makes clearing
+            // it on reconnect mean "allow everyone" rather than silently reusing
+            // the previously-saved list (#3794 review — Codex P2).
+            credentials[field.key] = '';
+          }
         }
 
         const result = await channelConnectionsApi.connectChannel('discord', {
@@ -211,9 +220,38 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
               });
               if (oauthResponse.result?.oauthUrl) {
                 await openUrl(oauthResponse.result.oauthUrl);
+              } else {
+                // No URL means the core couldn't start the flow. Surface it now
+                // instead of leaving the badge pinned at `connecting` until the
+                // listener's timeout fires (#4299).
+                log('oauth_connect returned no oauthUrl for discord');
+                dispatch(
+                  setChannelConnectionStatus({
+                    channel: 'discord',
+                    authMode: spec.mode,
+                    status: 'error',
+                    lastError: t(
+                      'channels.discord.oauthStartFailed',
+                      "Couldn't start Discord sign-in. Try again."
+                    ),
+                  })
+                );
               }
-            } catch {
-              // best-effort
+            } catch (err) {
+              // Opening the browser / starting the flow failed — don't swallow
+              // it, or the badge hangs at `connecting` (#4299).
+              log('oauth_connect failed for discord: %o', err);
+              dispatch(
+                setChannelConnectionStatus({
+                  channel: 'discord',
+                  authMode: spec.mode,
+                  status: 'error',
+                  lastError: t(
+                    'channels.discord.oauthStartFailed',
+                    "Couldn't start Discord sign-in. Try again."
+                  ),
+                })
+              );
             }
           }
           return;
@@ -234,7 +272,7 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
               })
             );
           } catch {
-            setError('Channel saved. Restart the app to activate it.');
+            setError(t('channels.discord.savedRestartRequired'));
           }
         } else {
           dispatch(
@@ -247,20 +285,24 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
         }
       });
     },
-    [dispatch, fieldValues, runBusy, startLinkPolling]
+    [dispatch, fieldValues, runBusy, setError, startLinkPolling, t]
   );
 
   const handleDisconnect = useCallback(
     (authMode: ChannelAuthMode) => {
+      const key = `discord:${authMode}`;
       void runBusy(`discord:${authMode}`, async () => {
         log('disconnecting discord via %s', authMode);
         pollAbort.current?.abort();
         setLinkToken(null);
-        await channelConnectionsApi.disconnectChannel('discord', authMode);
+        await channelConnectionsApi.disconnectChannel('discord', authMode, {
+          clearMemory: Boolean(clearMemoryOnDisconnect[key]),
+        });
+        setClearMemoryOnDisconnect(prev => ({ ...prev, [key]: false }));
         dispatch(disconnectChannelConnection({ channel: 'discord', authMode }));
       });
     },
-    [dispatch, runBusy]
+    [clearMemoryOnDisconnect, dispatch, runBusy]
   );
 
   const copyToken = useCallback(() => {
@@ -273,105 +315,147 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
 
   return (
     <div className="space-y-3">
-      {error && (
-        <div className="rounded-lg border border-coral-200 bg-coral-50 px-4 py-3 text-sm text-coral-700">
-          {error}
+      {error && <ChannelConfigError message={error} />}
+
+      {isLocalSession && visibleAuthModes.length !== definition.auth_modes.length && (
+        <div className="rounded-lg border border-line bg-surface-muted px-4 py-3 text-sm text-content-secondary">
+          {t('channels.localManagedUnavailable')}
         </div>
       )}
 
-      {definition.auth_modes.map(spec => {
+      {visibleAuthModes.map(spec => {
         const compositeKey = `discord:${spec.mode}`;
         const connection = channelConnections.connections.discord?.[spec.mode];
         const status: ChannelConnectionStatus = connection?.status ?? 'disconnected';
         const busy = busyKeys[compositeKey] ?? false;
 
         return (
-          <div key={spec.mode} className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-sm font-medium text-stone-900">
-                  {AUTH_MODE_LABELS[spec.mode] ?? spec.mode}
-                </p>
-                <p className="text-xs text-stone-500 mt-1">{spec.description}</p>
-                {connection?.lastError && (
-                  <p className="text-xs text-coral-600 mt-1">{connection.lastError}</p>
-                )}
-              </div>
-              <ChannelStatusBadge status={status} />
-            </div>
-
+          <ChannelAuthModeCard
+            key={spec.mode}
+            title={t(`channels.authMode.${spec.mode}`)}
+            description={t(`channels.discord.authMode.${spec.mode}.description`)}
+            status={status}
+            lastError={connection?.lastError}>
             {/* Field inputs — only for non-managed modes */}
             {spec.fields.length > 0 && status !== 'connected' && (
-              <div className="mt-3 space-y-2">
-                {spec.fields.map(field => (
-                  <ChannelFieldInput
-                    key={field.key}
-                    field={field}
-                    value={fieldValues[compositeKey]?.[field.key] ?? ''}
-                    onChange={val => updateField(compositeKey, field.key, val)}
-                    disabled={busy}
-                  />
-                ))}
-              </div>
+              <ChannelAuthFields
+                spec={spec}
+                compositeKey={compositeKey}
+                fieldValues={fieldValues}
+                onChange={updateField}
+                disabled={busy}
+                mapField={field => ({
+                  ...field,
+                  label: t(`channels.discord.fields.${field.key}.label`, field.label),
+                  placeholder: field.placeholder
+                    ? t(`channels.discord.fields.${field.key}.placeholder`, field.placeholder)
+                    : field.placeholder,
+                })}
+              />
             )}
 
             {/* Token card — managed_dm connecting state */}
             {spec.mode === 'managed_dm' && linkToken && status === 'connecting' && (
-              <div className="mt-3 rounded-lg border border-primary-200 bg-primary-50/60 p-3 space-y-2">
-                <p className="text-xs font-medium text-primary-700">Your one-time link token</p>
+              <div className="mt-3 rounded-lg border border-primary-200 dark:border-primary-500/30 bg-primary-50/60 dark:bg-primary-500/15 p-3 space-y-2">
+                <p className="text-xs font-medium text-primary-700 dark:text-primary-300">
+                  {t('channels.discord.linkTokenLabel')}
+                </p>
                 <div className="flex items-center gap-2">
-                  <code className="flex-1 rounded bg-white border border-primary-200 px-2 py-1 text-xs font-mono text-stone-800 select-all break-all">
+                  <code className="flex-1 rounded bg-surface border border-primary-200 dark:border-primary-500/30 px-2 py-1 text-xs font-mono text-content select-all break-all">
                     {linkToken}
                   </code>
-                  <button
-                    type="button"
-                    onClick={copyToken}
-                    className="shrink-0 rounded-lg border border-primary-300 px-2 py-1 text-xs font-medium text-primary-700 hover:bg-primary-100">
-                    {copied ? 'Copied!' : 'Copy'}
-                  </button>
+                  <Button variant="secondary" size="xs" onClick={copyToken} className="shrink-0">
+                    {copied ? t('common.copied') : t('common.copy')}
+                  </Button>
                 </div>
-                <p className="text-xs text-stone-500">
-                  In Discord, send <code className="font-mono font-medium">!start {linkToken}</code>{' '}
-                  to the OpenHuman bot. Token expires in 5 minutes.
+                <p className="text-xs text-content-muted">
+                  {t('channels.discord.linkTokenInstruction').replace('{token}', linkToken)}
                 </p>
                 <p className="text-xs text-amber-600 font-medium">
-                  Save this command — this token is shown only once.
+                  {t('channels.discord.linkTokenOnce')}
                 </p>
               </div>
             )}
 
             {/* Connected state for managed_dm — show only Disconnect */}
             {spec.mode === 'managed_dm' && status === 'connected' ? (
-              <div className="mt-3 flex items-center justify-between">
-                <p className="text-xs text-sage-700 font-medium">Your Discord account is linked.</p>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handleDisconnect(spec.mode)}
-                  className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-600 hover:border-stone-300 disabled:opacity-50">
-                  Disconnect
-                </button>
-              </div>
+              <>
+                <label
+                  htmlFor={`${compositeKey}-clear-memory`}
+                  className="mt-3 flex items-start gap-2 rounded-lg border border-line bg-surface px-3 py-2">
+                  <Checkbox
+                    id={`${compositeKey}-clear-memory`}
+                    checked={Boolean(clearMemoryOnDisconnect[compositeKey])}
+                    className="mt-0.5"
+                    onCheckedChange={checked => {
+                      // See the sibling checkbox below / #5161: `Checkbox`
+                      // reads `e.target.checked` synchronously in its own
+                      // handler before calling back here, so the boolean is
+                      // already settled by the time the functional updater runs.
+                      setClearMemoryOnDisconnect(prev => ({ ...prev, [compositeKey]: checked }));
+                    }}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-xs font-medium text-content">
+                      {t('accounts.disconnectClearMemory')}
+                    </span>
+                    <span className="block text-[11px] text-content-muted">
+                      {t('accounts.disconnectClearMemoryHint')}
+                    </span>
+                  </span>
+                </label>
+                <div className="mt-3 flex items-center justify-between">
+                  <p className="text-xs text-sage-700 dark:text-sage-300 font-medium">
+                    {t('channels.discord.accountLinked')}
+                  </p>
+                  <ChannelConnectActions
+                    busy={busy}
+                    status={status}
+                    connectLabel={t('channels.discord.connect')}
+                    disconnectLabel={t('accounts.disconnect')}
+                    onDisconnect={() => handleDisconnect(spec.mode)}
+                    showConnect={false}
+                    className="mt-0"
+                  />
+                </div>
+              </>
             ) : /* Connect / Disconnect buttons for all other modes and states */
             spec.mode !== 'managed_dm' || status !== 'connecting' ? (
-              <div className="mt-3 flex gap-2">
-                {status !== 'connected' && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleConnect(spec)}
-                    className="rounded-lg bg-primary-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-600 disabled:opacity-50">
-                    Connect
-                  </button>
+              <>
+                {status === 'connected' && (
+                  <label
+                    htmlFor={`${compositeKey}-clear-memory-alt`}
+                    className="mt-3 flex items-start gap-2 rounded-lg border border-line bg-surface px-3 py-2">
+                    <Checkbox
+                      id={`${compositeKey}-clear-memory-alt`}
+                      checked={Boolean(clearMemoryOnDisconnect[compositeKey])}
+                      className="mt-0.5"
+                      onCheckedChange={checked => {
+                        // `Checkbox` reads the checked value synchronously in
+                        // its own handler before this callback runs, so the
+                        // stale-`currentTarget` bug (#5161) can't recur here.
+                        setClearMemoryOnDisconnect(prev => ({ ...prev, [compositeKey]: checked }));
+                      }}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium text-content">
+                        {t('accounts.disconnectClearMemory')}
+                      </span>
+                      <span className="block text-[11px] text-content-muted">
+                        {t('accounts.disconnectClearMemoryHint')}
+                      </span>
+                    </span>
+                  </label>
                 )}
-                <button
-                  type="button"
-                  disabled={busy || status === 'disconnected'}
-                  onClick={() => handleDisconnect(spec.mode)}
-                  className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-600 hover:border-stone-300 disabled:opacity-50">
-                  Disconnect
-                </button>
-              </div>
+                <ChannelConnectActions
+                  busy={busy}
+                  status={status}
+                  connectLabel={t('channels.discord.connect')}
+                  disconnectLabel={t('accounts.disconnect')}
+                  onConnect={() => handleConnect(spec)}
+                  onDisconnect={() => handleDisconnect(spec.mode)}
+                />
+              </>
             ) : null}
 
             {/* Server + Channel picker — shown after successful bot_token connection */}
@@ -386,7 +470,7 @@ const DiscordConfig = ({ definition }: DiscordConfigProps) => {
                 onChannelSelected={channelId => updateField(compositeKey, 'channel_id', channelId)}
               />
             )}
-          </div>
+          </ChannelAuthModeCard>
         );
       })}
     </div>

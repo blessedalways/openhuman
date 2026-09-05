@@ -1,10 +1,18 @@
+worktrees/*
+!worktrees/.gitkeep
+
 # Workflow docs (local only)
 workflow
 create_issue
 review_pr
+sentry_bugs
+remove_dupe_nonsense_issues
 
 # Diagnostic harness output (scripts/diagnose-cef-runtime.mjs)
 diagnosis-*.json
+
+# Dev-mode keyring file backend (plain-text secrets, dev artifact only)
+dev-keychain.json
 
 # Logs
 logs
@@ -27,6 +35,15 @@ dist-web
 .env
 .env.local
 .env.*.local
+
+# pnpm local store (created when --store-dir points into the repo)
+.pnpm-store/
+
+# sccache local compiler cache (used by CI and act)
+.sccache/
+
+# E2E test artifacts (screenshots, logs, traces — never checked in)
+app/test/e2e/artifacts/
 
 my_docs
 
@@ -57,7 +74,10 @@ app/src-tauri/runtime-skill-*
 .mypy_cache
 .ruff_cache
 .kotlin
-.cargo
+# Keep .cargo/ untracked (local per-machine config + credentials) EXCEPT the
+# shared, opt-in repo config that documents faster-linker setup.
+.cargo/*
+!.cargo/config.toml
 
 CLAUDE.local.md
 
@@ -67,11 +87,17 @@ wdio-logs/
 test-results/
 coverage/
 app/public/generated/remotion/
+app/test/e2e/artifacts/
+
+# Local pnpm store (created when network-restricted hosts cache the store inside the repo)
+.pnpm-store/
 
 tauri.key
 tauri.key.pub
 /target/
 src-tauri/target/
+app/src-tauri-mobile/gen/
+app/src-tauri-mobile/target/
 .target-codex/
 
 workflow
@@ -80,3 +106,39 @@ overlay/src-tauri/target/
 .claude/*.lock
 app/.claude/scheduled_tasks.lock
 target-test-run
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+tmp/
+app/test/e2e/.cache/
+.cache/cargo-install/
+test-map.md
+.test-gap-analysis.md
+
+# AI assistant progress tracking
+.kimi/
+.specify/
+.claude/skills/
+.codex-tmp
+*.enc
+
+# Apple signing and App Store Connect credentials
+AuthKey_*.p8
+*.mobileprovision
+*.certSigningRequest
+*.p12
+distribution.cer
+
+# Release note previews
+CHANGELOG.preview.md
+*.profraw
+*.diff
+
+.claude/worktrees/
+
+# Python bytecode from scripts/dep-sim.py
+__pycache__/
+
+# Coverage/diff-cover artifacts (generated locally, never shipped)
+lcov*.info
+diff-coverage.md

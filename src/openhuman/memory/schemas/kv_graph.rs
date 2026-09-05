@@ -267,3 +267,7 @@ fn handle_graph_query(params: Map<String, Value>) -> ControllerFuture {
         to_json(rpc::graph_query(payload).await?)
     })
 }
+
+#[cfg(test)]
+#[path = "kv_graph_tests.rs"]
+mod tests;

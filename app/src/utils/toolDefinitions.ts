@@ -1,4 +1,4 @@
-export interface ToolDefinition {
+interface ToolDefinition {
   id: string;
   displayName: string;
   description: string;
@@ -7,7 +7,7 @@ export interface ToolDefinition {
   rustToolNames: string[];
 }
 
-export type ToolCategory = 'System' | 'Files' | 'Vision' | 'Web' | 'Memory' | 'Automation';
+type ToolCategory = 'System' | 'Files' | 'Vision' | 'Web' | 'Memory' | 'Automation';
 
 export const TOOL_CATEGORIES: ToolCategory[] = [
   'System',
@@ -56,14 +56,6 @@ export const TOOL_CATALOG: ToolDefinition[] = [
   },
 
   // Vision
-  {
-    id: 'screenshot',
-    displayName: 'Screenshot',
-    description: 'Capture screenshots of your screen.',
-    category: 'Vision',
-    defaultEnabled: true,
-    rustToolNames: ['screenshot'],
-  },
   {
     id: 'image_info',
     displayName: 'Image Analysis',
@@ -155,7 +147,7 @@ export const TOOL_CATALOG: ToolDefinition[] = [
 export const CATEGORY_DESCRIPTIONS: Record<ToolCategory, string> = {
   System: 'Shell access and version control',
   Files: 'Read and write files on disk',
-  Vision: 'Screen capture and image analysis',
+  Vision: 'Image analysis',
   Web: 'Browser, HTTP, and web search',
   Memory: 'Persistent recall for the AI',
   Automation: 'Cron jobs and scheduled tasks',
@@ -188,4 +180,37 @@ export function getEnabledRustToolNames(enabledIds: string[]): string[] {
     }
   }
   return result;
+}
+
+/**
+ * Normalise a persisted enabledTools list that may contain Rust tool names
+ * (written by handleSave via getEnabledRustToolNames) back into UI toggle IDs
+ * so the ToolsPanel read path can compare them against tool.id.
+ *
+ * Handles three cases:
+ *   - Entry is already a UI toggle ID  → kept as-is
+ *   - Entry is a Rust tool name        → converted to its UI toggle ID
+ *   - Entry is unknown                 → dropped
+ *
+ * Multiple Rust names that belong to the same UI toggle (e.g. "cron_add",
+ * "cron_list" both map to "cron") are deduplicated in the output.
+ */
+export function normalizeEnabledToolList(raw: string[]): string[] {
+  const rustToUiId = new Map<string, string>();
+  for (const tool of TOOL_CATALOG) {
+    for (const rustName of tool.rustToolNames) {
+      rustToUiId.set(rustName, tool.id);
+    }
+  }
+  const allUiIds = new Set(TOOL_CATALOG.map(t => t.id));
+  const result = new Set<string>();
+  for (const entry of raw) {
+    if (allUiIds.has(entry)) {
+      result.add(entry);
+    } else {
+      const uiId = rustToUiId.get(entry);
+      if (uiId !== undefined) result.add(uiId);
+    }
+  }
+  return Array.from(result);
 }

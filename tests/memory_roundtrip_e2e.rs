@@ -11,14 +11,15 @@
 //! Run with: `cargo test --test memory_roundtrip_e2e`
 
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tempfile::tempdir;
 
 use openhuman_core::openhuman::memory::ops::{
-    clear_namespace, doc_put, memory_recall_memories, ClearNamespaceParams, PutDocParams,
+    clear_namespace, doc_put, memory_recall_context, memory_recall_memories, ClearNamespaceParams,
+    PutDocParams,
 };
-use openhuman_core::openhuman::memory::rpc_models::RecallMemoriesRequest;
+use openhuman_core::openhuman::memory::rpc_models::{RecallContextRequest, RecallMemoriesRequest};
 
 // ── Env isolation ────────────────────────────────────────────────────
 
@@ -51,12 +52,45 @@ impl Drop for EnvVarGuard {
 
 /// Serialises tests: `HOME` + `OPENHUMAN_WORKSPACE` are process-global.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static MEMORY_SEAMS_INIT: OnceLock<()> = OnceLock::new();
+static TEST_ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock poisoned")
+    match ENV_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// This integration target calls memory operations without constructing a core
+/// runtime, so it supplies the seams that normal startup installs first.
+fn test_root() -> &'static tempfile::TempDir {
+    TEST_ROOT.get_or_init(|| tempdir().expect("memory roundtrip tempdir"))
+}
+
+fn ensure_memory_seams(workspace: &Path) {
+    MEMORY_SEAMS_INIT.get_or_init(|| {
+        let workspace = workspace.to_path_buf();
+        std::thread::Builder::new()
+            .name("memory-roundtrip-seams".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let config = Arc::new(openhuman_core::openhuman::config::Config {
+                    workspace_dir: workspace.clone(),
+                    action_dir: workspace.clone(),
+                    config_path: workspace.join("config.toml"),
+                    ..openhuman_core::openhuman::config::Config::default()
+                });
+                openhuman_core::openhuman::memory::host_impls::install_memory_host_seams(
+                    config.clone(),
+                );
+                #[cfg(feature = "modules")]
+                openhuman_core::openhuman::modules::memory::set_modules_policy(config);
+            })
+            .expect("spawn memory roundtrip seam installer")
+            .join()
+            .expect("memory roundtrip seam installer panicked");
+    });
 }
 
 const NS: &str = "memory-roundtrip-e2e-773";
@@ -91,17 +125,27 @@ fn recall_request() -> RecallMemoriesRequest {
     }
 }
 
+fn recall_context_request() -> RecallContextRequest {
+    RecallContextRequest {
+        namespace: NS.to_string(),
+        include_references: Some(true),
+        limit: Some(10),
+        max_chunks: None,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 /// 8.1.1 store + 8.1.2 recall — the happy-path round-trip.
 #[tokio::test]
 async fn doc_put_then_recall_memories_returns_canary() {
     let _lock = env_lock();
-    let tmp = tempdir().expect("tempdir");
+    let tmp = test_root();
     let _home = EnvVarGuard::set_to_path("HOME", tmp.path());
     let workspace_path = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace_path).expect("create workspace dir");
     let _ws = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", &workspace_path);
+    ensure_memory_seams(&workspace_path);
 
     // Store the canary document.
     let put_outcome = doc_put(put_params()).await.expect("doc_put rpc");
@@ -122,17 +166,112 @@ async fn doc_put_then_recall_memories_returns_canary() {
     );
 }
 
+/// `recall_context` should surface the same document as an LLM-ready prompt
+/// block, not only in the raw memory list view.
+#[tokio::test]
+async fn doc_put_then_recall_context_renders_llm_context_message() {
+    let _lock = env_lock();
+    let tmp = test_root();
+    let _home = EnvVarGuard::set_to_path("HOME", tmp.path());
+    let workspace_path = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let _ws = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", &workspace_path);
+    ensure_memory_seams(&workspace_path);
+
+    doc_put(put_params()).await.expect("doc_put rpc");
+
+    let recall_outcome = memory_recall_context(recall_context_request())
+        .await
+        .expect("memory_recall_context rpc");
+    let llm_context = recall_outcome
+        .value
+        .data
+        .as_ref()
+        .and_then(|data| data.llm_context_message.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        llm_context.contains(CONTENT) || llm_context.contains(KEY),
+        "llm context should reference the canary content/key — got {llm_context}"
+    );
+}
+
+/// doc_put with a body whose multi-byte codepoint straddles the 2048-byte
+/// body_preview boundary must complete without panic and return a non-empty
+/// document_id (PR #1681 regression guard).
+///
+/// Scenario: a ZWNJ (U+200C, 3 bytes: 0xE2 0x80 0x8C) is placed so each of
+/// its bytes falls exactly on the nominal 2048-byte cut point in turn.
+/// The ingest path calls `markdown_body_preview` which uses `ceil_char_boundary`
+/// — a panic here would surface as a test failure.
+#[tokio::test]
+async fn doc_put_with_multibyte_at_body_preview_boundary_does_not_panic() {
+    let _lock = env_lock();
+    let tmp = test_root();
+    let _home = EnvVarGuard::set_to_path("HOME", tmp.path());
+    let workspace_path = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let _ws = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", &workspace_path);
+    ensure_memory_seams(&workspace_path);
+
+    const BODY_PREVIEW_MAX_BYTES: usize = 2048;
+    let zwnj = '\u{200c}'; // 3-byte codepoint
+    let zwnj_bytes = zwnj.len_utf8();
+
+    for offset in 0..zwnj_bytes {
+        // Build a body where the nominal cut falls exactly `offset` bytes into the
+        // ZWNJ. `prefix_len` bytes of 'a' are placed before the ZWNJ so that the
+        // 2048-byte cut point lands `offset` bytes into the 3-byte ZWNJ codepoint.
+        // Total body length is prefix_len + zwnj_bytes + trailing, which is
+        // > BODY_PREVIEW_MAX_BYTES since trailing = offset + 80 >= 80.
+        let prefix_len = BODY_PREVIEW_MAX_BYTES - offset;
+        let body = format!(
+            "{}{}{}",
+            "a".repeat(prefix_len),
+            zwnj,
+            "b".repeat(offset + 80)
+        );
+        assert!(
+            body.len() > BODY_PREVIEW_MAX_BYTES,
+            "offset={offset}: fixture body too short to exercise truncation"
+        );
+
+        let params = PutDocParams {
+            namespace: format!("utf8-boundary-e2e-{offset}"),
+            key: format!("utf8-boundary-key-{offset}"),
+            title: format!("UTF-8 boundary test offset={offset}"),
+            content: body,
+            source_type: "doc".to_string(),
+            priority: "medium".to_string(),
+            tags: Vec::new(),
+            metadata: serde_json::Value::Null,
+            category: "core".to_string(),
+            session_id: None,
+            document_id: None,
+        };
+
+        let outcome = doc_put(params)
+            .await
+            .unwrap_or_else(|e| panic!("doc_put panicked at offset={offset}: {e}"));
+        assert!(
+            !outcome.value.document_id.is_empty(),
+            "doc_put must return non-empty document_id at offset={offset}"
+        );
+    }
+}
+
 /// 8.1.3 forget — clear_namespace must scrub the namespace so subsequent
 /// recalls do not see the canary content. Failure-path / edge-case assertion
 /// required by gitbooks/developing/testing-strategy.md.
 #[tokio::test]
 async fn clear_namespace_removes_canary_from_recall() {
     let _lock = env_lock();
-    let tmp = tempdir().expect("tempdir");
+    let tmp = test_root();
     let _home = EnvVarGuard::set_to_path("HOME", tmp.path());
     let workspace_path = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace_path).expect("create workspace dir");
     let _ws = EnvVarGuard::set_to_path("OPENHUMAN_WORKSPACE", &workspace_path);
+    ensure_memory_seams(&workspace_path);
 
     // Seed the namespace.
     doc_put(put_params()).await.expect("seed doc_put");

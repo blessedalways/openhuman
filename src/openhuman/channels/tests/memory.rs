@@ -1,16 +1,18 @@
 use super::super::context::{
-    build_memory_context, conversation_memory_key, ChannelRuntimeContext,
-    CHANNEL_MESSAGE_TIMEOUT_SECS,
+    build_memory_context, clear_sender_history, conversation_history_key, conversation_memory_key,
+    ChannelRuntimeContext, CHANNEL_MESSAGE_TIMEOUT_SECS,
 };
 use super::super::runtime::process_channel_message;
 use super::super::{traits, Channel};
-use super::common::{HistoryCaptureProvider, NoopMemory, RecordingChannel};
-use crate::openhuman::embeddings::NoopEmbedding;
-use crate::openhuman::memory::{Memory, MemoryCategory, UnifiedMemory};
-use crate::openhuman::providers;
+use super::common::{HistoryCaptureModel, RecordingChannel};
+use crate::openhuman::inference::embeddings::NoopEmbedding;
+use crate::openhuman::inference::provider;
+use crate::openhuman::memory::{Memory, MemoryCategory};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use tinymemory_api::provider::MemoryCore as _;
+use tinymemory_core::store::UnifiedMemory;
 
 fn conversation_memory_key_uses_message_id() {
     let msg = traits::ChannelMessage {
@@ -107,14 +109,14 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
 
 #[tokio::test]
 async fn build_memory_context_includes_recalled_entries() {
-    let tmp = TempDir::new().unwrap();
-    let mem = UnifiedMemory::new(tmp.path(), Arc::new(NoopEmbedding), None).unwrap();
+    let (_provider, mem) = crate::openhuman::memory::guard::in_memory::guarded_in_memory();
     mem.store(
         "",
         "age_fact",
         "Age is 45",
-        MemoryCategory::Conversation,
+        tinymemory_api::types::MemoryCategory::Conversation,
         None,
+        tinymemory_api::types::MemoryTaint::Internal,
     )
     .await
     .unwrap();
@@ -133,13 +135,15 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
 
-    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let provider_impl = Arc::new(HistoryCaptureModel::default());
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(channels_by_name),
-        provider: provider_impl.clone(),
+        turn_model_source: Some(
+            crate::openhuman::agent::tinyagents::TurnModelSource::from_model(provider_impl.clone()),
+        ),
         default_provider: Arc::new("test-provider".to_string()),
-        memory: Arc::new(NoopMemory),
+        memory: crate::openhuman::memory::guard::in_memory::FixedRecallProvider::guarded(Vec::new()),
         tools_registry: Arc::new(vec![]),
         system_prompt: Arc::new("test-system-prompt".to_string()),
         model: Arc::new("test-model".to_string()),
@@ -148,14 +152,17 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         max_tool_iterations: 5,
         min_relevance_score: 0.0,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        turn_model_source_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_url: None,
+        inference_url: None,
         reliability: Arc::new(crate::openhuman::config::ReliabilityConfig::default()),
-        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        provider_runtime_options: provider::ProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         multimodal: crate::openhuman::config::MultimodalConfig::default(),
+        multimodal_files: crate::openhuman::config::MultimodalFileConfig::default(),
+        config: None,
     });
 
     process_channel_message(
@@ -202,6 +209,103 @@ async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
     assert!(calls[1][1].1.contains("hello"));
     assert!(calls[1][2].1.contains("response-1"));
     assert!(calls[1][3].1.contains("follow up"));
+}
+
+#[tokio::test]
+#[ignore = "needs a built tinymemory module (OPENHUMAN_MODULE_PATH): the assertion turns on \
+ranked recall finding the autosaved turn, which the in-memory fake\'s substring match cannot do"]
+async fn process_channel_message_uses_autosaved_memory_after_history_is_cleared() {
+    let _bus_guard = super::common::use_real_agent_handler().await;
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let provider_impl = Arc::new(HistoryCaptureModel::default());
+    let (_memory_provider, memory) =
+        crate::openhuman::memory::guard::in_memory::guarded_in_memory();
+
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(channels_by_name),
+        turn_model_source: Some(
+            crate::openhuman::agent::tinyagents::TurnModelSource::from_model(provider_impl.clone()),
+        ),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory,
+        tools_registry: Arc::new(vec![]),
+        system_prompt: Arc::new("test-system-prompt".to_string()),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: true,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        turn_model_source_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_url: None,
+        inference_url: None,
+        reliability: Arc::new(crate::openhuman::config::ReliabilityConfig::default()),
+        provider_runtime_options: provider::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        multimodal: crate::openhuman::config::MultimodalConfig::default(),
+        multimodal_files: crate::openhuman::config::MultimodalFileConfig::default(),
+        config: None,
+    });
+
+    let first = traits::ChannelMessage {
+        id: "msg-memory-a".to_string(),
+        sender: "alice".to_string(),
+        reply_target: "chat-1".to_string(),
+        content: "My launch code is phoenix-773.".to_string(),
+        channel: "test-channel".to_string(),
+        timestamp: 1,
+        thread_ts: None,
+    };
+    let history_key = conversation_history_key(&first);
+
+    process_channel_message(runtime_ctx.clone(), first).await;
+
+    clear_sender_history(&runtime_ctx, &history_key);
+
+    process_channel_message(
+        runtime_ctx,
+        traits::ChannelMessage {
+            id: "msg-memory-b".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "What is my launch code?".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        },
+    )
+    .await;
+
+    let calls = provider_impl
+        .calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].len(), 2);
+    assert_eq!(calls[1][0].0, "system");
+    assert_eq!(calls[1][1].0, "user");
+    assert!(
+        calls[1][1].1.contains("[Memory context]"),
+        "second turn should include recalled memory context: {:?}",
+        calls[1][1]
+    );
+    assert!(
+        calls[1][1].1.contains("phoenix-773"),
+        "second turn should surface the autosaved fact: {:?}",
+        calls[1][1]
+    );
+    assert!(
+        calls[1][1].1.contains("What is my launch code?"),
+        "current user question should remain in the final prompt: {:?}",
+        calls[1][1]
+    );
 }
 
 // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

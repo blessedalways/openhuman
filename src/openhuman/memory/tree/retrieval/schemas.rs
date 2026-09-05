@@ -2,8 +2,6 @@
 //!
 //! Registered JSON-RPC methods:
 //! - `openhuman.memory_tree_query_source`
-//! - `openhuman.memory_tree_query_global`
-//! - `openhuman.memory_tree_query_topic`
 //! - `openhuman.memory_tree_search_entities`
 //! - `openhuman.memory_tree_drill_down`
 //! - `openhuman.memory_tree_fetch_leaves`
@@ -28,8 +26,7 @@ const NAMESPACE: &str = "memory_tree";
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
         schemas("query_source"),
-        schemas("query_global"),
-        schemas("query_topic"),
+        schemas("cover_window"),
         schemas("search_entities"),
         schemas("drill_down"),
         schemas("fetch_leaves"),
@@ -45,12 +42,8 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_query_source,
         },
         RegisteredController {
-            schema: schemas("query_global"),
-            handler: handle_query_global,
-        },
-        RegisteredController {
-            schema: schemas("query_topic"),
-            handler: handle_query_topic,
+            schema: schemas("cover_window"),
+            handler: handle_cover_window,
         },
         RegisteredController {
             schema: schemas("search_entities"),
@@ -145,53 +138,48 @@ pub fn schemas(function: &str) -> ControllerSchema {
             ],
             outputs: query_response_outputs(),
         },
-        "query_global" => ControllerSchema {
+        "cover_window" => ControllerSchema {
             namespace: NAMESPACE,
-            function: "query_global",
-            description: "Return the global digest for the last N days. Wraps \
-                 `tree_global::recap`; the returned hit carries `child_ids` pointing \
-                 at the folded per-day summary ids for drill-down.",
-            inputs: vec![FieldSchema {
-                name: "window_days",
-                ty: TypeSchema::U64,
-                comment: "Lookback window in days (e.g. 7 for weekly recap).",
-                required: true,
-            }],
-            outputs: query_response_outputs(),
-        },
-        "query_topic" => ControllerSchema {
-            namespace: NAMESPACE,
-            function: "query_topic",
-            description: "Return summaries / chunks associated with a canonical \
-                 entity id across every tree (source, topic, global). Also returns \
-                 the topic tree's root if one has materialised for the entity. \
-                 Sorted by (score DESC, timestamp DESC), or by cosine similarity \
-                 if `query` is provided.",
+            function: "cover_window",
+            description: "Return the MINIMUM set of nodes covering all memory in a time \
+                 window `[since_ms, until_ms]` (epoch-millis). Emits the coarsest summary \
+                 whose whole subtree falls inside the window, and raw leaf chunks for \
+                 anything not covered by such a summary (boundary content and not-yet-\
+                 summarised chunks). Optional `source_id` / `source_kind` scope the result. \
+                 Hits are grouped by source and ordered ascending by start time. Use this \
+                 for time-bounded recaps (e.g. a last-24h morning brief) instead of \
+                 `query_source`, which returns all-time summaries.",
             inputs: vec![
                 FieldSchema {
-                    name: "entity_id",
-                    ty: TypeSchema::String,
-                    comment: "Canonical id (e.g. `email:alice@example.com`, `topic:phoenix`).",
+                    name: "since_ms",
+                    ty: TypeSchema::I64,
+                    comment: "Inclusive window start, epoch-milliseconds.",
                     required: true,
                 },
                 FieldSchema {
-                    name: "time_window_days",
-                    ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
-                    comment: "Only return hits whose time range overlaps the last N days.",
+                    name: "until_ms",
+                    ty: TypeSchema::I64,
+                    comment: "Inclusive window end, epoch-milliseconds.",
+                    required: true,
+                },
+                FieldSchema {
+                    name: "source_id",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::String)),
+                    comment: "Exact source id (e.g. `slack:#eng`, `gmail:abc`).",
                     required: false,
                 },
                 FieldSchema {
-                    name: "query",
-                    ty: TypeSchema::Option(Box::new(TypeSchema::String)),
-                    comment: "Optional natural-language query — when present, \
-                     candidates are reranked by cosine similarity to the query's \
-                     embedding. Candidates without stored embeddings sort last.",
+                    name: "source_kind",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Enum {
+                        variants: vec!["chat", "email", "document"],
+                    })),
+                    comment: "Source kind filter when no exact id is known.",
                     required: false,
                 },
                 FieldSchema {
                     name: "limit",
                     ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
-                    comment: "Max hits (default 10).",
+                    comment: "Max hits (default 200).",
                     required: false,
                 },
             ],
@@ -338,19 +326,11 @@ fn handle_query_source(params: Map<String, Value>) -> ControllerFuture {
     })
 }
 
-fn handle_query_global(params: Map<String, Value>) -> ControllerFuture {
+fn handle_cover_window(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let config = config_rpc::load_config_with_timeout().await?;
-        let req = parse_value::<retrieval_rpc::QueryGlobalRequest>(Value::Object(params))?;
-        to_json(retrieval_rpc::query_global_rpc(&config, req).await?)
-    })
-}
-
-fn handle_query_topic(params: Map<String, Value>) -> ControllerFuture {
-    Box::pin(async move {
-        let config = config_rpc::load_config_with_timeout().await?;
-        let req = parse_value::<retrieval_rpc::QueryTopicRequest>(Value::Object(params))?;
-        to_json(retrieval_rpc::query_topic_rpc(&config, req).await?)
+        let req = parse_value::<retrieval_rpc::CoverWindowRequest>(Value::Object(params))?;
+        to_json(retrieval_rpc::cover_window_rpc(&config, req).await?)
     })
 }
 
@@ -385,3 +365,7 @@ fn parse_value<T: DeserializeOwned>(v: Value) -> Result<T, String> {
 fn to_json<T: serde::Serialize>(outcome: RpcOutcome<T>) -> Result<Value, String> {
     outcome.into_cli_compatible_json()
 }
+
+#[cfg(test)]
+#[path = "schemas_tests.rs"]
+mod tests;

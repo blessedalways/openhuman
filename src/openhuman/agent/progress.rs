@@ -37,6 +37,13 @@ pub enum AgentProgress {
         arguments: serde_json::Value,
         /// 1-based iteration index.
         iteration: u32,
+        /// Server-computed human label for the chat processing timeline
+        /// (e.g. "Reading messages"), or `None` to defer to the client
+        /// formatter. Set from [`crate::openhuman::tools::traits::Tool::display_label`].
+        display_label: Option<String>,
+        /// Server-computed contextual detail shown after the label
+        /// (e.g. "steven@gmail.com"), from `Tool::display_detail`.
+        display_detail: Option<String>,
     },
 
     /// A tool execution completed (success or failure).
@@ -47,9 +54,26 @@ pub enum AgentProgress {
         tool_name: String,
         success: bool,
         output_chars: usize,
+        /// Full text the tool returned. Mirrors
+        /// [`Self::SubagentToolCallCompleted::output`] so trace exporters can
+        /// record the parent-scope tool result as the span output (truncated +
+        /// content-gated at the collector). Empty when the harness ran with
+        /// payload capture off.
+        output: String,
+        /// The arguments the tool was invoked with, when the harness captured
+        /// them (`PayloadCapture::tool_io`). The crate emits arguments on the
+        /// *completed* event, so trace exporters use this to backfill the tool
+        /// span's input (the started event's `arguments` is `Null` on the
+        /// tinyagents path).
+        arguments: Option<serde_json::Value>,
         elapsed_ms: u64,
         /// 1-based iteration index.
         iteration: u32,
+        /// Present when `success` is false: a user-facing classification of the
+        /// failure (class, category, plain-language cause + next action) that
+        /// the chat "View processing" timeline renders. `None` on success and
+        /// on legacy snapshots. See `crate::openhuman::tools::status`.
+        failure: Option<crate::openhuman::tools::status::ClassifiedFailure>,
     },
 
     /// A sub-agent was spawned during tool execution.
@@ -68,6 +92,20 @@ pub enum AgentProgress {
         /// whether to render the prompt detail inline or behind a
         /// "show more" affordance.
         prompt_chars: usize,
+        /// Persistent worker sub-thread id backing this delegation, when
+        /// one was created (`worker-<uuid>`). The UI uses it to reopen the
+        /// full parent↔subagent conversation from memory after the live
+        /// turn ends. `None` for live-only runs (no parent context).
+        worker_thread_id: Option<String>,
+        /// Human-readable display name from the agent registry (e.g.
+        /// "Researcher", "Coding Agent"). Falls back to `agent_id` in
+        /// the UI when absent.
+        display_name: Option<String>,
+        /// The full delegated prompt text. `prompt_chars` stays as the cheap
+        /// size hint; trace exporters record this (truncated + content-gated)
+        /// as the subagent span's input so a delegation is inspectable
+        /// end-to-end in Langfuse.
+        prompt: String,
     },
 
     /// A sub-agent completed successfully.
@@ -82,6 +120,21 @@ pub enum AgentProgress {
         iterations: u32,
         /// Character length of the sub-agent's final assistant text.
         output_chars: usize,
+        /// The sub-agent's full final assistant text. Trace exporters record
+        /// this (truncated + content-gated) as the subagent span's output.
+        output: String,
+        /// Absolute path to the worker's isolated `git worktree` checkout,
+        /// when it ran with `isolation = "worktree"` (#3376). `None` for
+        /// non-isolated (read-only / shared-workspace) workers.
+        worktree_path: Option<String>,
+        /// Files (relative to the worktree root) the worker changed, snapshot
+        /// from `git status` after the run. Empty for non-isolated workers or
+        /// a clean worktree.
+        changed_files: Vec<String>,
+        /// Whether the worker's worktree had uncommitted changes after the
+        /// run. A dirty worktree must not be auto-removed — surfaced so the UI
+        /// can require an explicit user decision. `None` for non-isolated.
+        dirty_status: Option<bool>,
     },
 
     /// A sub-agent failed.
@@ -89,6 +142,25 @@ pub enum AgentProgress {
         agent_id: String,
         task_id: String,
         error: String,
+    },
+
+    /// A sub-agent paused and is waiting for user input relayed via
+    /// `continue_subagent`. The orchestrator surfaces the question to
+    /// the user and calls `continue_subagent` with the answer.
+    SubagentAwaitingUser {
+        agent_id: String,
+        task_id: String,
+        question: String,
+        worker_thread_id: Option<String>,
+        /// Where the paused conversation was persisted, or `None` when the
+        /// write failed.
+        ///
+        /// Carried rather than re-derived by the consumer: the run ledger used
+        /// to rebuild this path from the workspace dir and record it
+        /// unconditionally, so it claimed a checkpoint existed even when none
+        /// had been written, and would have pointed at the wrong directory for
+        /// any run whose `checkpoint_dir` was overridden (#5928).
+        checkpoint_path: Option<String>,
     },
 
     /// A sub-agent's inner LLM iteration is starting. Emitted **only
@@ -104,6 +176,9 @@ pub enum AgentProgress {
         iteration: u32,
         /// Maximum iterations configured for this child run.
         max_iterations: u32,
+        /// `true` when the agent uses [`IterationPolicy::Extended`](crate::openhuman::agent::harness::definition::IterationPolicy::Extended).
+        /// The UI uses this to show "step N" instead of "turn N/M".
+        extended_policy: bool,
     },
 
     /// A sub-agent is about to execute a tool. Distinct from
@@ -115,8 +190,18 @@ pub enum AgentProgress {
         task_id: String,
         call_id: String,
         tool_name: String,
+        /// Full arguments the child invoked the tool with, so the parent
+        /// thread's UI can show *what exactly* the sub-agent did (not just
+        /// the tool name). Mirrors the top-level `ToolCallStarted.arguments`.
+        arguments: serde_json::Value,
         /// 1-based child iteration index this call belongs to.
         iteration: u32,
+        /// Server-computed human label for the timeline (e.g. "Reading
+        /// messages"), or `None` to defer to the client formatter. Mirrors
+        /// the top-level `ToolCallStarted.display_label`.
+        display_label: Option<String>,
+        /// Server-computed contextual detail (e.g. "steven@gmail.com").
+        display_detail: Option<String>,
     },
 
     /// A sub-agent's tool execution finished.
@@ -127,9 +212,57 @@ pub enum AgentProgress {
         tool_name: String,
         success: bool,
         output_chars: usize,
+        /// Full text the tool returned, so the UI can show the sub-agent's
+        /// actual result/output. `output_chars` is kept as a cheap size hint
+        /// for consumers that only want the length.
+        output: String,
+        /// The arguments the tool was invoked with, when the harness captured
+        /// them (`PayloadCapture::tool_io`). Backfills the tool span's input in
+        /// trace exports (the started event's `arguments` is `Null` on the
+        /// tinyagents path).
+        arguments: Option<serde_json::Value>,
         elapsed_ms: u64,
         /// 1-based child iteration index.
         iteration: u32,
+        /// Present when `success` is false: a user-facing classification of the
+        /// child tool failure, mirroring [`Self::ToolCallCompleted::failure`] so
+        /// a failed sub-agent row carries the same "why + what to do next" copy
+        /// instead of discarding the already-computed classification (#4459).
+        failure: Option<crate::openhuman::tools::status::ClassifiedFailure>,
+    },
+
+    /// A chunk of a sub-agent's visible assistant text arrived from the
+    /// provider while the child iteration is still in flight. Distinct
+    /// from [`Self::TextDelta`] so the parent thread can attribute the
+    /// streamed token to a specific live subagent row (via `task_id`)
+    /// and render it inside that row's transcript instead of merging it
+    /// into the parent's own streaming buffer. Emitted **only from
+    /// inside [`crate::openhuman::agent::harness::subagent_runner`]** when
+    /// the parent context carries an `on_progress` sink.
+    SubagentTextDelta {
+        agent_id: String,
+        task_id: String,
+        delta: String,
+        /// 1-based child iteration index this delta belongs to.
+        iteration: u32,
+    },
+
+    /// A chunk of a sub-agent's model reasoning / thinking output
+    /// arrived (for models that emit `reasoning_content`). Counterpart
+    /// to [`Self::ThinkingDelta`] scoped to a child run — see
+    /// [`Self::SubagentTextDelta`] for the attribution rationale.
+    SubagentThinkingDelta {
+        agent_id: String,
+        task_id: String,
+        delta: String,
+        /// 1-based child iteration index.
+        iteration: u32,
+    },
+
+    /// The agent rewrote the per-thread task board. Emitted by the
+    /// `todo` tool (or `openhuman.todos_*` RPC) after the board has been persisted.
+    TaskBoardUpdated {
+        board: crate::openhuman::agent::task_board::TaskBoard,
     },
 
     /// A chunk of visible assistant text arrived from the provider
@@ -189,9 +322,63 @@ pub enum AgentProgress {
         total_usd: f64,
     },
 
+    /// A single LLM call finished and reported usage. Unlike
+    /// [`Self::TurnCostUpdated`] (cumulative rollup), every field here is
+    /// **per-call**, so trace exporters can render each model invocation as
+    /// its own Langfuse generation with exact model + token + cost figures.
+    /// Emitted once per model call — parent-scope calls carry
+    /// `subagent_task_id: None`; child (subagent) calls carry the owning
+    /// task id so exporters can nest the generation under the subagent span.
+    ModelCallCompleted {
+        /// Model that served this call (tier handle or concrete model id).
+        model: String,
+        /// Provider that served this call (`"managed"`, `"openai"`,
+        /// `"ollama"`, …). Trace exporters render the Langfuse model as
+        /// `{provider_id}.{model}` (e.g. `managed.chat-v1`).
+        provider_id: String,
+        /// Owning subagent task id when this call ran inside a child run
+        /// (`spawn_subagent` / Context Scout). `None` for parent-scope calls.
+        subagent_task_id: Option<String>,
+        /// The request messages sent to the model (including the system
+        /// prompt), when the harness captured them
+        /// (`PayloadCapture::model_io`). Trace exporters record this as the
+        /// generation's input, gated on `capture_content`.
+        input: Option<serde_json::Value>,
+        /// The model completion (assistant message), when captured. Recorded
+        /// as the generation's output, gated on `capture_content`.
+        output: Option<serde_json::Value>,
+        /// 1-based iteration index (one model call per iteration).
+        iteration: u32,
+        /// Input/prompt tokens for this call.
+        input_tokens: u64,
+        /// Output/completion tokens for this call.
+        output_tokens: u64,
+        /// Input tokens served from a provider-side cache (cache reads).
+        cached_input_tokens: u64,
+        /// Input tokens written into a provider cache (cache creation).
+        cache_creation_tokens: u64,
+        /// Reasoning/thinking tokens, when the provider reports them.
+        reasoning_tokens: u64,
+        /// Best-available USD cost for this single call (charged when the
+        /// backend reported it, else a catalog estimate).
+        cost_usd: f64,
+    },
+
     /// The turn completed with a final text response.
     TurnCompleted {
         /// Total iterations used.
         iterations: u32,
+    },
+
+    /// The turn's content: the user's prompt and the model's final reply.
+    /// Emitted just before [`Self::TurnCompleted`] so a tracing consumer can
+    /// attach `input`/`output` to the turn span. Carries prompt/reply text, so
+    /// exporters must honor the opt-in `observability.agent_tracing.capture_content`
+    /// gate before transmitting it off-device.
+    TurnContent {
+        /// The user's prompt for this turn.
+        input: Option<String>,
+        /// The model's final reply for this turn.
+        output: Option<String>,
     },
 }

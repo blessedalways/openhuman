@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import type { ToastNotification } from '../../types/intelligence';
+import { Button, CloseIcon } from '../ui';
 
 interface ToastProps {
   notification: ToastNotification;
@@ -40,14 +41,24 @@ const TOAST_ICONS = {
   ),
 };
 
+// Use the theme-aware `surface` token, not the fixed-white `neutral-0`: with
+// `text-content` (near-white in dark mode) a hard-white background rendered as
+// white-on-white in dark mode.
 const TOAST_STYLES = {
-  success: 'bg-sage-500 text-white',
-  error: 'bg-coral-500 text-white',
-  warning: 'bg-amber-500 text-white',
-  info: 'bg-primary-500 text-white',
+  success: 'bg-surface border-sage-500 text-content',
+  error: 'bg-surface border-coral-500 text-content',
+  warning: 'bg-surface border-amber-500 text-content',
+  info: 'bg-surface border-primary-500 text-content',
 };
 
-export function Toast({ notification, onRemove }: ToastProps) {
+const TOAST_ICON_STYLES = {
+  success: 'text-sage-600',
+  error: 'text-coral-500',
+  warning: 'text-amber-600',
+  info: 'text-primary-500',
+};
+
+function Toast({ notification, onRemove }: ToastProps) {
   const [isVisible, setIsVisible] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
 
@@ -76,6 +87,7 @@ export function Toast({ notification, onRemove }: ToastProps) {
 
   const icon = TOAST_ICONS[notification.type];
   const styles = TOAST_STYLES[notification.type];
+  const iconStyle = TOAST_ICON_STYLES[notification.type];
 
   return (
     <div
@@ -86,43 +98,42 @@ export function Toast({ notification, onRemove }: ToastProps) {
       `}>
       <div
         className={`
-          flex items-center gap-3 p-4 rounded-lg shadow-large border backdrop-blur-sm
+          flex items-center gap-3 p-4 rounded-lg shadow-large border-l-4 border backdrop-blur-sm
           max-w-sm w-full
           ${styles}
         `}>
         {/* Icon */}
-        <div className="flex-shrink-0">{icon}</div>
+        <div className={`shrink-0 ${iconStyle}`}>{icon}</div>
 
         {/* Content */}
         <div className="flex-1 min-w-0">
           <h4 className="text-sm font-medium">{notification.title}</h4>
           {notification.message && (
-            <p className="text-xs opacity-90 mt-1">{notification.message}</p>
+            <p className="text-xs text-content-muted mt-1">{notification.message}</p>
           )}
         </div>
 
         {/* Action button */}
         {notification.action && (
-          <button
+          <Button
+            variant="tertiary"
+            size="xs"
             onClick={notification.action.handler}
-            className="text-xs font-medium underline hover:no-underline flex-shrink-0">
+            className="underline hover:no-underline shrink-0 px-0 h-auto">
             {notification.action.label}
-          </button>
+          </Button>
         )}
 
         {/* Close button */}
-        <button
+        <Button
+          variant="tertiary"
+          size="xs"
+          iconOnly
+          aria-label="Dismiss notification"
           onClick={handleRemove}
-          className="flex-shrink-0 text-white/70 hover:text-white transition-colors">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M6 18L18 6M6 6l12 12"
-            />
-          </svg>
-        </button>
+          className="shrink-0 text-content-faint hover:text-content-secondary">
+          <CloseIcon className="w-4 h-4" />
+        </Button>
       </div>
     </div>
   );

@@ -2,9 +2,10 @@
 
 use std::collections::BTreeSet;
 
+use crate::openhuman::memory::api::provider::MemoryProvider;
 use crate::rpc::RpcOutcome;
 
-use super::helpers::active_memory_client;
+use super::guard::active_memory_guard;
 
 /// Per-namespace outcome for `memory_learn_all`.
 #[derive(Debug, serde::Serialize)]
@@ -45,8 +46,14 @@ pub async fn memory_learn_all(
     );
 
     // Resolve the target namespace list.
-    let client = active_memory_client().await?;
-    let all_ns = client.list_namespaces().await?;
+    let guard = active_memory_guard().await?;
+    let documents = guard
+        .as_documents()
+        .ok_or_else(|| "memory driver does not support the documents family".to_string())?;
+    let all_ns = documents
+        .list_namespaces()
+        .await
+        .map_err(|error| error.to_string())?;
     tracing::debug!("[memory.learn] available namespaces: {:?}", all_ns);
 
     let target_ns: Vec<String> = match &params.namespaces {
@@ -111,8 +118,10 @@ pub async fn memory_learn_all(
             "[memory.learn] running summarization for namespace='{}'",
             namespace
         );
-        let outcome =
-            crate::openhuman::tree_summarizer::ops::tree_summarizer_run(&config, namespace).await;
+        let outcome = crate::openhuman::memory::tree::tree_runtime::ops::tree_summarizer_run(
+            &config, namespace,
+        )
+        .await;
         match outcome {
             Ok(_) => {
                 tracing::info!("[memory.learn] namespace='{}' ok", namespace);
@@ -150,3 +159,7 @@ pub async fn memory_learn_all(
         vec![],
     ))
 }
+
+#[cfg(test)]
+#[path = "learn_tests.rs"]
+mod tests;

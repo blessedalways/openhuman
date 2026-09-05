@@ -1,22 +1,53 @@
-use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
+use crate::openhuman::security::{AutonomyLevel, CommandClass, GateDecision, SecurityPolicy};
 use crate::openhuman::tools::traits::{Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tinytools::ToolRunContext;
+
+use super::git_operations_config::{
+    disallowed_config_refusal, first_disallowed_repo_config_key, hardened_git,
+};
+use super::git_operations_render::{
+    render_branch_markdown, render_log_markdown, render_status_markdown,
+};
 
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
-    workspace_dir: std::path::PathBuf,
+    action_dir: PathBuf,
 }
 
 impl GitOperationsTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, action_dir: PathBuf) -> Self {
         Self {
             security,
-            workspace_dir,
+            action_dir,
         }
+    }
+
+    /// Resolve the working directory for git operations.
+    ///
+    /// Returns the per-worker git-worktree checkout when the tinyagents harness
+    /// threaded a [`WorkspaceDescriptor`] into this call's
+    /// [`ToolExecutionContext`] — an edit-capable worker running with
+    /// `isolation = "worktree"`, whose isolated worktree root is carried on the
+    /// run context (`RunContext::with_workspace`) and surfaced per tool call via
+    /// `ToolExecutionContext::from_run_context`. Otherwise falls back to the
+    /// tool's configured `action_dir`, which preserves the non-isolated
+    /// behaviour exactly. See #3376, #4249 (08.5).
+    fn effective_action_dir_for_context(&self, context: Option<&dyn ToolRunContext>) -> PathBuf {
+        if let Some(workspace) = context.and_then(|ctx| ctx.workspace()) {
+            tracing::debug!(
+                workspace_root = %workspace.root.display(),
+                policy_id = %workspace.policy_id,
+                "[git_operations] using TinyAgents workspace descriptor as action dir"
+            );
+            return workspace.root.clone();
+        }
+        self.action_dir.clone()
     }
 
     /// Sanitize git arguments to prevent injection attacks
@@ -65,12 +96,16 @@ impl GitOperationsTool {
         )
     }
 
-    async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
+    async fn run_git_command_in(&self, cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
+        if let Some(key) = first_disallowed_repo_config_key(cwd).await? {
+            tracing::debug!(
+                "[git_operations] refusing to run git: dir={}, disallowed_config_key={key}",
+                cwd.display()
+            );
+            anyhow::bail!("{}", disallowed_config_refusal(cwd, &key))
+        }
+
+        let output = hardened_git(cwd).args(args).output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -80,9 +115,9 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    async fn git_status(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_status(&self, cwd: &Path, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["status", "--porcelain=2", "--branch"])
+            .run_git_command_in(cwd, &["status", "--porcelain=2", "--branch"])
             .await?;
 
         // Parse git status output into structured format
@@ -129,7 +164,7 @@ impl GitOperationsTool {
         Ok(tr)
     }
 
-    async fn git_diff(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_diff(&self, cwd: &Path, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let files = args.get("files").and_then(|v| v.as_str()).unwrap_or(".");
         let cached = args
             .get("cached")
@@ -139,14 +174,27 @@ impl GitOperationsTool {
         // Validate files argument against injection patterns
         self.sanitize_git_args(files)?;
 
-        let mut git_args = vec!["diff", "--unified=3"];
+        // `--no-ext-diff` is where external-diff suppression has to live: it is
+        // a diff-command flag, and the `-c diff.external=` that used to stand in
+        // for it made git exec the empty string instead of disabling anything.
+        //
+        // `--no-textconv` is a SEPARATE mechanism and needs its own flag.
+        // `--no-ext-diff` covers `diff.external` and `diff.<driver>.command`;
+        // it does not touch `diff.<driver>.textconv`, which a `.gitattributes`
+        // line (`*.bin diff=evil`) can select and which git then EXECUTES to
+        // render a binary file as text. Verified against a scratch repo: with
+        // `--no-ext-diff` alone the textconv script ran; adding
+        // `--no-textconv` it did not. `hardened_git`'s `-c` list cannot close
+        // this — driver names are arbitrary, so there is no finite set of keys
+        // to neutralise, and the suppression has to be a command flag.
+        let mut git_args = vec!["diff", "--no-ext-diff", "--no-textconv", "--unified=3"];
         if cached {
             git_args.push("--cached");
         }
         git_args.push("--");
         git_args.push(files);
 
-        let output = self.run_git_command(&git_args).await?;
+        let output = self.run_git_command_in(cwd, &git_args).await?;
 
         // Parse diff into structured hunks
         let mut result = serde_json::Map::new();
@@ -206,18 +254,21 @@ impl GitOperationsTool {
         ))
     }
 
-    async fn git_log(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_log(&self, cwd: &Path, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let limit_raw = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
         let limit = usize::try_from(limit_raw).unwrap_or(usize::MAX).min(1000);
         let limit_str = limit.to_string();
 
         let output = self
-            .run_git_command(&[
-                "log",
-                &format!("-{limit_str}"),
-                "--pretty=format:%H|%an|%ae|%ad|%s",
-                "--date=iso",
-            ])
+            .run_git_command_in(
+                cwd,
+                &[
+                    "log",
+                    &format!("-{limit_str}"),
+                    "--pretty=format:%H|%an|%ae|%ad|%s",
+                    "--date=iso",
+                ],
+            )
             .await?;
 
         let mut commits = Vec::new();
@@ -242,9 +293,9 @@ impl GitOperationsTool {
         Ok(tr)
     }
 
-    async fn git_branch(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_branch(&self, cwd: &Path, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["branch", "--format=%(refname:short)|%(HEAD)"])
+            .run_git_command_in(cwd, &["branch", "--format=%(refname:short)|%(HEAD)"])
             .await?;
 
         let mut branches = Vec::new();
@@ -282,7 +333,7 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_commit(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_commit(&self, cwd: &Path, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
@@ -303,7 +354,9 @@ impl GitOperationsTool {
         // Limit message length
         let message = Self::truncate_commit_message(&sanitized);
 
-        let output = self.run_git_command(&["commit", "-m", &message]).await;
+        let output = self
+            .run_git_command_in(cwd, &["commit", "-m", &message])
+            .await;
 
         match output {
             Ok(_) => Ok(ToolResult::success(format!("Committed: {message}"))),
@@ -311,7 +364,7 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_add(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_add(&self, cwd: &Path, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let paths = args
             .get("paths")
             .and_then(|v| v.as_str())
@@ -320,7 +373,7 @@ impl GitOperationsTool {
         // Validate paths against injection patterns
         self.sanitize_git_args(paths)?;
 
-        let output = self.run_git_command(&["add", "--", paths]).await;
+        let output = self.run_git_command_in(cwd, &["add", "--", paths]).await;
 
         match output {
             Ok(_) => Ok(ToolResult::success(format!("Staged: {paths}"))),
@@ -328,7 +381,11 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_checkout(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_checkout(
+        &self,
+        cwd: &Path,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
         let branch = args
             .get("branch")
             .and_then(|v| v.as_str())
@@ -348,7 +405,9 @@ impl GitOperationsTool {
             anyhow::bail!("Branch name contains invalid characters");
         }
 
-        let output = self.run_git_command(&["checkout", branch_name]).await;
+        let output = self
+            .run_git_command_in(cwd, &["checkout", branch_name])
+            .await;
 
         match output {
             Ok(_) => Ok(ToolResult::success(format!(
@@ -358,7 +417,7 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_stash(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_stash(&self, cwd: &Path, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -366,16 +425,16 @@ impl GitOperationsTool {
 
         let output = match action {
             "push" | "save" => {
-                self.run_git_command(&["stash", "push", "-m", "auto-stash"])
+                self.run_git_command_in(cwd, &["stash", "push", "-m", "auto-stash"])
                     .await
             }
-            "pop" => self.run_git_command(&["stash", "pop"]).await,
-            "list" => self.run_git_command(&["stash", "list"]).await,
+            "pop" => self.run_git_command_in(cwd, &["stash", "pop"]).await,
+            "list" => self.run_git_command_in(cwd, &["stash", "list"]).await,
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let index = i32::try_from(index_raw)
                     .map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
-                self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")])
+                self.run_git_command_in(cwd, &["stash", "drop", &format!("stash@{{{index}}}")])
                     .await
             }
             _ => anyhow::bail!("Unknown stash action: {action}. Use: push, pop, list, drop"),
@@ -449,6 +508,16 @@ impl Tool for GitOperationsTool {
         true
     }
 
+    /// Write git operations (commit/add/checkout/stash/…) route through the
+    /// human approval gate in ask-before-edit; read operations (status/diff/
+    /// log/branch) never prompt. In Full, writes run; read-only is blocked in
+    /// `execute` via the existing `can_act()` / autonomy check.
+    fn external_effect_with_args(&self, args: &serde_json::Value) -> bool {
+        let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        self.requires_write_access(operation)
+            && self.security.gate_decision(CommandClass::Write) == GateDecision::Prompt
+    }
+
     async fn execute_with_options(
         &self,
         args: serde_json::Value,
@@ -458,10 +527,29 @@ impl Tool for GitOperationsTool {
         // structured sub-operations (status/diff/log/branch). The harness
         // picks it up when `prefer_markdown` is on; the JSON content
         // block is preserved for callers that want the raw structure.
-        self.execute(args).await
+        self.execute_in_context(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: ToolCallOptions,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, context).await
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, None).await
+    }
+}
+
+impl GitOperationsTool {
+    async fn execute_in_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
         let operation = match args.get("operation").and_then(|v| v.as_str()) {
             Some(op) => op,
             None => {
@@ -469,35 +557,63 @@ impl Tool for GitOperationsTool {
             }
         };
 
-        // Check if we're in a git repository
-        if !self.workspace_dir.join(".git").exists() {
-            // Try to find .git in parent directories
-            let mut current_dir = self.workspace_dir.as_path();
-            let mut found_git = false;
-            while current_dir.parent().is_some() {
-                if current_dir.join(".git").exists() {
-                    found_git = true;
-                    break;
-                }
-                current_dir = current_dir.parent().unwrap();
-            }
-
-            if !found_git {
-                return Ok(ToolResult::error("Not in a git repository"));
-            }
+        let effective_dir = self.effective_action_dir_for_context(context);
+        // Validate the repository instead of trusting the presence of a `.git`
+        // path. This handles linked-worktree gitfiles and rejects malformed
+        // ancestor markers that Git itself cannot open.
+        //
+        // Probed with `hardened_git` directly rather than through
+        // `run_git_command_in`. That helper refuses up front when the
+        // repository config carries a disallowed key, and routing the probe
+        // through it made the refusal indistinguishable from "there is no
+        // repository here": `is_ok_and` discarded the error, so a repo setting
+        // `core.fsmonitor` / `credential.helper` / `core.worktree` was reported
+        // as **not a git repository** and the message naming the key was lost
+        // (#5494). `first_disallowed_repo_config_key` even documents the
+        // ordering this restores — it expects the caller to have established
+        // that `dir` is a repository before it runs.
+        //
+        // Safe to probe unguarded: `hardened_git` already neutralises every
+        // config key that names a command, so this invocation cannot be turned
+        // into an execution primitive, and the real command below still goes
+        // through the full allow-list check in `run_git_command_in`.
+        let is_worktree = hardened_git(&effective_dir)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .await
+            .is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+            });
+        if !is_worktree {
+            // The probe can fail *because* the repository is misconfigured: a
+            // `core.worktree` redirect git cannot follow, or a config file it
+            // cannot read. Ask the guard before concluding there is nothing
+            // here, so a refusal is reported as a refusal — "Not in a git
+            // repository" is both false and un-actionable for those (#5494).
+            return Ok(
+                match first_disallowed_repo_config_key(&effective_dir).await {
+                    Ok(Some(key)) => {
+                        ToolResult::error(disallowed_config_refusal(&effective_dir, &key))
+                    }
+                    Err(error) => ToolResult::error(error.to_string()),
+                    Ok(None) => ToolResult::error("Not in a git repository"),
+                },
+            );
         }
 
         // Check autonomy level for write operations
         if self.requires_write_access(operation) {
             if !self.security.can_act() {
                 return Ok(ToolResult::error(
-                    "Action blocked: git write operations require higher autonomy level",
+                    "[policy-blocked] Action blocked: git write operations require higher autonomy level",
                 ));
             }
 
             match self.security.autonomy {
                 AutonomyLevel::ReadOnly => {
-                    return Ok(ToolResult::error("Action blocked: read-only mode"));
+                    return Ok(ToolResult::error(
+                        "[policy-blocked] Action blocked: read-only mode",
+                    ));
                 }
                 AutonomyLevel::Supervised | AutonomyLevel::Full => {}
             }
@@ -510,100 +626,23 @@ impl Tool for GitOperationsTool {
 
         // Execute the requested operation
         match operation {
-            "status" => self.git_status(args).await,
-            "diff" => self.git_diff(args).await,
-            "log" => self.git_log(args).await,
-            "branch" => self.git_branch(args).await,
-            "commit" => self.git_commit(args).await,
-            "add" => self.git_add(args).await,
-            "checkout" => self.git_checkout(args).await,
-            "stash" => self.git_stash(args).await,
+            "status" => self.git_status(&effective_dir, args).await,
+            "diff" => self.git_diff(&effective_dir, args).await,
+            "log" => self.git_log(&effective_dir, args).await,
+            "branch" => self.git_branch(&effective_dir, args).await,
+            "commit" => self.git_commit(&effective_dir, args).await,
+            "add" => self.git_add(&effective_dir, args).await,
+            "checkout" => self.git_checkout(&effective_dir, args).await,
+            "stash" => self.git_stash(&effective_dir, args).await,
             _ => Ok(ToolResult::error(format!("Unknown operation: {operation}"))),
         }
     }
 }
 
-fn render_status_markdown(result: &serde_json::Map<String, serde_json::Value>) -> String {
-    let mut out = String::new();
-    if let Some(branch) = result.get("branch").and_then(|v| v.as_str()) {
-        out.push_str(&format!("**branch**: `{branch}`\n"));
-    }
-    let clean = result
-        .get("clean")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if clean {
-        out.push_str("_Working tree clean._\n");
-        return out;
-    }
-    let push_section = |out: &mut String, label: &str, items: Option<&Vec<serde_json::Value>>| {
-        if let Some(items) = items {
-            if !items.is_empty() {
-                out.push_str(&format!("\n**{label}** ({})\n", items.len()));
-                for it in items {
-                    if let (Some(p), Some(s)) = (
-                        it.get("path").and_then(|v| v.as_str()),
-                        it.get("status").and_then(|v| v.as_str()),
-                    ) {
-                        out.push_str(&format!("- `{s}` {p}\n"));
-                    }
-                }
-            }
-        }
-    };
-    push_section(
-        &mut out,
-        "staged",
-        result.get("staged").and_then(|v| v.as_array()),
-    );
-    push_section(
-        &mut out,
-        "unstaged",
-        result.get("unstaged").and_then(|v| v.as_array()),
-    );
-    if let Some(items) = result.get("untracked").and_then(|v| v.as_array()) {
-        if !items.is_empty() {
-            out.push_str(&format!("\n**untracked** ({})\n", items.len()));
-            for it in items {
-                if let Some(p) = it.as_str() {
-                    out.push_str(&format!("- {p}\n"));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn render_log_markdown(commits: &[serde_json::Value]) -> String {
-    if commits.is_empty() {
-        return "_No commits._".to_string();
-    }
-    let mut out = format!("# Commits ({})\n", commits.len());
-    for c in commits {
-        let hash = c.get("hash").and_then(|v| v.as_str()).unwrap_or("");
-        let short = hash.get(..hash.len().min(8)).unwrap_or(hash);
-        let author = c.get("author").and_then(|v| v.as_str()).unwrap_or("");
-        let date = c.get("date").and_then(|v| v.as_str()).unwrap_or("");
-        let msg = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!("- `{short}` {msg} _(by {author}, {date})_\n"));
-    }
-    out
-}
-
-fn render_branch_markdown(current: &str, branches: &[serde_json::Value]) -> String {
-    let mut out = format!("**current**: `{current}`\n\n## Branches\n");
-    for b in branches {
-        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let cur = b.get("current").and_then(|v| v.as_bool()).unwrap_or(false);
-        if cur {
-            out.push_str(&format!("- **{name}** ← current\n"));
-        } else {
-            out.push_str(&format!("- {name}\n"));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 #[path = "git_operations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "git_operations_config_tests.rs"]
+mod config_tests;

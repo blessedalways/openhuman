@@ -48,27 +48,30 @@ export const oauthProviderConfigs: OAuthProviderConfig[] = [
     id: 'google',
     name: 'Google',
     icon: GoogleIcon,
-    color: 'bg-white border border-gray-200',
-    hoverColor: 'hover:bg-gray-50 hover:border-gray-300',
-    textColor: 'text-gray-900',
+    color: 'bg-surface border border-line dark:border-line-strong',
+    hoverColor:
+      'hover:bg-surface-muted hover:border-line-strong dark:hover:bg-surface-muted dark:hover:border-neutral-600',
+    textColor: 'text-content dark:text-content',
     showOnWelcome: true,
   },
   {
     id: 'github',
     name: 'GitHub',
     icon: GitHubIcon,
-    color: 'bg-white border border-gray-200',
-    hoverColor: 'hover:bg-gray-50 hover:border-gray-300',
-    textColor: 'text-gray-900',
+    color: 'bg-surface border border-line dark:border-line-strong',
+    hoverColor:
+      'hover:bg-surface-muted hover:border-line-strong dark:hover:bg-surface-muted dark:hover:border-neutral-600',
+    textColor: 'text-content dark:text-content',
     showOnWelcome: true,
   },
   {
     id: 'twitter',
     name: 'Twitter',
     icon: TwitterIcon,
-    color: 'bg-white border border-gray-200',
-    hoverColor: 'hover:bg-gray-50 hover:border-gray-300',
-    textColor: 'text-gray-900',
+    color: 'bg-surface border border-line dark:border-line-strong',
+    hoverColor:
+      'hover:bg-surface-muted hover:border-line-strong dark:hover:bg-surface-muted dark:hover:border-neutral-600',
+    textColor: 'text-content dark:text-content',
     showOnWelcome: true,
   },
   {
@@ -81,7 +84,3 @@ export const oauthProviderConfigs: OAuthProviderConfig[] = [
     showOnWelcome: false,
   },
 ];
-
-export const getProviderConfig = (provider: string): OAuthProviderConfig | undefined => {
-  return oauthProviderConfigs.find(config => config.id === provider);
-};

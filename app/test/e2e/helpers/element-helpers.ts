@@ -148,7 +148,7 @@ export async function waitForText(
  * - Mac2: XCUIElementTypeButton XPath
  * - tauri-driver: CSS button / [role="button"] / a selector
  */
-export async function waitForButton(
+async function waitForButton(
   text: string,
   timeout: number = 15_000
 ): Promise<ChainablePromiseElement> {
@@ -199,6 +199,33 @@ export async function textExists(text: string): Promise<boolean> {
 
     const el = await browser.$(xpathContainsText(text));
     return await el.isExisting();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Non-blocking check: is matching text rendered and visible right now?
+ *
+ * Unlike {@link textExists}, this deliberately ignores matching text retained
+ * inside a collapsed processing transcript.
+ */
+export async function visibleTextExists(text: string): Promise<boolean> {
+  try {
+    if (isTauriDriver()) {
+      const literal = xpathStringLiteral(text);
+      const matches = await browser.$$(`//*[contains(text(),${literal})]`);
+      for (const match of matches) {
+        if (await match.isDisplayed()) return true;
+      }
+      return false;
+    }
+
+    const matches = await browser.$$(xpathContainsText(text));
+    for (const match of matches) {
+      if (await match.isDisplayed()) return true;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -302,34 +329,108 @@ export async function clickNativeButton(text: string, timeout: number = 15_000):
 }
 
 /**
- * Wait for a toggle/switch element and click it.
+ * Click an element matched by a selector.
  *
- * - Mac2: XCUIElementTypeSwitch / XCUIElementTypeCheckBox
- * - tauri-driver: [role="switch"] / input[type="checkbox"]
+ * - tauri-driver: CSS or XPath selector
+ * - Mac2: XPath selector only
  */
-export async function clickToggle(_timeout: number = 15_000): Promise<void> {
-  if (isTauriDriver()) {
-    const selectors = ['[role="switch"]', 'input[type="checkbox"]', 'button[aria-checked]'];
-    for (const sel of selectors) {
-      const el = await browser.$(sel);
-      if (await el.isExisting()) {
-        await clickAtElement(el);
-        return;
-      }
-    }
-    throw new Error('Toggle element not found');
+export async function clickSelector(
+  selector: string,
+  timeout: number = 15_000
+): Promise<ChainablePromiseElement> {
+  const isXPath = selector.startsWith('//');
+  if (!isXPath && !isTauriDriver()) {
+    throw new Error(`CSS selector clicks are not supported on this backend: ${selector}`);
   }
 
-  // Mac2 path
-  const macSelectors = ['//XCUIElementTypeSwitch', '//XCUIElementTypeCheckBox'];
-  for (const sel of macSelectors) {
-    const el = await browser.$(sel);
-    if (await el.isExisting()) {
-      await clickAtElement(el);
-      return;
-    }
+  const el = await browser.$(selector);
+  await el.waitForExist({
+    timeout,
+    timeoutMsg: `Selector "${selector}" not found within ${timeout}ms`,
+  });
+  await clickAtElement(el);
+  return el;
+}
+
+function testIdSelector(testId: string): string {
+  return `[data-testid="${testId}"]`;
+}
+
+/**
+ * Wait for an element by stable `data-testid`.
+ *
+ * This is currently supported on tauri-driver, where WDIO can query the DOM.
+ * Mac2 exposes the accessibility tree instead, so specs that must run there
+ * should keep using text/accessibility helpers unless the app mirrors the
+ * test id into an accessible label.
+ */
+export async function waitForTestId(
+  testId: string,
+  timeout: number = 15_000
+): Promise<ChainablePromiseElement> {
+  if (!isTauriDriver()) {
+    throw new Error(`waitForTestId is only supported on tauri-driver: ${testId}`);
   }
-  throw new Error('Toggle element not found');
+
+  const selector = testIdSelector(testId);
+  const el = await browser.$(selector);
+  await el.waitForExist({
+    timeout,
+    timeoutMsg: `data-testid="${testId}" not found within ${timeout}ms`,
+  });
+  return el;
+}
+
+/**
+ * Wait for an element by stable `data-testid`, then click it.
+ */
+export async function clickTestId(
+  testId: string,
+  timeout: number = 15_000
+): Promise<ChainablePromiseElement> {
+  const el = await waitForTestId(testId, timeout);
+  await clickAtElement(el);
+  return el;
+}
+
+/**
+ * Click a label whose visible text contains `text`.
+ *
+ * - tauri-driver: XPath against the DOM
+ * - Mac2: XPath against accessibility labels/titles
+ */
+export async function clickLabelContaining(
+  text: string,
+  timeout: number = 15_000
+): Promise<ChainablePromiseElement> {
+  const literal = xpathStringLiteral(text);
+  const selector = isTauriDriver()
+    ? `//label[contains(normalize-space(.), ${literal})]`
+    : `//XCUIElementTypeStaticText[contains(@label, ${literal}) or contains(@value, ${literal}) or contains(@title, ${literal})]`;
+  return clickSelector(selector, timeout);
+}
+
+/**
+ * Set a select element's value by `data-testid` and dispatch a change event.
+ *
+ * This is currently only supported on tauri-driver because the Linux harness
+ * exposes the DOM directly.
+ */
+export async function setSelectValueByTestId(testId: string, value: string): Promise<boolean> {
+  if (!isTauriDriver()) {
+    throw new Error(`setSelectValueByTestId is only supported on tauri-driver: ${testId}`);
+  }
+
+  return await browser.execute(
+    ({ id, next }) => {
+      const el = document.querySelector<HTMLSelectElement>(`[data-testid="${id}"]`);
+      if (!el) return false;
+      el.value = next;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    },
+    { id: testId, next: value }
+  );
 }
 
 /**

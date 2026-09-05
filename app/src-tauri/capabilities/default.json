@@ -20,12 +20,21 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "opener:default",
+    "opener:allow-reveal-item-in-dir",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "obsidian://open*" }]
+      "allow": [
+        { "url": "obsidian://open*" },
+        { "url": "https://ollama.com/*" }
+      ]
     },
     "updater:default",
     "allow-core-process",
-    "allow-app-update"
+    "allow-workspace-files",
+    "allow-artifact-download",
+    "allow-artifact-save",
+    "allow-directory-picker",
+    "allow-app-update",
+    "allow-loopback-oauth"
   ]
 }

@@ -5,7 +5,9 @@
  * activates the corresponding entity in the Navigator, filtering the
  * result list to chunks tagged with that entity.
  */
+import { useT } from '../../lib/i18n/I18nContext';
 import type { EntityRef } from '../../utils/tauriCommands';
+import Button from '../ui/Button';
 
 interface MemoryChunkMentionedProps {
   entities: EntityRef[];
@@ -13,24 +15,30 @@ interface MemoryChunkMentionedProps {
 }
 
 export function MemoryChunkMentioned({ entities, onSelectEntity }: MemoryChunkMentionedProps) {
+  const { t } = useT();
   if (entities.length === 0) return null;
 
   return (
     <section data-testid="memory-chunk-mentioned">
-      <h3 className="mw-mentioned-heading">m e n t i o n e d</h3>
+      <h3 className="mw-mentioned-heading">{t('intelligence.memoryChunk.mentioned.heading')}</h3>
       <div className="mw-mentioned-table">
         {entities.map(ent => (
-          <button
-            type="button"
+          <Button
+            variant="tertiary"
             key={ent.entity_id}
-            className="mw-mentioned-row"
+            className="mw-mentioned-row h-auto w-full justify-start rounded-none px-0"
             onClick={() => onSelectEntity(ent)}>
             <span className="mw-mentioned-kind">{ent.kind}</span>
             <span className="mw-mentioned-surface">{ent.surface}</span>
             <span className="mw-mentioned-count">
-              {ent.count} chunk{ent.count === 1 ? '' : 's'}
+              {ent.count === 1
+                ? t('intelligence.memoryChunk.mentioned.chunkOne')
+                : t('intelligence.memoryChunk.mentioned.chunkOther').replace(
+                    '{count}',
+                    String(ent.count)
+                  )}
             </span>
-          </button>
+          </Button>
         ))}
       </div>
     </section>

@@ -1,82 +1,76 @@
-# Memory
+# memory
 
-Persistent knowledge layer. Owns the unified store (SQLite + FTS5 + vector embeddings + graph relations), document ingestion pipelines, namespace + KV operations, conversation history, and retrieval scoring. Does NOT own raw provider embedding APIs (`local_ai/`), agent prompt assembly (`agent/memory_loader.rs`), or per-channel ingestion adapters beyond the bundled Slack importer.
+Host layer over the memory stack. The substance of the memory subsystem was
+extracted into [`tinymemory-core`](https://github.com/tinyhumansai/tinymemory): the
+SQLite/vector store, the markdown summary tree, the provider sync pipelines,
+ingestion, recall/query/search, the ingest queue, conversations, people,
+goals and the tool-memory rules. That crate names no OpenHuman type — see
+[its README](https://github.com/tinyhumansai/tinymemory#readme) for the extracted
+side of this split.
 
-## Architecture
+Links to the extracted crate point at GitHub rather than into
+`vendor/tinymemory/`: CI checks out this repository without submodule
+contents, so a relative link into that directory resolves to nothing on the
+runner and fails the link check.
 
-The module is organised in concentric layers — the contract on the
-inside, the persistent backend around it, the ingestion + retrieval
-pipelines on top, and the per-domain glue at the edge:
+What stays here, per that split:
 
-```text
-                      ┌──────────────────────────────────────┐
-                      │  conversations/   slack_ingestion/   │  per-domain plumbing
-                      ├──────────────────────────────────────┤
-                      │  tree/   (bucket-seal LLD pipeline)  │  new retrieval architecture
-                      ├──────────────────────────────────────┤
-                      │  ingestion/        (extract chunks)  │  document ingestion
-                      ├──────────────────────────────────────┤
-                      │  store/      (UnifiedMemory backend) │  SQLite + FTS5 + vectors
-                      ├──────────────────────────────────────┤
-                      │  traits.rs           (Memory trait)  │  contract
-                      └──────────────────────────────────────┘
-```
+- **RPC surface** — [`schemas/`](schemas/) + [`schema/`](schema/), the
+  memory\_\* controller registrations, and [`read_rpc/`](read_rpc/) for reads.
+- **Agent tools** — [`tools/`](tools/), [`agent/`](agent/) (the memory agent
+  + prompt), and the consolidated `memory_query` agent tool in
+  [`query/`](query/) (it came back from the extracted crate because the
+  engine crate cannot name the `Tool` trait).
+- **Guard** — [`guard/`](guard/), the taint/scope/budget policy gate over
+  every provider call.
+- **Driver binding** — [`driver/`](driver/), which provider backs a
+  workspace.
+- **Ops** — [`ops/`](ops/), RPC handlers that delegate into the core.
+- **Seam impls** — [`host.rs`](host.rs) /
+  [`host_impls.rs`](host_impls.rs) — `install_memory_event_sink` and
+  `MemoryHostConfig for Config`.
 
-- **`traits.rs`** — `Memory`, `MemoryEntry`, `MemoryCategory`,
-  `RecallOpts`. The backend-agnostic contract every store implements.
-- **`store/`** — `UnifiedMemory` is the production backend (SQLite
-  with FTS5 for keyword search, vector tables for embeddings, and
-  graph tables for entity/relation triples) plus the `MemoryClient`
-  handle used by the rest of the process.
-- **`ingestion/`** — chunking + extraction pipeline (entities,
-  relations, embeddings) and the background `IngestionQueue` worker.
-- **`tree/`** — the new bucket-seal retrieval architecture from
-  `docs/MEMORY_ARCHITECTURE_LLD.md`: `canonicalize` (normalise
-  inputs), `chunker` and `content_store` (durable chunks),
-  `score`/`retrieval` (ranking surface),
-  `tree_source`/`tree_topic`/`tree_global` (the three concentric
-  trees the LLD calls for), and `jobs` (background seals/summaries).
-- **`conversations/`** — workspace-backed JSONL chat thread/message
-  history. See `conversations/README.md`.
-- **`slack_ingestion/`** — Slack provider plumbing (bucketer +
-  ingest wrapper + RPC). See `slack_ingestion/README.md`.
+Everything else in this module is a **re-export** of the extracted crate
+(`pub use tinymemory_core::{chat, global, ingest_pipeline, ingestion,
+preferences, remember, rpc_models, store, sync_events, traits, util, …}` in
+[`mod.rs`](mod.rs)), so the ~550 `crate::openhuman::memory::…` paths
+elsewhere in this crate keep resolving unchanged. Prefer
+`tinymemory_core::…` in new code.
 
-The legacy memory store (`store/` + `ingestion/`) and the new
-`tree/` pipeline coexist for now — `tree/` is replacing the older
-retrieval surface incrementally and both must remain wired into RPC
-until the migration completes.
+## Domains that kept their RPC surface here
 
-## Public surface
+Mostly extracted, but each is a thin wrapper (`pub use
+tinymemory_core::<domain>::*;` plus the handler/schema modules that name
+`RpcOutcome` and `ControllerSchema`):
 
-- `pub trait Memory` / `pub struct MemoryEntry` / `pub enum MemoryCategory` / `pub struct RecallOpts` — `traits.rs:11-100` — backend contract for any memory store.
-- `pub struct UnifiedMemory` — `store/unified/` (re-exported `store/mod.rs:40`) — primary SQLite + FTS5 + vector implementation.
-- `pub struct MemoryClient` / `pub struct MemoryClientRef` / `pub enum MemoryState` — `store/client.rs` — async client handle used by RPC handlers.
-- `pub fn create_memory` / `pub fn create_memory_with_storage` / `pub fn create_memory_with_storage_and_routes` / `pub fn create_memory_for_migration` — `store/factories.rs` — bootstrap a memory instance.
-- `pub struct MemoryIngestionRequest` / `pub struct MemoryIngestionResult` / `pub struct MemoryIngestionConfig` / `pub enum ExtractionMode` / `pub struct ExtractedEntity` / `pub struct ExtractedRelation` / `const DEFAULT_MEMORY_EXTRACTION_MODEL` — `ingestion.rs` (re-exported `mod.rs:22`).
-- `pub struct IngestionQueue` / `pub struct IngestionJob` — `ingestion_queue.rs` — async background ingestion worker.
-- `pub struct NamespaceDocumentInput` / `pub struct NamespaceMemoryHit` / `pub struct NamespaceQueryResult` / `pub struct NamespaceRetrievalContext` / `pub struct RetrievalScoreBreakdown` / `pub enum MemoryItemKind` — `store/types.rs`.
-- RPC `memory.{init, list_documents, list_namespaces, delete_document, query_namespace, recall_context, recall_memories, list_files, read_file, write_file, namespace_list, doc_put, doc_ingest, doc_list, doc_delete, context_query, context_recall, kv_set, kv_get, kv_delete, kv_list_namespace, graph_upsert, graph_query, clear_namespace}` — `schemas.rs:29-55`.
-- RPC tree `memory.tree.*` and retrieval — `tree/` (re-exported via `all_memory_tree_*` / `all_retrieval_*`).
-- RPC slack ingestion — `slack_ingestion/` (re-exported via `all_slack_ingestion_*`).
+| Module                          | Role                                                     |
+| -------------------------------- | --------------------------------------------------------- |
+| [`conversations/`](conversations/) | Conversation-scoped memory RPC.                          |
+| [`goals/`](goals/)               | Goal tracking RPC.                                       |
+| [`people/`](people/)             | People/contacts RPC.                                     |
+| [`sources/`](sources/)           | Source-registration RPC.                                 |
+| [`sync/`](sync/)                 | Composio + workspace + MCP sync pipeline RPC.            |
+| [`tool_memory/`](tool_memory/)   | Tool-scoped rules + agent read/write tools.               |
+| [`tree/`](tree/)                 | Tree walk/retrieval RPC.                                  |
 
-## Calls into
+## What lives in the extracted crate (for reference)
 
-- `src/openhuman/local_ai/` — embedding model, sentiment scoring, extraction LLM.
-- `src/openhuman/embeddings/` — vector backend selection.
-- `src/openhuman/config/` — memory backend choice + filesystem paths.
-- `src/openhuman/encryption/` — at-rest secrets for KV namespaces.
-- `src/core/event_bus/` — emits `DomainEvent::Memory(*)` on ingestion / mutation.
+See [`vendor/tinymemory/crates/tinymemory-core/src/`](https://github.com/tinyhumansai/tinymemory/tree/1d6b997874a06600ba0c4922708b5613497c9ffe/crates/tinymemory-core/src) for
+the storage primitives (`store/`), ingestion queue (`ingestion/`), sync
+lifecycle types (`sync_events.rs`), remember classification (`remember.rs`),
+ingest orchestration (`ingest_pipeline.rs`), the `Memory`/`MemoryEntry`/etc.
+traits (`traits.rs`), preferences (`preferences.rs`), and shared RPC shapes
+(`rpc_models.rs`). Source → canonical markdown (chat / email / document)
+lives in [`tinycortex::memory::ingest::canonicalize`](https://github.com/tinyhumansai/tinycortex/tree/main/src/memory/ingest/canonicalize),
+owned by TinyCortex and used at ingest time.
 
-## Called by
+## Layer rules
 
-- `src/openhuman/agent/` (`memory_loader.rs`, `harness/memory_context.rs`, `harness/archivist*.rs`, `harness/fork_context.rs`) — context injection and episodic indexing.
-- `src/openhuman/learning/{reflection,tool_tracker,user_profile,prompt_sections}.rs` — long-term insight storage.
-- `src/openhuman/screen_intelligence/{helpers,tests}.rs` — recall surfaces for visual context.
-- `src/openhuman/autocomplete/history.rs` — query-history recall.
-- `src/openhuman/tools/ops.rs` and `tools/impl/system/tool_stats.rs` — memory-backed tool stats.
-- `src/core/all.rs` — registers `all_memory_*` controllers.
-
-## Tests
-
-- Unit: `ops_tests.rs`, `schemas_tests.rs`, `rpc_models_tests.rs`, `ingestion_tests.rs`, plus `*_tests.rs` files inside `store/`, `tree/`, `conversations/`, `slack_ingestion/`.
-- Integration: `tests/autocomplete_memory_e2e.rs`, `tests/memory_graph_sync_e2e.rs`.
+- **No storage in this module.** All persistence goes through
+  `tinymemory_core::store::*`. If you're tempted to open a SQLite
+  connection here, the connection helper belongs one layer down, in the
+  extracted crate.
+- **RPC + tools + seam wiring live here.** Domain logic belongs in
+  `tinymemory-core`; this module surfaces it over `/rpc` and to agents.
+- **Surface high-level tool calls** that route to the right submodule;
+  don't expose internals at the call site.

@@ -2,10 +2,15 @@ import { IS_DEV } from '../utils/config';
 
 export type AccountProvider =
   | 'whatsapp'
+  | 'wechat'
   | 'telegram'
   | 'linkedin'
   | 'slack'
   | 'discord'
+  | 'gmail'
+  | 'outlook'
+  | 'instagram'
+  | 'twitter'
   | 'google-meet'
   | 'zoom'
   | 'browserscan';
@@ -52,6 +57,14 @@ export interface AccountsState {
   messages: Record<string, IngestedMessage[]>;
   unread: Record<string, number>;
   logs: Record<string, AccountLogEntry[]>;
+  /**
+   * True while a rail overlay (add-account modal or the right-click context
+   * menu) is open. The app rail now lives in the persistent sidebar, while the
+   * active provider webview is composited by the chat page — so the rail signals
+   * overlay state here and the chat page hides/restores the native webview
+   * accordingly (DOM z-index can't paint React overlays above a CEF webview).
+   * Transient: not in the persist whitelist.
+   */
 }
 
 export interface AccountLogEntry {
@@ -73,6 +86,12 @@ const BASE_PROVIDERS: ProviderDescriptor[] = [
     label: 'WhatsApp Web',
     description: 'Open web.whatsapp.com inside the app and stream chat updates.',
     serviceUrl: 'https://web.whatsapp.com/',
+  },
+  {
+    id: 'wechat',
+    label: 'WeChat Web',
+    description: 'Open WeChat in-app for QR sign-in and desktop chat access.',
+    serviceUrl: 'https://web.wechat.com/',
   },
   {
     id: 'telegram',
@@ -99,17 +118,33 @@ const BASE_PROVIDERS: ProviderDescriptor[] = [
     serviceUrl: 'https://discord.com/channels/@me',
   },
   {
-    id: 'google-meet',
-    label: 'Google Meet',
-    description: 'Join Google Meet calls and capture live captions.',
-    serviceUrl: 'https://meet.google.com/',
+    id: 'gmail',
+    label: 'Gmail',
+    description: 'Your Gmail inbox, embedded and observed.',
+    serviceUrl: 'https://mail.google.com/mail/u/0/',
   },
   {
-    id: 'zoom',
-    label: 'Zoom',
-    description: 'Zoom web client — log in and join meetings from inside the app.',
-    serviceUrl: 'https://zoom.us/',
+    id: 'outlook',
+    label: 'Outlook',
+    description: 'Outlook / Microsoft 365 mail, embedded in-app.',
+    serviceUrl: 'https://outlook.live.com/mail/',
   },
+  {
+    id: 'instagram',
+    label: 'Instagram',
+    description: 'Instagram direct messages — DMs and conversations.',
+    serviceUrl: 'https://www.instagram.com/direct/inbox/',
+  },
+  {
+    id: 'twitter',
+    label: 'X (Twitter)',
+    description: 'X / Twitter direct messages.',
+    serviceUrl: 'https://x.com/messages/',
+  },
+  // Google Meet + Zoom are hidden from the picker for now — usage is low
+  // and the integrations need more polish before re-surfacing them. Their
+  // AccountProvider ids stay in the type union so existing accounts keep
+  // rendering correctly.
 ];
 
 const DEV_PROVIDERS: ProviderDescriptor[] = [

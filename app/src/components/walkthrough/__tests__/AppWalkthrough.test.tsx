@@ -9,7 +9,7 @@
  *  - AppWalkthrough does not render when already completed
  *  - AppWalkthrough restarts when walkthrough:restart event fires
  *  - Completing/skipping the tour calls markWalkthroughComplete (localStorage set)
- *  - createWalkthroughSteps: 9 steps, cross-page steps have before functions
+ *  - createWalkthroughSteps: current targets, cross-page steps have before functions
  *  - waitForTarget: resolves when element added, rejects on timeout
  *  - WalkthroughTooltip renders step title, content, and navigation buttons
  */
@@ -504,26 +504,23 @@ describe('WalkthroughTooltip', () => {
   });
 
   it('renders progress bar', () => {
-    const { container } = render(
-      <WalkthroughTooltip {...makeTooltipProps({ index: 2, size: 9 })} />
-    );
+    render(<WalkthroughTooltip {...makeTooltipProps({ index: 2, size: 9 })} />);
 
-    // Gradient progress bar fills based on step progress (3/9 ≈ 33.33%)
-    const bar = container.querySelector('div.bg-gradient-to-r');
-    expect(bar).not.toBeNull();
-    // width rounds to ~33.33% for step 3 of 9
-    expect(bar?.getAttribute('style')).toMatch(/width:\s*33\.3/);
+    // Query the progress bar by its stable test id rather than a presentational
+    // Tailwind class (plan.md §3). The real signal is the computed fill width:
+    // step 3 of 9 ≈ 33.33%.
+    const bar = screen.getByTestId('walkthrough-progress-bar');
+    expect(bar.getAttribute('style')).toMatch(/width:\s*33\.3/);
   });
 });
 
 // ── createWalkthroughSteps tests ──────────────────────────────────────────
 
 describe('createWalkthroughSteps', () => {
-  it('returns 10 steps', () => {
-    const navigate = vi.fn();
-    const steps = createWalkthroughSteps(navigate);
-    expect(steps).toHaveLength(10);
-  });
+  // NOTE: the brittle `returns 13 steps` magic-count test was removed
+  // (plan.md §3) — it broke on any intentional add/remove of a walkthrough
+  // step. The first-/last-step target tests below carry the real ordering
+  // signal, and `all steps have a title and content` guards each entry.
 
   it('first step targets home-card', () => {
     const navigate = vi.fn();
@@ -551,19 +548,21 @@ describe('createWalkthroughSteps', () => {
     const navigate = vi.fn();
     const steps = createWalkthroughSteps(navigate);
 
-    // Steps: 2=chat, 3=integrations, 4=channels, 5=intelligence, 6=settings, 7=home-return, 9=chat-welcome
-    const crossPageIndices = [2, 3, 4, 5, 6, 7, 9];
+    // Steps: 2=chat, 3=integrations, 4=channels, 5=settings, 6=chat-tab, 9=chat-welcome.
+    // The tail has shifted down twice: once when the Human nav step was dropped
+    // (Human has no nav row — the chat composer's idle button opens it), and
+    // again when the Feedback step went with the sidebar icon it pointed at.
+    const crossPageIndices = [2, 3, 4, 5, 6, 9];
     for (const idx of crossPageIndices) {
       expect(typeof steps[idx].before, `step[${idx}] should have a before fn`).toBe('function');
     }
   });
 
-  it('home-only steps do not have before functions', () => {
+  it('same-shell steps do not have before functions', () => {
     const navigate = vi.fn();
     const steps = createWalkthroughSteps(navigate);
 
-    // Steps: 0=home-card, 1=home-cta, 8=tab-notifications (step 9 now has a before hook)
-    const homeOnlyIndices = [0, 1, 8];
+    const homeOnlyIndices = [0, 1, 7, 8];
     for (const idx of homeOnlyIndices) {
       expect(steps[idx].before, `step[${idx}] should not have a before fn`).toBeUndefined();
     }
@@ -571,11 +570,10 @@ describe('createWalkthroughSteps', () => {
 
   it.each([
     { idx: 2, route: '/chat', target: 'chat-agent-panel' },
-    { idx: 3, route: '/skills', target: 'skills-grid' },
+    { idx: 3, route: '/connections', target: 'skills-grid' },
     { idx: 4, route: null, target: 'skills-channels' },
-    { idx: 5, route: '/intelligence', target: 'intelligence-header' },
-    { idx: 6, route: '/settings', target: 'settings-menu' },
-    { idx: 7, route: '/home', target: 'tab-chat' },
+    { idx: 5, route: '/settings', target: 'settings-menu' },
+    { idx: 6, route: '/chat', target: 'tab-chat' },
     { idx: 9, route: '/chat', target: 'chat-agent-panel' },
   ])('before hook for step $idx calls navigate("$route")', async ({ idx, route, target }) => {
     const navigate = vi.fn();
@@ -593,6 +591,34 @@ describe('createWalkthroughSteps', () => {
     } finally {
       document.body.removeChild(el);
     }
+  });
+
+  it('targets only current walkthrough anchors', () => {
+    const navigate = vi.fn();
+    const steps = createWalkthroughSteps(navigate);
+    const targets = steps.map(step => step.target);
+
+    expect(targets).toEqual([
+      '[data-walkthrough="home-card"]',
+      '[data-walkthrough="home-cta"]',
+      '[data-walkthrough="chat-agent-panel"]',
+      '[data-walkthrough="skills-grid"]',
+      '[data-walkthrough="skills-channels"]',
+      '[data-walkthrough="settings-menu"]',
+      '[data-walkthrough="tab-chat"]',
+      '[data-walkthrough="tab-brain"]',
+      '[data-walkthrough="tab-connections"]',
+      '[data-walkthrough="chat-agent-panel"]',
+    ]);
+    expect(targets).not.toContain('[data-walkthrough="tab-activity"]');
+    // The sidebar header's Feedback icon became the command-palette trigger and
+    // the board moved to `/settings/feedback`, so this anchor is gone from the
+    // DOM; a step still pointing at it would stall the tour.
+    expect(targets).not.toContain('[data-walkthrough="tab-feedback"]');
+    // Human has no nav row — the chat composer's idle button opens it — so a
+    // tour step pointing at one would stall on a target that never mounts.
+    expect(targets).not.toContain('[data-walkthrough="tab-human"]');
+    expect(targets).not.toContain('[data-walkthrough="intelligence-header"]');
   });
 
   it('final step before hook creates thread and seeds welcome message', async () => {

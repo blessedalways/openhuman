@@ -8,12 +8,13 @@
  * names, categories, descriptions, and logos for rendering.
  *
  * Source of truth for the managed-auth list:
- * https://docs.composio.dev/toolkits/managed-auth (118 toolkits as of
- * May 1, 2026).
+ * https://docs.composio.dev/toolkits/managed-auth plus OpenHuman's
+ * compatibility aliases (119 toolkits as of May 21, 2026).
  */
 import { type ReactNode, useState } from 'react';
 
 import { canonicalizeComposioToolkitSlug } from '../../lib/composio/toolkitSlug';
+import type { ComposioToolkitCatalogEntry } from '../../lib/composio/types';
 import type { SkillCategory } from '../skills/skillCategories';
 
 export interface ComposioToolkitMeta {
@@ -100,6 +101,7 @@ const MANAGED_COMPOSIO_TOOLKITS: readonly ManagedToolkitEntry[] = Object.freeze(
   { slug: 'intercom', name: 'Intercom' },
   { slug: 'jira', name: 'Jira' },
   { slug: 'kit', name: 'Kit' },
+  { slug: 'larksuite', name: 'Lark / Feishu' },
   { slug: 'linear', name: 'Linear' },
   { slug: 'linkedin', name: 'LinkedIn' },
   { slug: 'linkhut', name: 'Linkhut' },
@@ -163,7 +165,16 @@ const MANAGED_TOOLKIT_NAME_BY_SLUG = new Map(
   MANAGED_COMPOSIO_TOOLKITS.map(entry => [entry.slug, entry.name])
 );
 
-const CHAT_KEYWORDS = ['discord', 'slack', 'teams', 'webex', 'whatsapp', 'dialpad'];
+const CHAT_KEYWORDS = [
+  'discord',
+  'slack',
+  'teams',
+  'webex',
+  'whatsapp',
+  'dialpad',
+  'lark',
+  'feishu',
+];
 const SOCIAL_KEYWORDS = [
   'facebook',
   'instagram',
@@ -227,7 +238,7 @@ const PLATFORM_KEYWORDS = [
 
 function GenericIntegrationIcon() {
   return (
-    <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-stone-100 text-stone-600 shadow-sm ring-1 ring-black/5">
+    <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-surface-subtle text-content-secondary shadow-xs ring-1 ring-surface-overlay/5">
       <svg className="h-[18px] w-[18px]" viewBox="0 0 24 24" aria-hidden="true" fill="none">
         <path
           d="M8 8h8v8H8zM5 12h3m8 0h3M12 5v3m0 8v3"
@@ -241,16 +252,25 @@ function GenericIntegrationIcon() {
   );
 }
 
-function ComposioLogoBadge({ slug, name }: { slug: string; name: string }) {
+function ComposioLogoBadge({
+  slug,
+  name,
+  logoUrl: logoOverride,
+}: {
+  slug: string;
+  name: string;
+  /** Prefer the dynamic-catalog logo when present; fall back to the CDN URL. */
+  logoUrl?: string;
+}) {
   const [failed, setFailed] = useState(false);
-  const logoUrl = composioLogoUrl(slug);
+  const logoUrl = logoOverride || composioLogoUrl(slug);
 
   if (failed) {
     return <GenericIntegrationIcon />;
   }
 
   return (
-    <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-black/5">
+    <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-xl bg-surface shadow-xs ring-1 ring-surface-overlay/5">
       <img
         src={logoUrl}
         alt={`${name} logo`}
@@ -262,7 +282,8 @@ function ComposioLogoBadge({ slug, name }: { slug: string; name: string }) {
   );
 }
 
-function composioLogoUrl(slug: string): string {
+/** Composio-hosted logo URL for a given toolkit slug. */
+export function composioLogoUrl(slug: string): string {
   return `https://logos.composio.dev/api/${slug}`;
 }
 
@@ -273,6 +294,61 @@ function guessCategory(slug: string, name: string): SkillCategory {
   if (PRODUCTIVITY_KEYWORDS.some(keyword => key.includes(keyword))) return 'Productivity';
   if (PLATFORM_KEYWORDS.some(keyword => key.includes(keyword))) return 'Platform';
   return 'Tools & Automation';
+}
+
+/**
+ * Map Composio's catalog category strings onto our fixed `SkillCategory`
+ * buckets. Composio category names are free-form (e.g. `"productivity"`,
+ * `"crm"`, `"developer-tools"`), so we match on substrings and return the
+ * first hit. Returns `undefined` when nothing matches so the caller can
+ * fall back to the slug/name keyword heuristic.
+ *
+ * ## This function has a twin. Edit both.
+ *
+ * The other copy is `mapComposioCategory` in
+ * `frontend/src/lib/composio-catalog.ts` in **tinyhumansai/opencompany**,
+ * where the operator console buckets the same Composio catalog off the same
+ * free-form strings (opencompany#600). Nothing mechanical detects a
+ * divergence: edit one and both consoles keep looking correct in isolation
+ * while bucketing the same provider differently.
+ *
+ * The branch **order** is as load-bearing as the substrings — both copies
+ * return on the first hit, so an entry carrying several categories depends on
+ * Chat → Social → Productivity → Platform. Reordering here alone is the
+ * subtlest way the two can drift.
+ *
+ * There is no shared package to hoist this into, so the guard is social and
+ * deliberately cheap: this notice, the matching one on the OpenCompany side,
+ * and that repository's `mapComposioCategory keeps the buckets its OpenHuman
+ * twin produces` test, which pins the table case-by-case.
+ */
+function mapComposioCategory(categories?: string[]): SkillCategory | undefined {
+  if (!categories || categories.length === 0) return undefined;
+  const haystack = categories.join(' ').toLowerCase();
+  const has = (...needles: string[]) => needles.some(n => haystack.includes(n));
+
+  if (has('chat', 'messaging', 'communication')) return 'Chat';
+  if (has('social', 'marketing')) return 'Social';
+  if (
+    has(
+      'productivity',
+      'document',
+      'calendar',
+      'scheduling',
+      'project management',
+      'project-management',
+      'note',
+      'task',
+      'storage',
+      'email'
+    )
+  ) {
+    return 'Productivity';
+  }
+  if (has('crm', 'developer', 'devtool', 'analytics', 'payment', 'finance', 'database', 'cloud')) {
+    return 'Platform';
+  }
+  return undefined;
 }
 
 function defaultDescription(name: string, category: SkillCategory): string {
@@ -322,17 +398,42 @@ export const KNOWN_COMPOSIO_TOOLKITS = Object.freeze(
   MANAGED_COMPOSIO_TOOLKITS.map(entry => entry.slug)
 );
 
-export function composioToolkitMeta(slug: string): ComposioToolkitMeta {
+function descriptionForToolkit(key: string, name: string, category: SkillCategory): string {
+  if (key === 'instagram') {
+    return (
+      'Connect Instagram Business or Creator accounts (personal accounts are not supported). ' +
+      'If Meta shows “Too Many Requests” (HTTP 429), wait a few minutes before retrying.'
+    );
+  }
+  return defaultDescription(name, category);
+}
+
+/**
+ * Build the render model for a toolkit card/modal.
+ *
+ * When a live-catalog `entry` is supplied (backend dynamic catalog — see
+ * `COMPOSIO_DYNAMIC_CATALOG_PLAN.md`) its name/description/category/logo
+ * win, so the UI reflects what Composio actually offers. Every field
+ * degrades gracefully to the local hardcoded derivation when the entry is
+ * absent (older core/backend) or a given field is empty.
+ */
+export function composioToolkitMeta(
+  slug: string,
+  entry?: ComposioToolkitCatalogEntry
+): ComposioToolkitMeta {
   const key = canonicalizeComposioToolkitSlug(slug);
-  const name = MANAGED_TOOLKIT_NAME_BY_SLUG.get(key) ?? prettifyUnknownSlug(key);
-  const category = guessCategory(key, name);
+  const name =
+    entry?.name?.trim() || MANAGED_TOOLKIT_NAME_BY_SLUG.get(key) || prettifyUnknownSlug(key);
+  const category = mapComposioCategory(entry?.categories) ?? guessCategory(key, name);
+  const description = entry?.description?.trim() || descriptionForToolkit(key, name, category);
+  const logoUrl = entry?.logo?.trim() || composioLogoUrl(key);
   return {
     slug: key,
     name,
-    description: defaultDescription(name, category),
+    description,
     category,
-    icon: <ComposioLogoBadge slug={key} name={name} />,
-    logoUrl: composioLogoUrl(key),
+    icon: <ComposioLogoBadge slug={key} name={name} logoUrl={logoUrl} />,
+    logoUrl,
     permissionLabel: permissionLabelFor(category),
   };
 }

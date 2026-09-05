@@ -54,3 +54,7 @@ fn handle_learn_all(params: Map<String, Value>) -> ControllerFuture {
         to_json(rpc::memory_learn_all(payload).await?)
     })
 }
+
+#[cfg(test)]
+#[path = "learn_tests.rs"]
+mod tests;

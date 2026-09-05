@@ -1,19 +1,17 @@
-pub mod agent;
 pub mod browser;
-pub mod computer;
-pub mod cron;
+#[cfg(feature = "documents")]
+pub mod document;
 pub mod filesystem;
-pub mod memory;
 pub mod network;
+#[cfg(feature = "documents")]
+pub mod presentation;
 pub mod system;
-pub mod whatsapp_data;
 
-pub use agent::*;
 pub use browser::*;
-pub use computer::*;
-pub use cron::*;
+#[cfg(feature = "documents")]
+pub use document::DocumentTool;
 pub use filesystem::*;
-pub use memory::*;
 pub use network::*;
+#[cfg(feature = "documents")]
+pub use presentation::PresentationTool;
 pub use system::*;
-pub use whatsapp_data::*;

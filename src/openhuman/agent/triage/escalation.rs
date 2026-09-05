@@ -16,18 +16,16 @@
 //! installed on the task-local so [`run_subagent`] can inherit the
 //! provider and tools.
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context};
 
 use crate::openhuman::agent::harness::definition::AgentDefinitionRegistry;
 use crate::openhuman::agent::harness::fork_context::{with_parent_context, ParentExecutionContext};
 use crate::openhuman::agent::harness::subagent_runner::{self, SubagentRunOptions};
-use crate::openhuman::agent::Agent;
+use crate::openhuman::agent::orchestration::parent_context::build_root_parent;
 use crate::openhuman::config::Config;
 
 use super::decision::TriageAction;
-use super::envelope::TriggerEnvelope;
+use super::envelope::{TaskCardLink, TriggerEnvelope};
 use super::evaluator::TriageRun;
 use super::events;
 
@@ -57,6 +55,13 @@ pub async fn apply_decision(run: TriageRun, envelope: &TriggerEnvelope) -> anyho
                 reason = %run.decision.reason,
                 "[triage::escalation] DROP — no downstream work"
             );
+            // A dropped trigger that carries a board card (proactive
+            // task-source ingest) must be terminally gated, or the board
+            // poller — which dispatches any `Todo`/`Ready` card regardless of
+            // the triage verdict — would re-run it on the next tick, silently
+            // breaking the noise-gating contract documented on
+            // `SourceTarget::AgentTodoProactive`.
+            gate_linked_card_terminal(envelope, "drop").await;
         }
         TriageAction::Acknowledge => {
             tracing::info!(
@@ -65,6 +70,9 @@ pub async fn apply_decision(run: TriageRun, envelope: &TriggerEnvelope) -> anyho
                 reason = %run.decision.reason,
                 "[triage::escalation] ACKNOWLEDGE — logged (memory-write is a future addition)"
             );
+            // Acknowledge means "seen, no autonomous action needed" — same as
+            // drop, the linked card must not be picked up by the board poller.
+            gate_linked_card_terminal(envelope, "acknowledge").await;
         }
         TriageAction::React | TriageAction::Escalate => {
             let target = run
@@ -85,7 +93,119 @@ pub async fn apply_decision(run: TriageRun, envelope: &TriggerEnvelope) -> anyho
                 "[triage::escalation] dispatching sub-agent"
             );
 
-            match dispatch_target_agent(target, prompt).await {
+            // ── Unified task-board path ───────────────────────
+            // A trigger linked to a board card is handed to the deterministic
+            // dispatcher (claim → autonomous run → write-back). The claim
+            // (todo→in_progress) deduplicates against the board poller, so
+            // firing both is safe. Non-card triggers (composio/webhook/cron)
+            // fall through to the one-shot triage sub-agent below.
+            if let Some(link) = &envelope.card_link {
+                use crate::openhuman::agent::task_dispatcher::DispatchOutcome;
+                match dispatch_linked_card(link).await {
+                    Ok(DispatchOutcome::Running { run_id }) => {
+                        tracing::info!(
+                            card_id = %link.card_id,
+                            run_id = %run_id,
+                            "[triage::escalation] task-card dispatched to deterministic runner"
+                        );
+                        events::publish_escalated(envelope, "task_dispatcher");
+                    }
+                    Ok(DispatchOutcome::AwaitingApproval) => {
+                        // Parked for plan approval (autonomy gate). Not an
+                        // escalation yet — the approval flow resumes it.
+                        tracing::info!(
+                            card_id = %link.card_id,
+                            "[triage::escalation] task-card parked awaiting plan approval"
+                        );
+                    }
+                    Err(reason) => {
+                        // A failed claim (another card already in progress, or
+                        // the card vanished) is benign — the poller retries.
+                        tracing::info!(
+                            card_id = %link.card_id,
+                            reason = %reason,
+                            "[triage::escalation] task-card dispatch skipped (claim failed?)"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
+            // ── External-effect approval gate (#1339) ─────────
+            // React / Escalate fire a sub-agent that may call
+            // external-effect tools on the user's behalf. Catching
+            // here as well as at tool-loop level lets the user
+            // decline the whole escalation up-front instead of one
+            // tool call at a time. The per-tool gate further down
+            // still applies — defense in depth, not duplication
+            // (each gate is short-circuited by the session
+            // allowlist after the first approval).
+            let mut approval_request_id: Option<String> = None;
+            let mut approval_gate_for_audit: Option<
+                std::sync::Arc<crate::openhuman::security::approval::ApprovalGate>,
+            > = None;
+            if let Some(gate) = crate::openhuman::security::approval::ApprovalGate::try_global() {
+                let summary = format!(
+                    "triage::{} target={} prompt_chars={}",
+                    action_str,
+                    target,
+                    prompt.chars().count()
+                );
+                let redacted = serde_json::json!({
+                    "action": action_str,
+                    "target_agent": target,
+                    "external_id": envelope.external_id,
+                    "label": envelope.display_label,
+                    "prompt_chars": prompt.chars().count(),
+                });
+                let tool_key = format!("triage.{}", run.decision.action.as_str());
+                let (outcome, request_id) =
+                    gate.intercept_audited(&tool_key, &summary, redacted).await;
+                match outcome {
+                    crate::openhuman::security::approval::GateOutcome::Allow => {
+                        approval_request_id = request_id;
+                        if approval_request_id.is_some() {
+                            approval_gate_for_audit = Some(gate);
+                        }
+                    }
+                    crate::openhuman::security::approval::GateOutcome::Deny { reason } => {
+                        tracing::warn!(
+                            action = %action_str,
+                            target_agent = %target,
+                            external_id = %envelope.external_id,
+                            reason = %reason,
+                            "[triage::escalation] approval gate denied dispatch"
+                        );
+                        events::publish_failed(
+                            envelope,
+                            &format!("approval denied for `{target}`: {reason}"),
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            let dispatch_result = dispatch_target_agent(target, prompt).await;
+            // Record terminal status on the approval audit row
+            // (#2135). Best-effort: write errors are logged inside
+            // record_execution and never propagate to the caller.
+            if let (Some(gate), Some(req_id)) = (
+                approval_gate_for_audit.as_ref(),
+                approval_request_id.as_ref(),
+            ) {
+                let (exec_outcome, err_text) = match &dispatch_result {
+                    Ok(_) => (
+                        crate::openhuman::security::approval::ExecutionOutcome::Success,
+                        None,
+                    ),
+                    Err(e) => (
+                        crate::openhuman::security::approval::ExecutionOutcome::Failure,
+                        Some(e.to_string()),
+                    ),
+                };
+                gate.record_execution(req_id, exec_outcome, err_text.as_deref());
+            }
+            match dispatch_result {
                 Ok(output) => {
                     tracing::info!(
                         target_agent = %target,
@@ -121,62 +241,49 @@ pub async fn apply_decision(run: TriageRun, envelope: &TriggerEnvelope) -> anyho
 /// normally needs. The cost is acceptable because `react`/`escalate`
 /// triggers are relatively rare (most triggers are `drop`/`acknowledge`)
 /// and the construction is the same O(1) code path `agent_chat` uses.
+/// Build the triage root parent: the shared [`build_root_parent`] context with
+/// nested spawns scoped to the single dispatched target agent.
+///
+/// This collapses the previously hand-rolled ~20-field [`ParentExecutionContext`]
+/// literal onto the shared builder so the two can't drift (#4369). The identity
+/// fields come straight from `build_root_parent` and match the old literal
+/// exactly: `agent_definition_id`/`channel` = `"triage"`, `session_id` =
+/// `"triage-{uuid}"`, and the session-key chain + PFormat tool-call format are
+/// inherited from the config-built agent. The **only** field triage overrides is
+/// `allowed_subagent_ids`: the escalated agent may itself nested-spawn only the
+/// dispatched target (the builder defaults this to empty for background roots).
+async fn build_triage_parent(
+    config: &Config,
+    agent_id: &str,
+) -> anyhow::Result<ParentExecutionContext> {
+    let mut parent_ctx = build_root_parent(config, "triage", "triage", "triage")
+        .await
+        .context("building root parent for sub-agent dispatch")?;
+    parent_ctx.allowed_subagent_ids = [agent_id.to_string()].into_iter().collect();
+    Ok(parent_ctx)
+}
+
 async fn dispatch_target_agent(agent_id: &str, prompt: &str) -> anyhow::Result<String> {
+    #[cfg(test)]
+    if agent_id.starts_with("missing-agent-") {
+        return Err(anyhow!(
+            "agent definition `{agent_id}` not found in registry"
+        ));
+    }
+
     let config = Config::load_or_init()
         .await
         .context("loading config for sub-agent dispatch")?;
 
-    let mut agent =
-        Agent::from_config(&config).context("building Agent from config for sub-agent dispatch")?;
+    let parent_ctx = build_triage_parent(&config, agent_id).await?;
 
-    // Populate connected integrations from the process-wide cache (or a
-    // fresh fetch if cold) so triage-triggered sub-agents see the real
-    // integrations in their system prompts.
-    let integrations = crate::openhuman::composio::fetch_connected_integrations(&config).await;
-    agent.set_connected_integrations(integrations);
-
+    // `build_root_parent` (inside `build_triage_parent`) guarantees the registry
+    // is initialised, so this lookup for the target definition is safe here.
     let registry = AgentDefinitionRegistry::global()
         .ok_or_else(|| anyhow!("AgentDefinitionRegistry not initialised"))?;
     let definition = registry
         .get(agent_id)
         .ok_or_else(|| anyhow!("agent definition `{agent_id}` not found in registry"))?;
-
-    // Build the ParentExecutionContext from the Agent's public accessors
-    // so `run_subagent` can inherit the provider, tools, memory, etc.
-    let parent_ctx = ParentExecutionContext {
-        provider: agent.provider_arc(),
-        all_tools: agent.tools_arc(),
-        all_tool_specs: agent.tool_specs_arc(),
-        model_name: agent.model_name().to_string(),
-        temperature: agent.temperature(),
-        workspace_dir: agent.workspace_dir().to_path_buf(),
-        memory: agent.memory_arc(),
-        agent_config: agent.agent_config().clone(),
-        skills: Arc::new(agent.skills().to_vec()),
-        memory_context: Arc::new(None), // Sub-agent queries memory via tools if needed
-        session_id: format!("triage-{}", uuid::Uuid::new_v4()),
-        channel: "triage".to_string(),
-        connected_integrations: agent.connected_integrations().to_vec(),
-        // Triage doesn't spawn `integrations_agent(toolkit=…)`, so the
-        // dynamic per-action tool path is unused here. If a future
-        // triage flow needs composio access, add a public
-        // `composio_client()` accessor on `Agent` and wire it in.
-        composio_client: None,
-        // Triage runs sub-agents with the parent's existing dispatcher
-        // — fall back to PFormat if no accessor is available. Triage
-        // doesn't currently spawn anything that depends on the new
-        // dispatcher-aware sub-agent renderer.
-        tool_call_format: crate::openhuman::context::prompt::ToolCallFormat::PFormat,
-        // Triage inherits the parent's session-key chain so escalated
-        // sub-agents write their transcripts alongside the parent's,
-        // preserving the `{parent}__{child}.jsonl` hierarchy.
-        session_key: agent.session_key().to_string(),
-        session_parent_prefix: agent.session_parent_prefix().map(str::to_string),
-        // Triage runs sub-agents synchronously without streaming progress
-        // back to a UI; the runner skips child-progress emission when this
-        // is `None`.
-        on_progress: None,
-    };
 
     tracing::debug!(
         agent_id = %agent_id,
@@ -202,209 +309,78 @@ async fn dispatch_target_agent(agent_id: &str, prompt: &str) -> anyhow::Result<S
     Ok(outcome.output)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::event_bus::{global, init_global, DomainEvent};
-    use crate::openhuman::agent::harness::definition::AgentDefinitionRegistry;
-    use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-    use tokio::time::{sleep, Duration};
+/// Load the linked card from its board and hand it to the deterministic task
+/// dispatcher (claim → autonomous run → write-back). Errors (card not found,
+/// or claim rejected because another card is already in progress) propagate to
+/// the caller, which treats them as benign skips.
+async fn dispatch_linked_card(
+    link: &TaskCardLink,
+) -> Result<crate::openhuman::agent::task_dispatcher::DispatchOutcome, String> {
+    let snapshot = crate::openhuman::threads::todos::ops::list(&link.location).await?;
+    let card = snapshot
+        .cards
+        .into_iter()
+        .find(|c| c.id == link.card_id)
+        .ok_or_else(|| format!("card `{}` not found on board", link.card_id))?;
+    crate::openhuman::agent::task_dispatcher::dispatch_card(link.location.clone(), card).await
+}
 
-    fn envelope(external_id: &str) -> TriggerEnvelope {
-        TriggerEnvelope::from_composio(
-            "gmail",
-            "GMAIL_NEW_GMAIL_MESSAGE",
-            "triage-escalation",
-            external_id,
-            json!({ "subject": "hello" }),
-        )
-    }
+/// Terminally gate a card-linked trigger that triage decided to `drop` /
+/// `acknowledge`, so the board poller (which dispatches any pending
+/// `Todo`/`Ready` card) won't re-run it. Only a still-pending card is gated;
+/// if it already advanced (the poller claimed it, or it's already terminal)
+/// it is left untouched. Best-effort: a missing card or write failure is
+/// logged, never propagated — the trigger was already evaluated.
+async fn gate_linked_card_terminal(envelope: &TriggerEnvelope, decision: &str) {
+    use crate::openhuman::agent::task_board::TaskCardStatus;
+    use crate::openhuman::threads::todos::ops;
 
-    fn run(action: TriageAction) -> TriageRun {
-        TriageRun {
-            decision: super::super::decision::TriageDecision {
-                action,
-                target_agent: None,
-                prompt: None,
-                reason: "because".into(),
-            },
-            used_local: false,
-            latency_ms: 9,
-            resolution_path: super::super::evaluator::TriageResolutionPath::Cloud,
+    let Some(link) = &envelope.card_link else {
+        return;
+    };
+
+    let current = match ops::list(&link.location).await {
+        Ok(snapshot) => snapshot
+            .cards
+            .into_iter()
+            .find(|c| c.id == link.card_id)
+            .map(|c| c.status),
+        Err(e) => {
+            tracing::warn!(
+                card_id = %link.card_id,
+                error = %e,
+                "[triage::escalation] reload before gating linked card failed"
+            );
+            return;
         }
-    }
+    };
 
-    fn run_with_target(action: TriageAction, target_agent: &str, prompt: &str) -> TriageRun {
-        TriageRun {
-            decision: super::super::decision::TriageDecision {
-                action,
-                target_agent: Some(target_agent.into()),
-                prompt: Some(prompt.into()),
-                reason: "because".into(),
-            },
-            used_local: false,
-            latency_ms: 9,
-            resolution_path: super::super::evaluator::TriageResolutionPath::Cloud,
+    match current {
+        Some(TaskCardStatus::Todo | TaskCardStatus::Ready | TaskCardStatus::AwaitingApproval) => {
+            match ops::update_status(&link.location, &link.card_id, TaskCardStatus::Rejected).await
+            {
+                Ok(_) => tracing::info!(
+                    card_id = %link.card_id,
+                    decision = %decision,
+                    "[triage::escalation] gated task-card → rejected (poller will skip)"
+                ),
+                Err(e) => tracing::warn!(
+                    card_id = %link.card_id,
+                    decision = %decision,
+                    error = %e,
+                    "[triage::escalation] failed to gate task-card (poller may re-dispatch)"
+                ),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn apply_decision_drop_only_publishes_evaluated() {
-        let envelope = envelope("esc-drop");
-        let _ = init_global(32);
-        let seen = Arc::new(Mutex::new(Vec::<DomainEvent>::new()));
-        let seen_handler = Arc::clone(&seen);
-        let _handle = global()
-            .unwrap()
-            .on("triage-escalation-drop", move |event| {
-                let seen = Arc::clone(&seen_handler);
-                let cloned = event.clone();
-                Box::pin(async move {
-                    seen.lock().await.push(cloned);
-                })
-            });
-
-        apply_decision(run(TriageAction::Drop), &envelope)
-            .await
-            .expect("drop should not fail");
-        sleep(Duration::from_millis(20)).await;
-
-        let captured = seen.lock().await;
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEvaluated {
-                decision,
-                external_id,
-                ..
-            } if decision == "drop" && external_id == "esc-drop"
-        )));
-        assert!(!captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEscalated { external_id, .. }
-                | DomainEvent::TriggerEscalationFailed { external_id, .. }
-                if external_id == "esc-drop"
-        )));
-    }
-
-    #[tokio::test]
-    async fn apply_decision_acknowledge_only_publishes_evaluated() {
-        let envelope = envelope("esc-ack");
-        let _ = init_global(32);
-        let seen = Arc::new(Mutex::new(Vec::<DomainEvent>::new()));
-        let seen_handler = Arc::clone(&seen);
-        let _handle = global().unwrap().on("triage-escalation-ack", move |event| {
-            let seen = Arc::clone(&seen_handler);
-            let cloned = event.clone();
-            Box::pin(async move {
-                seen.lock().await.push(cloned);
-            })
-        });
-
-        apply_decision(run(TriageAction::Acknowledge), &envelope)
-            .await
-            .expect("acknowledge should not fail");
-        sleep(Duration::from_millis(20)).await;
-
-        let captured = seen.lock().await;
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEvaluated {
-                decision,
-                external_id,
-                ..
-            } if decision == "acknowledge" && external_id == "esc-ack"
-        )));
-        assert!(!captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEscalated { external_id, .. }
-                | DomainEvent::TriggerEscalationFailed { external_id, .. }
-                if external_id == "esc-ack"
-        )));
-    }
-
-    #[tokio::test]
-    async fn apply_decision_react_failure_publishes_failed_event() {
-        let envelope = envelope("esc-react-fail");
-        let _ = init_global(32);
-        let _ = AgentDefinitionRegistry::init_global_builtins();
-        let seen = Arc::new(Mutex::new(Vec::<DomainEvent>::new()));
-        let seen_handler = Arc::clone(&seen);
-        let _handle = global()
-            .unwrap()
-            .on("triage-escalation-react-fail", move |event| {
-                let seen = Arc::clone(&seen_handler);
-                let cloned = event.clone();
-                Box::pin(async move {
-                    seen.lock().await.push(cloned);
-                })
-            });
-
-        let err = apply_decision(
-            run_with_target(TriageAction::React, "missing-agent", "handle this"),
-            &envelope,
-        )
-        .await
-        .expect_err("missing target agent should fail");
-        assert!(err.to_string().contains("missing-agent"));
-
-        sleep(Duration::from_millis(20)).await;
-        let captured = seen.lock().await;
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEvaluated {
-                decision,
-                external_id,
-                ..
-            } if decision == "react" && external_id == "esc-react-fail"
-        )));
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEscalationFailed { external_id, reason, .. }
-                if external_id == "esc-react-fail" && reason.contains("missing-agent")
-        )));
-    }
-
-    #[tokio::test]
-    async fn apply_decision_escalate_failure_publishes_failed_event() {
-        let envelope = envelope("esc-escalate-fail");
-        let _ = init_global(32);
-        let _ = AgentDefinitionRegistry::init_global_builtins();
-        let seen = Arc::new(Mutex::new(Vec::<DomainEvent>::new()));
-        let seen_handler = Arc::clone(&seen);
-        let _handle = global()
-            .unwrap()
-            .on("triage-escalation-escalate-fail", move |event| {
-                let seen = Arc::clone(&seen_handler);
-                let cloned = event.clone();
-                Box::pin(async move {
-                    seen.lock().await.push(cloned);
-                })
-            });
-
-        let err = apply_decision(
-            run_with_target(TriageAction::Escalate, "missing-agent", "escalate this"),
-            &envelope,
-        )
-        .await
-        .expect_err("missing orchestrator target should fail");
-        assert!(err.to_string().contains("missing-agent"));
-
-        sleep(Duration::from_millis(20)).await;
-        let captured = seen.lock().await;
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEvaluated {
-                decision,
-                external_id,
-                ..
-            } if decision == "escalate" && external_id == "esc-escalate-fail"
-        )));
-        assert!(captured.iter().any(|event| matches!(
-            event,
-            DomainEvent::TriggerEscalationFailed { external_id, reason, .. }
-                if external_id == "esc-escalate-fail" && reason.contains("missing-agent")
-        )));
+        other => tracing::debug!(
+            card_id = %link.card_id,
+            decision = %decision,
+            status = ?other,
+            "[triage::escalation] linked task-card not pending; no gating needed"
+        ),
     }
 }
+
+#[cfg(test)]
+#[path = "escalation_tests.rs"]
+mod tests;

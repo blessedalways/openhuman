@@ -21,13 +21,13 @@ fn controller_lists_match_lengths() {
 
 #[test]
 fn skill_summary_round_trip_minimum_fields() {
-    let skill = Skill {
+    let skill = Workflow {
         name: "demo".to_string(),
         description: "desc".to_string(),
         version: "".to_string(),
         ..Default::default()
     };
-    let summary: SkillSummary = skill.into();
+    let summary: WorkflowSummary = skill.into();
     assert_eq!(summary.id, "demo");
     assert_eq!(summary.name, "demo");
     assert_eq!(summary.description, "desc");

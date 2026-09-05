@@ -1,33 +1,74 @@
-import { useNavigate } from 'react-router-dom';
+import createDebug from 'debug';
+import { useCallback, useState } from 'react';
 
+import { useT } from '../../lib/i18n/I18nContext';
+import { rewardsApi } from '../../services/api/rewardsApi';
+import { callCoreRpc } from '../../services/coreRpcClient';
 import type { RewardsAchievement, RewardsSnapshot } from '../../types/rewards';
 import { DISCORD_INVITE_URL } from '../../utils/links';
+import { setOAuthReturnRoute } from '../../utils/oauthReturnRoute';
 import { openUrl } from '../../utils/openUrl';
+import Button from '../ui/Button';
 
-function discordMembershipLabel(snapshot: RewardsSnapshot | null): string {
-  if (!snapshot) return 'Waiting for backend sync';
-  switch (snapshot.discord.membershipStatus) {
-    case 'member':
-      return 'Joined the server';
-    case 'not_in_guild':
-      return 'Linked, but not in server';
-    case 'not_linked':
-      return 'Not linked';
-    default:
-      return 'Membership status unavailable';
-  }
-}
+const log = createDebug('rewards:discord');
+
+// discordMembershipLabel is now inlined into JSX to access t()
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('en-US').format(Math.max(0, Math.trunc(value)));
 }
 
+// Compact token amounts for reward badges: 500000 -> "500K", 2000000 -> "2M".
+function formatTokens(value: number): string {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(
+    Math.max(0, Math.trunc(value))
+  );
+}
+
+// Locale-aware USD so the money glyph matches the surrounding translated sentence.
+function formatUsd(value: number): string {
+  return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD' }).format(
+    Math.max(0, value)
+  );
+}
+
+// Prefer the backend's actionable claim-error message (e.g. "not unlocked yet",
+// "no active paid subscription"); fall back to the generic localized string.
+function claimErrorMessage(err: unknown, fallback: string): string {
+  if (
+    err &&
+    typeof err === 'object' &&
+    'error' in err &&
+    typeof (err as { error?: unknown }).error === 'string'
+  ) {
+    return (err as { error: string }).error;
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 function roleAccentTone(index: number) {
   const tones = [
-    { iconBg: 'bg-amber-50', iconText: 'text-amber-600', iconBorder: 'border-amber-100' },
-    { iconBg: 'bg-blue-50', iconText: 'text-primary-600', iconBorder: 'border-blue-100' },
-    { iconBg: 'bg-slate-100', iconText: 'text-slate-600', iconBorder: 'border-slate-200' },
-    { iconBg: 'bg-emerald-50', iconText: 'text-emerald-600', iconBorder: 'border-emerald-100' },
+    {
+      iconBg: 'bg-amber-50 dark:bg-amber-500/10',
+      iconText: 'text-amber-600 dark:text-amber-300',
+      iconBorder: 'border-amber-100 dark:border-amber-500/20',
+    },
+    {
+      iconBg: 'bg-primary-50 dark:bg-primary-500/10',
+      iconText: 'text-primary-600 dark:text-primary-300',
+      iconBorder: 'border-primary-100 dark:border-primary-500/20',
+    },
+    {
+      iconBg: 'bg-surface-subtle dark:bg-surface-strong',
+      iconText: 'text-content-secondary',
+      iconBorder: 'border-line',
+    },
+    {
+      iconBg: 'bg-sage-50 dark:bg-sage-500/10',
+      iconText: 'text-sage-600 dark:text-sage-300',
+      iconBorder: 'border-sage-100 dark:border-sage-500/20',
+    },
   ] as const;
 
   return tones[index % tones.length];
@@ -70,6 +111,8 @@ interface RewardsCommunityTabProps {
   error: string | null;
   isLoading: boolean;
   onRetry?: () => void;
+  /** Reconcile the snapshot after a claim without the full-page loading state. */
+  onSilentRefresh?: () => Promise<void> | void;
   snapshot: RewardsSnapshot | null;
 }
 
@@ -77,96 +120,290 @@ export default function RewardsCommunityTab({
   error,
   isLoading,
   onRetry,
+  onSilentRefresh,
   snapshot,
 }: RewardsCommunityTabProps) {
-  const navigate = useNavigate();
+  const { t } = useT();
+  const [connectState, setConnectState] = useState<'idle' | 'connecting' | 'error'>('idle');
+  const [disconnectState, setDisconnectState] = useState<'idle' | 'disconnecting' | 'error'>(
+    'idle'
+  );
+  // Reward claim state, keyed by achievement id. Claimed/claimable are read from
+  // the server snapshot (single source of truth); these hold only the in-flight id,
+  // a transient "credited" note for a fresh grant, and per-card error text.
+  // Track in-flight claims as a Set of ids so concurrent claims on different
+  // achievements each disable their own button independently (a single scalar
+  // would let a second claim re-enable the first's button mid-flight).
+  const [claimingIds, setClaimingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [claimedFeedback, setClaimedFeedback] = useState<Record<string, string>>({});
+  const [claimErrors, setClaimErrors] = useState<Record<string, string>>({});
   const rewardRoles: RewardsAchievement[] = snapshot?.achievements ?? [];
   const unlocked =
     snapshot?.summary.unlockedCount ?? rewardRoles.filter(role => role.unlocked).length;
   const total = snapshot?.summary.totalCount ?? rewardRoles.length;
   const inviteUrl = snapshot?.discord.inviteUrl ?? DISCORD_INVITE_URL;
   const progressPercent = total > 0 ? Math.round((unlocked / total) * 100) : 0;
-  const achievementSlots =
-    rewardRoles.length > 0 ? rewardRoles.slice(0, 8) : new Array(4).fill(null);
+  // Render one progress circle per achievement so the row always matches the
+  // "{unlocked} of {total} achievements" count. Previously capped at 8, which
+  // silently hid the remaining badges (11 achievements → only 8 circles).
+  const achievementSlots: (RewardsAchievement | null)[] =
+    rewardRoles.length > 0 ? rewardRoles : new Array<null>(4).fill(null);
   const ringCircumference = 2 * Math.PI * 24;
   const ringOffset = ringCircumference - (progressPercent / 100) * ringCircumference;
+  const discordLinked = snapshot?.discord.linked ?? false;
+  const discordUsername = snapshot?.discord.username ?? null;
+  const membershipStatus = snapshot?.discord.membershipStatus ?? null;
+  // "Roles assigned" is a ratio over *assignable* achievements — the ones both unlocked
+  // and backed by a configured Discord role. Locked achievements (no role yet) and
+  // unlocked achievements with no configured role can never be assigned, so counting
+  // them would misreport the ratio (e.g. "3 of 4" when the 4th can never be granted).
+  const assignableRoles = rewardRoles.filter(role => role.unlocked && Boolean(role.roleId));
+  const assignableRoleCount = assignableRoles.length;
+  const assignedRoleCount = assignableRoles.filter(
+    role => role.discordRoleStatus === 'assigned'
+  ).length;
+  // A connected member who unlocked a role-bearing achievement but has not joined the
+  // server yet cannot receive the role — surface an actionable prompt to join.
+  const hasUnlockedConfiguredRole = assignableRoles.length > 0;
+  const showClaimBanner =
+    discordLinked && membershipStatus === 'not_in_guild' && hasUnlockedConfiguredRole;
+
+  const handleConnectDiscord = useCallback(async () => {
+    log('connect discord requested');
+    setConnectState('connecting');
+    try {
+      const response = await callCoreRpc<{ result: { oauthUrl?: string } }>({
+        method: 'openhuman.auth.oauth_connect',
+        params: { provider: 'discord' },
+      });
+      const oauthUrl = response.result?.oauthUrl;
+      if (!oauthUrl) {
+        throw new Error('missing oauthUrl in oauth_connect response');
+      }
+      log('opening discord oauth consent url');
+      await openUrl(oauthUrl);
+      // Persist the return route only after the consent URL actually launched, so a failed
+      // initiation never leaves a stale route that could misroute a later OAuth success.
+      setOAuthReturnRoute('/rewards?view=main');
+      // Reset so the button is usable again if the user cancels; once the snapshot
+      // refetches with discord.linked the connected state takes over.
+      setConnectState('idle');
+    } catch (err) {
+      log('connect discord failed error=%s', err instanceof Error ? err.message : String(err));
+      setConnectState('error');
+    }
+  }, []);
+
+  const handleDisconnectDiscord = useCallback(async () => {
+    log('disconnect discord requested');
+    setDisconnectState('disconnecting');
+    try {
+      // Clears user.discordId/discordUsername on the backend (idempotent), which flips the
+      // rewards snapshot back to unlinked.
+      await rewardsApi.disconnectDiscord();
+      log('disconnect discord ok; refreshing snapshot');
+      setDisconnectState('idle');
+      // Refetch the snapshot so the connected state flips back to the Connect button (re-link path).
+      onRetry?.();
+    } catch (err) {
+      log('disconnect discord failed error=%s', err instanceof Error ? err.message : String(err));
+      setDisconnectState('error');
+    }
+  }, [onRetry]);
+
+  const handleClaim = useCallback(
+    async (role: RewardsAchievement) => {
+      log('claim requested reward=%s', role.id);
+      setClaimingIds(prev => new Set(prev).add(role.id));
+      setClaimErrors(prev => {
+        if (!(role.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[role.id];
+        return next;
+      });
+      try {
+        const result = await rewardsApi.claimReward(role.id);
+        log(
+          'claim ok reward=%s amountUsd=%d alreadyClaimed=%s',
+          role.id,
+          result.amountUsd,
+          result.alreadyClaimed
+        );
+        // Only a fresh grant moves new money — an idempotent re-claim must NOT
+        // imply "$X credited", so gate the credited note on !alreadyClaimed.
+        if (!result.alreadyClaimed) {
+          setClaimedFeedback(prev => ({ ...prev, [role.id]: formatUsd(result.amountUsd) }));
+        }
+        // Reconcile with server truth (claimed / claimable / claimableCount and any
+        // balance surface) without the full-page loading flicker. The button stays
+        // "Claiming…" until this lands, then the server snapshot flips it to Claimed.
+        await onSilentRefresh?.();
+      } catch (err) {
+        log(
+          'claim failed reward=%s error=%s',
+          role.id,
+          err instanceof Error ? err.message : String(err)
+        );
+        setClaimErrors(prev => ({
+          ...prev,
+          [role.id]: claimErrorMessage(err, t('rewards.community.claimError')),
+        }));
+      } finally {
+        // Only clear the id that just settled — leave any other in-flight claim's
+        // button disabled.
+        setClaimingIds(prev => {
+          const next = new Set(prev);
+          next.delete(role.id);
+          return next;
+        });
+      }
+    },
+    [onSilentRefresh, t]
+  );
+
   return (
     <>
-      <section className="relative overflow-hidden rounded-[1.25rem] bg-gradient-to-br from-[#004ad0] to-[#2b64f1] p-6 text-white shadow-[0_20px_40px_rgba(25,28,30,0.08)]">
+      <section className="relative overflow-hidden rounded-3xl bg-linear-to-br from-[#004ad0] to-[#2b64f1] p-6 text-content-inverted shadow-[0_20px_40px_rgba(25,28,30,0.08)]">
         <div className="relative z-10 space-y-4">
           <div className="space-y-2">
-            <h1 className="text-2xl font-bold tracking-tight text-white">
-              Earn Rewards & Discord Roles
+            <h1 className="text-2xl font-bold tracking-tight text-content-inverted">
+              {t('rewards.community.heroTitle')}
             </h1>
-            <p className="text-sm font-medium leading-relaxed text-white/90">
-              Unlock exclusive channels, supporter badges, and backend-synced rewards by connecting
-              your Discord account.
+            <p className="text-sm font-medium leading-relaxed text-content-inverted/90">
+              {t('rewards.community.heroSubtitle')}
             </p>
           </div>
           <div className="flex flex-col gap-2 sm:flex-row">
-            <button
-              onClick={() => navigate('/settings/messaging')}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-primary-700 shadow-lg transition-transform active:scale-[0.98]">
-              <svg
-                className="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-                aria-hidden="true">
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M13.828 10.172a4 4 0 0 0-5.656 0l-1 1a4 4 0 0 0 5.656 5.656l.586-.586m-3.242-2.828a4 4 0 0 0 5.656 0l1-1a4 4 0 1 0-5.656-5.656l-.586.586"
-                />
-              </svg>
-              Connect Discord
-            </button>
-            <button
+            {discordLinked ? (
+              <>
+                <div
+                  data-testid="rewards-discord-connected"
+                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-surface/15 px-4 py-3 text-sm font-semibold text-content-inverted">
+                  <svg
+                    className="h-4 w-4"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    aria-hidden="true">
+                    <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                  </svg>
+                  {discordUsername
+                    ? t('rewards.community.discordConnectedAs').replace(
+                        '{username}',
+                        discordUsername
+                      )
+                    : t('rewards.community.discordConnected')}
+                </div>
+                <Button
+                  onClick={() => {
+                    void handleDisconnectDiscord();
+                  }}
+                  disabled={disconnectState === 'disconnecting'}
+                  data-testid="rewards-disconnect-discord"
+                  variant="secondary"
+                  size="lg"
+                  className="border-content-inverted/20 bg-surface/10 text-content-inverted backdrop-blur-sm hover:bg-content-inverted/15">
+                  {disconnectState === 'disconnecting'
+                    ? t('rewards.community.disconnectingDiscord')
+                    : t('rewards.community.disconnectDiscord')}
+                </Button>
+              </>
+            ) : (
+              <Button
+                onClick={() => {
+                  void handleConnectDiscord();
+                }}
+                disabled={connectState === 'connecting'}
+                data-testid="rewards-connect-discord"
+                variant="secondary"
+                size="lg"
+                className="bg-surface text-primary-700 shadow-lg transition-transform active:scale-[0.98] dark:text-primary-300">
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M13.828 10.172a4 4 0 0 0-5.656 0l-1 1a4 4 0 0 0 5.656 5.656l.586-.586m-3.242-2.828a4 4 0 0 0 5.656 0l1-1a4 4 0 1 0-5.656-5.656l-.586.586"
+                  />
+                </svg>
+                {connectState === 'connecting'
+                  ? t('rewards.community.connectingDiscord')
+                  : t('rewards.community.connectDiscord')}
+              </Button>
+            )}
+            <Button
               onClick={() => {
                 void openUrl(inviteUrl);
               }}
-              className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/20 bg-white/10 px-4 py-3 text-sm font-semibold text-white backdrop-blur-sm transition-colors hover:bg-white/15">
+              variant="secondary"
+              size="lg"
+              className="border-content-inverted/20 bg-surface/10 text-content-inverted backdrop-blur-sm hover:bg-content-inverted/15">
               <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M20.317 4.369A19.79 19.79 0 0 0 15.885 3c-.191.328-.403.775-.552 1.124a18.27 18.27 0 0 0-5.29 0A11.56 11.56 0 0 0 9.49 3a19.74 19.74 0 0 0-4.433 1.369C2.253 8.51 1.492 12.55 1.872 16.533a19.9 19.9 0 0 0 5.239 2.673c.423-.58.8-1.196 1.123-1.845a12.84 12.84 0 0 1-1.767-.85c.148-.106.292-.217.43-.332c3.408 1.6 7.104 1.6 10.472 0c.14.115.283.226.43.332c-.565.338-1.157.623-1.771.851c.322.648.698 1.264 1.123 1.844a19.84 19.84 0 0 0 5.241-2.673c.446-4.617-.761-8.621-3.787-12.164ZM9.46 14.088c-1.02 0-1.855-.936-1.855-2.084c0-1.148.82-2.084 1.855-2.084c1.044 0 1.87.944 1.855 2.084c0 1.148-.82 2.084-1.855 2.084Zm5.08 0c-1.02 0-1.855-.936-1.855-2.084c0-1.148.82-2.084 1.855-2.084c1.044 0 1.87.944 1.855 2.084c0 1.148-.812 2.084-1.855 2.084Z" />
               </svg>
-              Join Discord
-            </button>
+              {t('rewards.community.joinDiscord')}
+            </Button>
           </div>
+          {connectState === 'error' ? (
+            <p
+              role="alert"
+              data-testid="rewards-connect-discord-error"
+              className="text-xs font-medium text-content-inverted/90">
+              {t('rewards.community.connectDiscordError')}
+            </p>
+          ) : null}
+          {discordLinked && disconnectState === 'error' ? (
+            <p
+              role="alert"
+              data-testid="rewards-disconnect-discord-error"
+              className="text-xs font-medium text-content-inverted/90">
+              {t('rewards.community.disconnectDiscordError')}
+            </p>
+          ) : null}
         </div>
-        <div className="absolute -right-10 -top-10 h-32 w-32 rounded-full bg-white/10 blur-2xl" />
-        <div className="absolute -bottom-10 -left-8 h-24 w-24 rounded-full bg-white/15 blur-xl" />
+        <div className="absolute -right-10 -top-10 h-32 w-32 rounded-full bg-surface/10 blur-2xl" />
+        <div className="absolute -bottom-10 -left-8 h-24 w-24 rounded-full bg-surface/15 blur-xl" />
       </section>
 
       {error ? (
         <div
           role="alert"
           data-testid="rewards-error"
-          className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
           <span>
-            Rewards sync is unavailable right now. The page is showing connection guidance without
-            claiming new unlocks. Details: {error}
+            {t('rewards.community.syncUnavailable')} {error}
           </span>
           {onRetry ? (
-            <button
-              type="button"
+            <Button
               data-testid="rewards-retry"
               onClick={onRetry}
               disabled={isLoading}
-              className="rounded-full border border-amber-300 bg-white px-3 py-1 text-xs font-semibold text-amber-800 shadow-sm transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60">
-              {isLoading ? 'Retrying…' : 'Try again'}
-            </button>
+              variant="secondary"
+              size="xs"
+              className="rounded-full border-amber-300 bg-surface text-amber-800 shadow-xs hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-500/20 dark:text-amber-200">
+              {isLoading ? t('rewards.community.retrying') : t('rewards.community.tryAgain')}
+            </Button>
           ) : null}
         </div>
       ) : null}
 
       <div className="space-y-4">
-        <section className="rounded-[1.25rem] bg-white p-6 shadow-[0_4px_20px_rgba(25,28,30,0.04)]">
+        <section className="rounded-3xl bg-surface p-6 shadow-[0_4px_20px_rgba(25,28,30,0.04)]">
           <div className="mb-6 flex items-center justify-between gap-4">
             <div>
-              <h2 className="text-lg font-bold text-stone-900">Your Progress</h2>
-              <p className="text-xs text-stone-500">
-                {isLoading ? 'Loading rewards…' : `${unlocked} of ${total} achievements unlocked`}
+              <h2 className="text-lg font-bold text-content">
+                {t('rewards.community.yourProgress')}
+              </h2>
+              <p className="text-xs text-content-muted">
+                {isLoading
+                  ? t('rewards.community.loadingRewards')
+                  : t('rewards.community.achievementsUnlocked')
+                      .replace('{unlocked}', String(unlocked))
+                      .replace('{total}', String(total))}
               </p>
             </div>
             <div className="relative flex h-14 w-14 items-center justify-center">
@@ -178,7 +415,7 @@ export default function RewardsCommunityTab({
                   fill="transparent"
                   stroke="currentColor"
                   strokeWidth="4"
-                  className="text-stone-200"
+                  className="text-line-strong"
                 />
                 <circle
                   cx="28"
@@ -189,10 +426,10 @@ export default function RewardsCommunityTab({
                   strokeWidth="4"
                   strokeDasharray={ringCircumference}
                   strokeDashoffset={ringOffset}
-                  className="text-primary-600 transition-all duration-300"
+                  className="text-primary-600 dark:text-primary-300 transition-all duration-300"
                 />
               </svg>
-              <span className="absolute text-sm font-bold text-stone-900">{progressPercent}%</span>
+              <span className="absolute text-sm font-bold text-content">{progressPercent}%</span>
             </div>
           </div>
 
@@ -200,10 +437,13 @@ export default function RewardsCommunityTab({
             {achievementSlots.map((role, index) => (
               <div
                 key={role?.id ?? `placeholder-${index}`}
-                className={`flex h-16 w-16 flex-shrink-0 items-center justify-center rounded-full border-2 ${
+                title={role?.title ?? undefined}
+                aria-label={role?.title ?? undefined}
+                data-testid={role ? `rewards-achievement-badge-${role.id}` : undefined}
+                className={`flex h-16 w-16 shrink-0 items-center justify-center rounded-full border-2 ${
                   role?.unlocked
-                    ? 'border-primary-200 bg-primary-50 text-primary-600'
-                    : 'border-dashed border-stone-300 bg-stone-100 text-stone-400'
+                    ? 'border-primary-200 dark:border-primary-500/30 bg-primary-50 dark:bg-primary-500/10 text-primary-600 dark:text-primary-300'
+                    : 'border-dashed border-line-strong bg-surface-subtle text-content-faint'
                 }`}>
                 <svg className="h-6 w-6" viewBox="0 0 24 24" aria-hidden="true">
                   {roleGlyph(index)}
@@ -215,40 +455,120 @@ export default function RewardsCommunityTab({
 
         <section className="space-y-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-stone-900">Roles & Rewards</h2>
+            <h2 className="text-lg font-bold text-content">
+              {t('rewards.community.rolesAndRewards')}
+            </h2>
           </div>
+          {showClaimBanner ? (
+            <div
+              role="status"
+              data-testid="rewards-claim-roles-banner"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-primary-100 dark:border-primary-500/30 bg-primary-50 dark:bg-primary-500/10 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-bold text-content">
+                  {t('rewards.community.roleClaimTitle')}
+                </p>
+                <p className="mt-0.5 text-xs leading-relaxed text-content-secondary">
+                  {t('rewards.community.roleClaimDesc')}
+                </p>
+              </div>
+              <Button
+                variant="primary"
+                size="md"
+                data-testid="rewards-claim-roles-join"
+                onClick={() => {
+                  void openUrl(inviteUrl);
+                }}
+                className="shrink-0">
+                {t('rewards.community.joinDiscord')}
+              </Button>
+            </div>
+          ) : null}
           {isLoading ? (
-            <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-soft">
-              <div className="text-sm text-stone-600">Loading rewards…</div>
+            <div className="rounded-2xl border border-line bg-surface p-5 shadow-soft">
+              <div className="text-sm text-content-secondary">
+                {t('rewards.community.loadingRewards')}
+              </div>
             </div>
           ) : rewardRoles.length > 0 ? (
             rewardRoles.map((role, index) => {
               const tone = roleAccentTone(index);
+              // Surface Discord role-assignment status only for a linked user's unlocked
+              // achievements — locked badges have no role to claim yet.
+              const roleStatus =
+                discordLinked && role.unlocked
+                  ? role.discordRoleStatus === 'assigned'
+                    ? {
+                        label: t('rewards.community.roleAssigned'),
+                        classes: 'bg-sage-50 text-sage-700 dark:bg-sage-500/10 dark:text-sage-300',
+                      }
+                    : role.discordRoleStatus === 'not_assigned'
+                      ? {
+                          label: t('rewards.community.rolePending'),
+                          classes:
+                            'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
+                        }
+                      : role.discordRoleStatus === 'not_in_guild'
+                        ? {
+                            label: t('rewards.community.roleJoinToClaim'),
+                            classes:
+                              'bg-primary-50 text-primary-700 dark:bg-primary-500/10 dark:text-primary-300',
+                          }
+                        : null
+                  : null;
+
+              // Claimed/claimable come from the server snapshot (single source of
+              // truth); the local overlay only holds the transient credited note.
+              const claimed = role.claimed === true;
+              const feedback = claimedFeedback[role.id];
+              const claimError = claimErrors[role.id];
+              const showClaimFooter = role.claimable === true || claimed;
 
               return (
                 <div
                   key={role.id}
-                  className={`rounded-[1.25rem] bg-white p-5 shadow-sm transition-shadow hover:shadow-md ${
-                    role.unlocked ? 'ring-1 ring-primary-100' : 'ring-1 ring-black/[0.04]'
+                  className={`rounded-3xl bg-surface p-5 shadow-xs transition-shadow hover:shadow-md ${
+                    role.unlocked
+                      ? 'ring-1 ring-primary-100 dark:ring-primary-500/20'
+                      : 'ring-1 ring-line/4 dark:ring-line-strong/6'
                   }`}>
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex gap-4">
                       <div
-                        className={`flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-xl border ${tone.iconBg} ${tone.iconText} ${tone.iconBorder}`}>
+                        className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border ${tone.iconBg} ${tone.iconText} ${tone.iconBorder}`}>
                         <svg className="h-6 w-6" viewBox="0 0 24 24" aria-hidden="true">
                           {roleGlyph(index)}
                         </svg>
                       </div>
                       <div>
-                        <h3 className="text-base font-bold text-stone-900">{role.title}</h3>
-                        <p className="mt-1 text-xs leading-relaxed text-stone-600">
+                        <h3 className="text-base font-bold text-content">{role.title}</h3>
+                        <p className="mt-1 text-xs leading-relaxed text-content-secondary">
                           {role.description}
                         </p>
+                        {!role.unlocked && role.progressLabel ? (
+                          <p
+                            data-testid={`rewards-achievement-progress-${role.id}`}
+                            className="mt-1.5 text-[11px] font-semibold text-primary-600 dark:text-primary-300">
+                            {role.progressLabel}
+                          </p>
+                        ) : null}
+                        {role.rewardTokens ? (
+                          <p
+                            data-testid={`rewards-achievement-reward-${role.id}`}
+                            className="mt-1.5 inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                            {(role.rewardRecurring
+                              ? t('rewards.community.rewardTokensMonthly')
+                              : t('rewards.community.rewardTokens')
+                            ).replace('{tokens}', formatTokens(role.rewardTokens))}
+                          </p>
+                        ) : null}
                       </div>
                     </div>
-                    <div className="flex items-center gap-1 text-primary-700">
+                    <div className="flex items-center gap-1 text-primary-700 dark:text-primary-300">
                       <span className="text-[10px] font-bold uppercase tracking-[0.16em]">
-                        {role.unlocked ? 'Unlocked' : 'Locked'}
+                        {role.unlocked
+                          ? t('rewards.community.unlocked')
+                          : t('rewards.community.locked')}
                       </span>
                       <svg
                         className="h-4 w-4"
@@ -263,35 +583,163 @@ export default function RewardsCommunityTab({
                       </svg>
                     </div>
                   </div>
+                  {roleStatus ? (
+                    <div className="mt-3">
+                      <span
+                        data-testid={`rewards-role-status-${role.id}`}
+                        className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold ${roleStatus.classes}`}>
+                        {roleStatus.label}
+                      </span>
+                    </div>
+                  ) : null}
+                  {showClaimFooter ? (
+                    <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line pt-3">
+                      {claimed ? (
+                        <>
+                          <span
+                            data-testid={`rewards-claimed-${role.id}`}
+                            className="inline-flex items-center gap-1.5 rounded-full bg-sage-50 px-3 py-1.5 text-xs font-semibold text-sage-700 dark:bg-sage-500/10 dark:text-sage-300">
+                            <svg
+                              className="h-3.5 w-3.5"
+                              viewBox="0 0 24 24"
+                              fill="currentColor"
+                              aria-hidden="true">
+                              <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                            </svg>
+                            {t('rewards.community.claimed')}
+                          </span>
+                          {feedback ? (
+                            <span
+                              role="status"
+                              data-testid={`rewards-claim-credited-${role.id}`}
+                              className="text-xs font-semibold text-sage-600 dark:text-sage-300">
+                              {t('rewards.community.claimCredited').replace('{amount}', feedback)}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            data-testid={`rewards-claim-${role.id}`}
+                            disabled={claimingIds.has(role.id)}
+                            onClick={() => {
+                              void handleClaim(role);
+                            }}>
+                            {claimingIds.has(role.id)
+                              ? t('rewards.community.claiming')
+                              : t('rewards.community.claimTokens').replace(
+                                  '{tokens}',
+                                  formatTokens(role.rewardTokens ?? 0)
+                                )}
+                          </Button>
+                          {claimError ? (
+                            <span
+                              role="alert"
+                              data-testid={`rewards-claim-error-${role.id}`}
+                              className="text-xs font-semibold text-coral-600 dark:text-coral-300">
+                              {claimError}
+                            </span>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
               );
             })
           ) : (
-            <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-soft">
-              <h2 className="text-lg font-semibold text-stone-900">Rewards sync pending</h2>
-              <p className="mt-2 text-sm text-stone-600">
-                The backend did not return achievement data yet. Join Discord and connect your
-                account now, then refresh this page once sync is available again.
+            <div className="rounded-2xl border border-line bg-surface p-5 shadow-soft">
+              <h2 className="text-lg font-semibold text-content">
+                {t('rewards.community.syncPending')}
+              </h2>
+              <p className="mt-2 text-sm text-content-secondary">
+                {t('rewards.community.syncPendingDesc')}
               </p>
             </div>
           )}
         </section>
 
-        <section className="rounded-[1.25rem] bg-[#f2f4f6] p-4 text-sm text-stone-600">
+        {/* Discord-specific status — kept separate from product activity metrics
+            so the two are no longer conflated in a single list. */}
+        <section
+          data-testid="rewards-discord-stats"
+          className="rounded-3xl bg-[#f2f4f6] dark:bg-surface-muted/60 p-4 text-sm text-content-secondary">
+          <h2 className="mb-3 text-sm font-bold text-content">
+            {t('rewards.community.discordDetails')}
+          </h2>
           <div className="flex items-center justify-between gap-3">
-            <span>Discord server</span>
-            <span className="font-semibold text-stone-900">{discordMembershipLabel(snapshot)}</span>
+            <span>{t('rewards.community.discordServer')}</span>
+            <span className="font-semibold text-content">
+              {!snapshot
+                ? t('rewards.community.discordWaiting')
+                : snapshot.discord.membershipStatus === 'member'
+                  ? t('rewards.community.discordMember')
+                  : snapshot.discord.membershipStatus === 'not_in_guild'
+                    ? t('rewards.community.discordLinkedNotInGuild')
+                    : snapshot.discord.membershipStatus === 'not_linked'
+                      ? t('rewards.community.discordNotLinked')
+                      : t('rewards.community.discordStatusUnavailable')}
+            </span>
           </div>
-          <div className="mt-3 flex items-center justify-between gap-3">
-            <span>Current streak</span>
-            <span className="font-semibold text-stone-900">
-              {snapshot ? `${snapshot.metrics.currentStreakDays} days` : 'Unknown'}
+          {discordLinked && discordUsername ? (
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span>{t('rewards.community.discordAccount')}</span>
+              <span data-testid="rewards-discord-username" className="font-semibold text-content">
+                {discordUsername}
+              </span>
+            </div>
+          ) : null}
+          {discordLinked && membershipStatus === 'member' ? (
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span>{t('rewards.community.rolesAndRewards')}</span>
+              <span data-testid="rewards-roles-assigned" className="font-semibold text-content">
+                {t('rewards.community.roleAssignmentCount')
+                  .replace('{assigned}', String(assignedRoleCount))
+                  .replace('{unlocked}', String(assignableRoleCount))}
+              </span>
+            </div>
+          ) : null}
+        </section>
+
+        {/* Product-usage metrics — the activity streak counts consecutive days the
+            user actually used OpenHuman (token-processing days), not a check-in. */}
+        <section
+          data-testid="rewards-activity-stats"
+          className="rounded-3xl bg-[#f2f4f6] dark:bg-surface-muted/60 p-4 text-sm text-content-secondary">
+          <h2 className="text-sm font-bold text-content">{t('rewards.community.activityTitle')}</h2>
+          <p className="mb-3 mt-0.5 text-xs leading-relaxed text-content-muted">
+            {t('rewards.community.activityStreakHint')}
+          </p>
+          <div className="flex items-center justify-between gap-3">
+            <span>{t('rewards.community.currentStreak')}</span>
+            <span data-testid="rewards-current-streak" className="font-semibold text-content">
+              {snapshot
+                ? t('rewards.community.streakDays').replace(
+                    '{n}',
+                    String(snapshot.metrics.currentStreakDays)
+                  )
+                : t('rewards.community.unknown')}
             </span>
           </div>
           <div className="mt-3 flex items-center justify-between gap-3">
-            <span>Cumulative tokens</span>
-            <span className="font-semibold text-stone-900">
-              {snapshot ? formatNumber(snapshot.metrics.cumulativeTokens) : 'Unknown'}
+            <span>{t('rewards.community.longestStreak')}</span>
+            <span data-testid="rewards-longest-streak" className="font-semibold text-content">
+              {snapshot
+                ? t('rewards.community.streakDays').replace(
+                    '{n}',
+                    String(snapshot.metrics.longestStreakDays)
+                  )
+                : t('rewards.community.unknown')}
+            </span>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <span>{t('rewards.community.cumulativeTokens')}</span>
+            <span className="font-semibold text-content">
+              {snapshot
+                ? formatNumber(snapshot.metrics.cumulativeTokens)
+                : t('rewards.community.unknown')}
             </span>
           </div>
         </section>

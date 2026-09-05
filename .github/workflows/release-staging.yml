@@ -1,8 +1,29 @@
 ---
 name: Release Staging
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description:
+          Build from a specific commit SHA instead of the selected branch HEAD.
+          The commit must be reachable from the selected main or release branch.
+        required: false
+        type: string
+        default: ""
+      create_tag:
+        description:
+          Create the immutable `v<version>-staging` tag and run the full
+          build matrix. When false, bump versions on the selected branch but
+          skip tag creation, desktop builds, and Docker; useful for
+          version-bump-only runs.
+        required: false
+        type: boolean
+        default: true
 permissions:
+  # `actions: read` lets scripts/ci-cancel-aware.sh poll the run status so
+  # cancelled builds inside container jobs stop themselves (docker exec
+  # swallows the runner's signals).
+  actions: read
   # `contents: write` is required for the patch bump commit and the
   # `v<version>-staging` tag push performed by `prepare-build` below.
   contents: write
@@ -11,12 +32,18 @@ concurrency:
   group: release-staging
   cancel-in-progress: false
 # ---------------------------------------------------------------------------
+# Branch model: staging builds may be cut from `main` or `release`, selected
+# by the workflow-dispatch ref. The version bump is committed back to the
+# selected branch, and the build matrix uses the immutable staging tag.
+#
 # Job dependency graph
 #
 #   prepare-build
 #        │
-#        ├── build-desktop      (delegated to .github/workflows/build-desktop.yml)
-#        ├── build-docker       (build only — no GHCR push on staging)
+#        ├── build-desktop      (delegated to .github/workflows/build-desktop.yml;
+#        │                       skipped when `create_tag=false`)
+#        ├── build-docker       (build only — no GHCR push on staging;
+#        │                       skipped when `create_tag=false`)
 #        │
 #   record-sentry-deploy
 #        │
@@ -28,16 +55,14 @@ concurrency:
 # ---------------------------------------------------------------------------
 jobs:
   # =========================================================================
-  # Phase 1: Patch-bump on `main` and create the immutable
+  # Phase 1: Patch-bump on `release` and optionally create the immutable
   # `v<version>-staging` tag at that commit. The build matrix below then
-  # checks out the tag (not main HEAD) so reruns reproduce byte-for-byte.
-  # Production promotion (`release-production.yml`,
-  # `release_source = staging_tag`) reads this tag verbatim and creates a
-  # `v<version>` tag at the same commit.
+  # checks out the tag (not release HEAD) so reruns reproduce byte-for-byte.
   # =========================================================================
   prepare-build:
     name: Prepare build context
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Reuse the Production GitHub Actions environment so Sentry vars
     # (`OPENHUMAN_*_SENTRY_DSN`, `SENTRY_PROJECT_*`, `SENTRY_ORG`,
     # `SENTRY_AUTH_TOKEN`) and `VITE_DEBUG` resolve here too. Staging
@@ -47,8 +72,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       # Immutable staging tag created by this run, e.g. `v1.2.4-staging`.
-      # Downstream consumers (release-production.yml `staging_tag` promotion,
-      # Sentry, installer asset names) reference this rather than the bare SHA.
+      # Sentry and installer asset names reference this rather than the bare SHA.
       tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}
       # First 12 chars of `sha`. Matches the truncation runtime code in
@@ -60,44 +84,67 @@ jobs:
       build_ref: ${{ steps.resolve.outputs.build_ref }}
       base_url: ${{ steps.resolve.outputs.base_url }}
     steps:
-      - name: Enforce main branch
-        if: github.ref != 'refs/heads/main'
+      - name: Enforce staging source branch
+        if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/release'
         run: |
-          echo "This workflow can only run from main. Current ref: $GITHUB_REF"
+          echo "This workflow can only run from main or release. Current ref: $GITHUB_REF"
           exit 1
       - name: Generate GitHub App token
         id: app-token
-        uses: tibdex/github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
-          app_id: ${{ secrets.XGITHUB_APP_ID }}
-          private_key: ${{ secrets.XGITHUB_APP_PRIVATE_KEY }}
-      - name: Checkout main
-        uses: actions/checkout@v4
+          app-id: ${{ secrets.XGITHUB_APP_ID }}
+          private-key: ${{ secrets.XGITHUB_APP_PRIVATE_KEY }}
+          # Least privilege: this job only pushes the version-bump commit and
+          # tag (and, on production, the back-merge to main) — contents: write
+          # is all it needs. Branch-protection bypass comes from the App's
+          # identity in the ruleset bypass list, not from token scopes.
+          permission-contents: write
+      - name: Checkout staging source
+        uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
           submodules: recursive
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.10.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24.x
+          package-manager-cache: false
       - name: Configure Git
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
           git fetch origin --tags --prune --prune-tags
-          git checkout main
-          git pull origin main --ff-only
+          if [ -n "$COMMIT_SHA" ]; then
+            [[ "$COMMIT_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] || {
+              echo "Invalid commit_sha: must be a hex SHA (7-40 chars)"
+              exit 1
+            }
+            git rev-parse --verify "${COMMIT_SHA}^{commit}" >/dev/null
+            git merge-base --is-ancestor "$COMMIT_SHA" "origin/$SOURCE_BRANCH" || {
+              echo "commit_sha $COMMIT_SHA is not reachable from $SOURCE_BRANCH"
+              exit 1
+            }
+            git checkout --detach "$COMMIT_SHA"
+          else
+            git checkout "$SOURCE_BRANCH"
+            git pull origin "$SOURCE_BRANCH" --ff-only
+          fi
       # Patch-only bump for staging cuts. Minor/major promotions are owned
       # by `release-production.yml` and only happen on the production path.
-      # Bump commit lands on `main` (we don't maintain a separate `staging`
-      # branch) and the immutable `v<version>-staging` tag pinpoints the
-      # exact main commit QA validated, so production promotion can later
-      # find the tagged commit reachable from main.
+      # The bump commit lands on the selected source branch and the immutable
+      # `v<version>-staging` tag pinpoints the exact commit QA validated.
       - name: Bump patch version
         id: bump
         run: node scripts/release/bump-version.js patch
@@ -119,6 +166,7 @@ jobs:
           STAGING_TAG="v${VERSION}-staging"
           echo "tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
       - name: Ensure staging tag does not already exist
+        if: inputs.create_tag
         env:
           TAG: ${{ steps.tagname.outputs.tag }}
         run: |
@@ -130,17 +178,24 @@ jobs:
             echo "Tag already exists on origin: $TAG"
             exit 1
           fi
-      - name: Commit, push and tag staging cut
+      - name: Commit and push version bump
         id: push
         env:
           VERSION: ${{ steps.bump.outputs.version }}
           TAG: ${{ steps.tagname.outputs.tag }}
+          CREATE_TAG: ${{ inputs.create_tag }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
         run: |
           git add app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.toml app/src-tauri/Cargo.lock Cargo.lock
-          git commit -m "chore(staging): v${VERSION}"
-          git push origin main
-          git tag -a "$TAG" -m "Staging cut $TAG"
-          git push origin "$TAG"
+          # Avoid rebuilding the source branch solely for version metadata.
+          git commit -m "chore(staging): v${VERSION} [skip ci]"
+          git push origin "HEAD:$SOURCE_BRANCH"
+          if [ "$CREATE_TAG" = "true" ]; then
+            git tag -a "$TAG" -m "Staging cut $TAG"
+            git push origin "$TAG"
+          else
+            echo "Skipping tag creation (create_tag=false)"
+          fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Resolve build outputs
         id: resolve
@@ -149,21 +204,36 @@ jobs:
           VERSION: ${{ steps.bump.outputs.version }}
           TAG: ${{ steps.tagname.outputs.tag }}
           SHA: ${{ steps.push.outputs.sha }}
+          CREATE_TAG: ${{ inputs.create_tag }}
         run: |
-          # Match the 12-char truncation runtime code applies to
-          # VITE_BUILD_SHA / OPENHUMAN_BUILD_SHA when constructing the
-          # release tag at startup, so SENTRY_RELEASE assembled in CI
-          # agrees with the tag events emit.
           SHORT_SHA="${SHA:0:12}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          # Build from the immutable staging tag rather than main HEAD so
-          # reruns of this workflow rebuild the same content even if main
-          # has moved on (e.g. another patch cut, or a hotfix landed).
-          echo "build_ref=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$CREATE_TAG" = "true" ]; then
+            # Build from the immutable staging tag rather than release HEAD so
+            # reruns of this workflow rebuild the same content even if release
+            # has moved on (e.g. another patch cut, or a hotfix landed).
+            echo "build_ref=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_ref=$SHA" >> "$GITHUB_OUTPUT"
+          fi
           echo "base_url=https://staging-api.tinyhumans.ai/" >> "$GITHUB_OUTPUT"
+
+      # Keep main in sync: the version-bump commit (and anything else on
+      # release) flows back into main right after the cut — every release
+      # build back-merges, not just production. Runs in both create_tag
+      # variants because the bump commit lands on release in both.
+      # continue-on-error so a merge conflict never strands a cut that is
+      # already tagged — resolve the merge manually in that case.
+      - name: Merge release back into main
+        if: github.ref == 'refs/heads/release'
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          bash scripts/release/merge-release-into-main.sh "chore(staging): merge release v${VERSION}-staging back into main"
 
   # =========================================================================
   # Phase 2: Build desktop artifacts (delegated to reusable workflow)
@@ -171,6 +241,7 @@ jobs:
   build-desktop:
     name: Build desktop matrix
     needs: [prepare-build]
+    if: inputs.create_tag
     uses: ./.github/workflows/build-desktop.yml
     secrets: inherit
     with:
@@ -205,26 +276,47 @@ jobs:
   # Phase 2b: Build the openhuman-core Docker image without pushing.
   # Mirrors the production `build-docker` job so a Dockerfile regression
   # surfaces on the staging cut — no GHCR push, no `:staging-*` tag
-  # pollution. `deploy-smoke.yml` already covers the build path on PRs
-  # that touch Dockerfile / src; this is the equivalent gate at the
-  # staging-tag boundary so a green staging cut means the next prod
+  # pollution. This is the Docker build gate at the staging-tag
+  # boundary so a green staging cut means the next prod
   # promotion's GHCR push will succeed too.
   # =========================================================================
   build-docker:
     name: "Docker: build (no push)"
     needs: [prepare-build]
+    if: inputs.create_tag
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: Production
     steps:
       - name: Checkout build ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-build.outputs.build_ref }}
           fetch-depth: 1
+      # Every submodule, not an enumerated subset. The Dockerfile COPYs vendor/
+      # because [patch.crates-io] resolves Rust SDK crates from vendor/, and an
+      # uninitialised submodule is copied in as an EMPTY directory — cargo then
+      # fails on the missing manifest before it compiles anything.
+      #
+      # This used to name eight paths, to skip "the large tauri-cef fork the
+      # core image doesn't need". That fork stopped being a submodule in
+      # `1843706c3 refactor(tauri): replace CEF runtime with upstream Wry`, so
+      # there is nothing left for the list to exclude: all ten entries in
+      # `.gitmodules` are `path` dependencies of the root crate, and cargo reads
+      # every one of their manifests to resolve, `optional` or not. A subset is
+      # therefore always a bug, which is what the list kept producing — it went
+      # stale three times (tinymemory in `54f8710f`, then tinywallet and
+      # tinyhosts together, issue #5594), and each time the breakage surfaced at
+      # RELEASE time rather than in PR CI.
+      #
+      # Enumerating buys nothing once nothing can legitimately be excluded, so
+      # the enumeration is gone rather than corrected a third time.
+      - name: Init vendored Rust submodules
+        run: git submodule update --init --recursive
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Build image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -252,10 +344,13 @@ jobs:
   record-sentry-deploy:
     name: Record Sentry deploy marker
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: Production
+    if: inputs.create_tag
     needs: [prepare-build, build-desktop, build-docker]
     env:
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_URL: ${{ vars.SENTRY_URL }}
     steps:
       - name: Install sentry-cli
         if: env.SENTRY_AUTH_TOKEN != ''
@@ -265,6 +360,7 @@ jobs:
         if: env.SENTRY_AUTH_TOKEN != ''
         shell: bash
         env:
+          SENTRY_URL: ${{ vars.SENTRY_URL }}
           SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           # Marker lives on the React project's release; events from all
           # surfaces share the same `openhuman@<version>+<short_sha>` release
@@ -283,23 +379,25 @@ jobs:
 
   # =========================================================================
   # Cleanup: delete the staging tag if the build matrix failed. The version
-  # bump commit on `main` stays — reverting it would risk a race with
+  # bump commit on `release` stays — reverting it would risk a race with
   # concurrent merges. The next staging cut just continues from the new
   # patch number; the small “gap” in patch numbers is acceptable.
   # =========================================================================
   cleanup-failed-staging:
     name: Remove staging tag if build failed
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: Production
     needs: [prepare-build, build-desktop, build-docker]
     if: >-
       always()
+      && inputs.create_tag
       && needs.prepare-build.result == 'success'
       && (needs.build-desktop.result == 'failure' || needs.build-desktop.result == 'cancelled'
           || needs.build-docker.result == 'failure' || needs.build-docker.result == 'cancelled')
     steps:
       - name: Delete remote staging tag
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const owner = context.repo.owner;

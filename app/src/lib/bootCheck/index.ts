@@ -25,23 +25,44 @@ const logError = debug('boot-check:error');
 // Result types
 // ---------------------------------------------------------------------------
 
+/** A non-OpenHuman process holding the core RPC port, surfaced so the user can
+ * see what to free (and consent to force-quitting it). */
+export interface PortOwner {
+  pid: number;
+  name: string;
+}
+
 export type BootCheckResult =
   | { kind: 'match' }
   | { kind: 'daemonDetected' }
   | { kind: 'outdatedLocal' }
   | { kind: 'outdatedCloud' }
   | { kind: 'noVersionMethod' }
-  | { kind: 'unreachable'; reason: string };
+  | { kind: 'unreachable'; reason: string; portConflict?: boolean; foreignOwner?: PortOwner };
 
 // ---------------------------------------------------------------------------
 // Transport interface (injectable for tests)
 // ---------------------------------------------------------------------------
+
+// Mirrors the Rust `RecoveryOutcome` JSON: serde serializes `None` as explicit
+// `null`, so the optional fields are nullable, not just absent.
+export interface RecoveryOutcome {
+  success: boolean;
+  message: string;
+  new_port?: number | null;
+  foreign_owner?: PortOwner | null;
+}
 
 export interface BootCheckTransport {
   /** Call a JSON-RPC method on the active core endpoint. */
   callRpc: <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
   /** Invoke a Tauri command. */
   invokeCmd: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  /** Attempt to auto-recover from a port conflict. Optional — only wired in desktop builds. */
+  recoverPortConflict?: () => Promise<RecoveryOutcome>;
+  /** Terminate the foreign process holding the port, after explicit user
+   * consent for that pid. Optional — only wired in desktop builds. */
+  forceQuitPortOwner?: (pid: number) => Promise<RecoveryOutcome>;
 }
 
 // The production transport lives in `app/src/services/bootCheckService.ts`
@@ -136,7 +157,7 @@ type VersionCheckResult = 'match' | 'outdated' | 'noVersionMethod' | 'unreachabl
 async function checkVersion(callRpc: BootCheckTransport['callRpc']): Promise<VersionCheckResult> {
   try {
     // `openhuman.update_version` is wrapped by RpcOutcome::single_log
-    // (see src/openhuman/update/ops.rs + src/rpc/mod.rs::into_cli_compatible_json):
+    // (see src/openhuman/platform/update/ops.rs + src/rpc/mod.rs::into_cli_compatible_json):
     // when logs are present the response shape is `{ result: VersionInfo, logs }`,
     // and VersionInfo is `{ version, target_triple, asset_prefix }`. Earlier
     // attempts read `result.version_info.version` (no such field) and then
@@ -201,22 +222,63 @@ export async function runBootCheck(
   if (mode.kind === 'local') {
     log('[boot-check] local mode — starting core process');
 
+    let startFailed = false;
     try {
       await invokeCmd<void>('start_core_process', {});
       log('[boot-check] start_core_process invoked successfully');
     } catch (err) {
+      startFailed = true;
       logError('[boot-check] start_core_process failed: %o', err);
-      return {
-        kind: 'unreachable',
-        reason: `Failed to start local core: ${err instanceof Error ? err.message : String(err)}`,
-      };
+    }
+
+    // If start failed, attempt port-conflict auto-recovery before giving up.
+    if (startFailed && transport.recoverPortConflict) {
+      log('[boot-check] start_core_process failed — attempting port-conflict auto-recovery');
+      try {
+        const recovery = await transport.recoverPortConflict();
+        log(
+          '[boot-check] port-conflict recovery result: success=%s message=%s',
+          recovery.success,
+          recovery.message
+        );
+        if (!recovery.success) {
+          logError('[boot-check] port-conflict recovery failed: %s', recovery.message);
+          return {
+            kind: 'unreachable',
+            reason: `Failed to start local core — port conflict recovery failed: ${recovery.message}`,
+            portConflict: true,
+            foreignOwner: recovery.foreign_owner ?? undefined,
+          };
+        }
+        // Recovery succeeded — clear the URL cache so we pick up the new port.
+        clearCoreRpcUrlCache();
+        log('[boot-check] port-conflict recovery succeeded, RPC URL cache cleared');
+      } catch (recoveryErr) {
+        logError('[boot-check] port-conflict recovery threw: %o', recoveryErr);
+        return {
+          kind: 'unreachable',
+          reason: `Failed to start local core — recovery error: ${recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr)}`,
+          portConflict: true,
+        };
+      }
+    } else if (startFailed) {
+      return { kind: 'unreachable', reason: `Failed to start local core` };
     }
 
     // Wait for the embedded core to be reachable.
-    const reachable = await waitForCore(callRpc);
+    let reachable = await waitForCore(callRpc);
     if (!reachable) {
-      logError('[boot-check] local core unreachable after retries');
-      return { kind: 'unreachable', reason: 'Local core did not respond in time' };
+      logError('[boot-check] local core unreachable after retries — trying cache clear + retry');
+      clearCoreRpcUrlCache();
+      reachable = await waitForCore(callRpc, 5_000);
+    }
+    if (!reachable) {
+      logError('[boot-check] local core unreachable after retries and cache clear');
+      return {
+        kind: 'unreachable',
+        reason: 'Local core did not respond in time',
+        portConflict: startFailed,
+      };
     }
 
     // Check for a legacy background daemon that should be removed.
@@ -242,6 +304,44 @@ export async function runBootCheck(
     }
     log('[boot-check] local mode — version outdated');
     return { kind: 'outdatedLocal' };
+  }
+
+  // ------------------------------------------------------------------
+  // Gateway mode
+  // ------------------------------------------------------------------
+  //
+  // A gateway is provisioned and health-checked by the Tauri shell before it
+  // ever becomes the active one (`gateway::registry::activate`), and the shell
+  // answers `core_rpc_url` / `core_rpc_token` from it — so by the time the boot
+  // gate runs, the reachability question this function exists to ask has
+  // already been asked and answered somewhere better placed to ask it.
+  //
+  // What *does* have to happen here is re-activation. A provisioned gateway
+  // lives only as long as the process holding its tunnel, so a relaunch starts
+  // with nothing held open and the shell answering `core_rpc_url` from the
+  // embedded core. Without this the user's chosen gateway would silently not be
+  // the one in use — the worst possible failure for this feature, because
+  // everything keeps working against the wrong core.
+  //
+  // The version check is deliberately not repeated: a gateway's core is
+  // whatever image or binary the user pointed at, so "older than this UI" is a
+  // possibility they chose, not a broken install to block on. The
+  // unknown-method classification in `coreRpcClient` handles the consequences
+  // per call, which is where a mismatch actually shows up.
+  if (mode.kind === 'gateway') {
+    log('[boot-check] gateway mode — re-activating id=%s', mode.gatewayId);
+    try {
+      await invokeCmd<unknown>('gateway_activate', { id: mode.gatewayId });
+      log('[boot-check] gateway mode — active');
+      return { kind: 'match' };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logError('[boot-check] gateway mode — activation failed: %s', reason);
+      // Reported rather than silently falling back to the local core: the two
+      // hold different data, and quietly swapping one for the other is how a
+      // user ends up wondering where their conversations went.
+      return { kind: 'unreachable', reason };
+    }
   }
 
   // ------------------------------------------------------------------

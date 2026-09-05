@@ -6,16 +6,10 @@
 // console at runtime via AttachConsole, so command-line output still works.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-// On the CEF runtime, the main binary is re-exec'd as the renderer / GPU /
-// utility helper subprocesses. The `cef_entry_point` macro short-circuits
-// main() when CEF has passed `--type=<role>` in argv, routing straight into
-// CEF's process dispatcher — our normal startup only runs for the browser
-// process. The macro is a no-op relative to our own `core` subcommand
-// multiplexing since that path never carries `--type=`.
-#[tauri::cef_entry_point]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("core") {
+    let sub = args.get(1).map(String::as_str);
+    if sub == Some("core") {
         // CLI path: re-attach to the parent shell's console so eprintln!
         // output lands in the cmd/PowerShell window the user invoked us
         // from. No-op (and harmless) when launched without a parent
@@ -25,6 +19,21 @@ fn main() {
 
         if let Err(err) = openhuman::run_core_from_args(&args[2..]) {
             eprintln!("core process failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // MCP clients (e.g. the Claude Code CLI provider) spawn this binary as
+    // `<bin> mcp` to get a stdio MCP server. The standalone `openhuman-core`
+    // binary already accepts `mcp` directly; route it here too so the desktop
+    // app binary behaves the same instead of falling through to GUI startup.
+    if matches!(sub, Some("mcp") | Some("mcp-server")) {
+        #[cfg(target_os = "windows")]
+        attach_parent_console();
+
+        if let Err(err) = openhuman::run_core_from_args(&args[1..]) {
+            eprintln!("core mcp server failed: {err}");
             std::process::exit(1);
         }
         return;

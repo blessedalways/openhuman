@@ -10,7 +10,7 @@ export const STATUS_STYLES: Record<ChannelConnectionStatus, { label: string; cla
     },
     disconnected: {
       label: 'Disconnected',
-      className: 'bg-stone-100 text-stone-500 border-stone-200',
+      className: 'bg-surface-subtle text-content-muted border-line',
     },
     error: { label: 'Error', className: 'bg-coral-500/10 text-coral-700 border-coral-500/30' },
   };
@@ -49,6 +49,13 @@ export const FALLBACK_DEFINITIONS: ChannelDefinition[] = [
             placeholder: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11',
           },
           {
+            key: 'chat_id',
+            label: 'Chat ID',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Optional: default chat for outbound messages',
+          },
+          {
             key: 'allowed_users',
             label: 'Allowed Users',
             field_type: 'string',
@@ -85,6 +92,20 @@ export const FALLBACK_DEFINITIONS: ChannelDefinition[] = [
             required: false,
             placeholder: 'Optional: restrict to a specific server',
           },
+          {
+            key: 'channel_id',
+            label: 'Channel ID',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Optional: default channel for outbound messages',
+          },
+          {
+            key: 'allowed_users',
+            label: 'Allowed Users',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Comma-separated Discord user IDs, or * for everyone (blank = everyone)',
+          },
         ],
         auth_action: undefined,
       },
@@ -117,5 +138,213 @@ export const FALLBACK_DEFINITIONS: ChannelDefinition[] = [
       },
     ],
     capabilities: ['send_text', 'send_rich_text', 'receive_text'],
+  },
+  // Lark / Feishu — fields must stay aligned with `LarkConfig` in
+  // `src/openhuman/config/schema/channels.rs` and `lark_definition()` in
+  // `src/openhuman/channels/controllers/definitions.rs`. See #2048.
+  {
+    id: 'lark',
+    display_name: 'Lark / Feishu',
+    description: 'Send and receive via Lark (international) or Feishu (中国版).',
+    icon: 'lark',
+    auth_modes: [
+      {
+        mode: 'api_key',
+        description: 'Provide your Lark/Feishu app credentials from the Open Platform.',
+        fields: [
+          {
+            key: 'app_id',
+            label: 'App ID',
+            field_type: 'string',
+            required: true,
+            placeholder: 'cli_xxxxxxxxxxxx',
+          },
+          {
+            key: 'app_secret',
+            label: 'App Secret',
+            field_type: 'secret',
+            required: true,
+            placeholder: 'Your Lark app secret',
+          },
+          {
+            key: 'encrypt_key',
+            label: 'Encrypt Key',
+            field_type: 'secret',
+            required: false,
+            placeholder: 'Optional — required only if you enabled message encryption',
+          },
+          {
+            key: 'verification_token',
+            label: 'Verification Token',
+            field_type: 'secret',
+            required: false,
+            placeholder: 'Optional — used for HTTP webhook verification',
+          },
+          {
+            key: 'use_feishu',
+            label: 'Use Feishu (中国版)',
+            field_type: 'boolean',
+            required: false,
+            placeholder: 'On = open.feishu.cn (China); off = open.larksuite.com',
+          },
+          {
+            key: 'receive_mode',
+            label: 'Receive Mode',
+            field_type: 'string',
+            required: false,
+            placeholder: 'websocket (default) or webhook',
+          },
+          {
+            key: 'port',
+            label: 'Webhook Port',
+            // Numeric — field_type stays 'string' because the schema-driven
+            // form renderer only accepts 'string' | 'secret' | 'boolean'.
+            // LarkConfig parses it back to u16. Keep aligned with the Rust
+            // lark_definition() entry.
+            field_type: 'string',
+            required: false,
+            placeholder: 'Optional — local HTTP port when receive_mode = webhook (e.g. 8080)',
+          },
+          {
+            key: 'allowed_users',
+            label: 'Allowed Users',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Comma-separated open_id / union_id; leave empty to allow any',
+          },
+        ],
+        auth_action: undefined,
+      },
+    ],
+    capabilities: ['send_text', 'receive_text', 'threaded_replies'],
+  },
+  // DingTalk (钉钉) — fields must stay aligned with `DingTalkConfig` in
+  // `src/openhuman/config/schema/channels.rs`. See #2048.
+  {
+    id: 'dingtalk',
+    display_name: 'DingTalk (钉钉)',
+    description: 'Send and receive via DingTalk Stream Mode (钉钉).',
+    icon: 'dingtalk',
+    auth_modes: [
+      {
+        mode: 'api_key',
+        description: 'Provide your DingTalk app credentials from the developer console.',
+        fields: [
+          {
+            key: 'client_id',
+            label: 'Client ID (AppKey)',
+            field_type: 'string',
+            required: true,
+            placeholder: 'ding_xxxxxxxxxxxx',
+          },
+          {
+            key: 'client_secret',
+            label: 'Client Secret (AppSecret)',
+            field_type: 'secret',
+            required: true,
+            placeholder: 'Your DingTalk app secret',
+          },
+          {
+            key: 'allowed_users',
+            label: 'Allowed Users',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Comma-separated DingTalk userIds; leave empty to allow any',
+          },
+        ],
+        auth_action: undefined,
+      },
+    ],
+    capabilities: ['send_text', 'receive_text'],
+  },
+  // Native IMAP/SMTP email (#4280). Field keys map 1:1 to
+  // `config::schema::channels::EmailConfig` and `email_definition()` in
+  // `src/openhuman/channels/controllers/definitions.rs`; keep the two in sync.
+  {
+    id: 'email',
+    display_name: 'Email (IMAP/SMTP)',
+    description: 'Send and receive email via any standard IMAP/SMTP mailbox.',
+    icon: 'email',
+    auth_modes: [
+      {
+        mode: 'api_key',
+        description: "Provide your mailbox's IMAP/SMTP server settings and an app password.",
+        fields: [
+          {
+            key: 'imap_host',
+            label: 'IMAP Host',
+            field_type: 'string',
+            required: true,
+            placeholder: 'imap.fastmail.com',
+          },
+          {
+            key: 'imap_port',
+            label: 'IMAP Port',
+            field_type: 'string',
+            required: false,
+            placeholder: '993 (TLS)',
+          },
+          {
+            key: 'username',
+            label: 'Email Address',
+            field_type: 'string',
+            required: true,
+            placeholder: 'you@example.com',
+          },
+          {
+            key: 'password',
+            label: 'Password / App Password',
+            field_type: 'secret',
+            required: true,
+            placeholder: 'App-specific password (recommended)',
+          },
+          {
+            key: 'smtp_host',
+            label: 'SMTP Host',
+            field_type: 'string',
+            required: true,
+            placeholder: 'smtp.fastmail.com',
+          },
+          {
+            key: 'smtp_port',
+            label: 'SMTP Port',
+            field_type: 'string',
+            required: false,
+            placeholder: '465 (TLS)',
+          },
+          {
+            key: 'smtp_tls',
+            label: 'Use TLS for SMTP',
+            field_type: 'boolean',
+            required: false,
+            placeholder: 'On = TLS (recommended)',
+            default_bool: true,
+          },
+          {
+            key: 'from_address',
+            label: 'From Address',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Optional — defaults to the email address above',
+          },
+          {
+            key: 'imap_folder',
+            label: 'IMAP Folder',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Optional — defaults to INBOX',
+          },
+          {
+            key: 'allowed_senders',
+            label: 'Allowed Senders',
+            field_type: 'string',
+            required: false,
+            placeholder: 'Comma-separated addresses or @domain; * to allow any',
+          },
+        ],
+        auth_action: undefined,
+      },
+    ],
+    capabilities: ['send_text', 'receive_text', 'file_attachments'],
   },
 ];

@@ -1,14 +1,28 @@
-import { useEffect, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
 
+import { useT } from '../../../lib/i18n/I18nContext';
 import {
   openhumanGetComposioTriggerSettings,
   openhumanUpdateComposioTriggerSettings,
 } from '../../../utils/tauriCommands';
-import SettingsHeader from '../components/SettingsHeader';
-import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
+import Button from '../../ui/Button';
+import {
+  SettingsRow,
+  SettingsSection,
+  SettingsStatusLine,
+  SettingsSwitch,
+  SettingsTextField,
+} from '../controls';
+import SettingsPanel from '../layout/SettingsPanel';
 
-const ComposioTriagePanel = () => {
-  const { navigateBack, breadcrumbs } = useSettingsNavigation();
+interface ComposioTriagePanelProps {
+  /** When true, render without the SettingsPanel chrome (used when embedded in
+   *  the Connections Composio page). */
+  embedded?: boolean;
+}
+
+const ComposioTriagePanel = ({ embedded = false }: ComposioTriagePanelProps = {}) => {
+  const { t } = useT();
 
   const [triageDisabled, setTriageDisabled] = useState(false);
   const [disabledToolkits, setDisabledToolkits] = useState('');
@@ -48,7 +62,7 @@ const ComposioTriagePanel = () => {
     try {
       const toolkitList = disabledToolkits
         .split(',')
-        .map(t => t.trim().toLowerCase())
+        .map(e => e.trim().toLowerCase())
         .filter(Boolean);
       await openhumanUpdateComposioTriggerSettings({
         triage_disabled: triageDisabled,
@@ -71,106 +85,77 @@ const ComposioTriagePanel = () => {
     }
   };
 
-  if (loading) {
-    return (
-      <div>
-        <SettingsHeader
-          title="Integration Triggers"
-          showBackButton
-          onBack={navigateBack}
-          breadcrumbs={breadcrumbs}
-        />
-        <div className="p-4">
-          <p className="text-sm text-stone-500">Loading…</p>
-        </div>
-      </div>
+  const wrap = (node: ReactNode) =>
+    embedded ? (
+      <div className="space-y-5">{node}</div>
+    ) : (
+      <SettingsPanel description={t('settings.developerMenu.composio.desc')}>{node}</SettingsPanel>
     );
+
+  if (loading) {
+    return wrap(<p className="text-sm text-content-muted">{t('settings.composio.loading')}</p>);
   }
 
-  return (
-    <div>
-      <SettingsHeader
-        title="Integration Triggers"
-        showBackButton
-        onBack={navigateBack}
-        breadcrumbs={breadcrumbs}
-      />
+  return wrap(
+    <>
+      <p className="text-sm text-content-muted">
+        {t('composio.triageDesc')}{' '}
+        <span className="font-mono">OPENHUMAN_TRIGGER_TRIAGE_DISABLED</span>{' '}
+        {t('composio.envVarOverrides')}
+      </p>
 
-      <div className="p-4 space-y-5">
-        <p className="text-sm text-stone-500">
-          When active, each incoming Composio trigger runs through an AI triage step that classifies
-          the event and may kick off automated actions — one local LLM turn per trigger. Disable
-          globally or per integration if you prefer manual review. If the environment variable{' '}
-          <span className="font-mono">OPENHUMAN_TRIGGER_TRIAGE_DISABLED</span> is set, it overrides
-          these settings and disables triage for all triggers.
-        </p>
+      <SettingsSection>
+        <SettingsRow
+          htmlFor="switch-triage-disabled"
+          label={t('composio.disableAllTriage')}
+          description={t('composio.triggersStillRecorded')}
+          control={
+            <SettingsSwitch
+              id="switch-triage-disabled"
+              checked={triageDisabled}
+              onCheckedChange={next => setTriageDisabled(next)}
+              aria-label={t('composio.disableAllTriage')}
+            />
+          }
+        />
+      </SettingsSection>
 
-        {/* Global toggle */}
-        <div className="rounded-2xl border border-stone-200 bg-stone-50/60 p-4 space-y-1">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={triageDisabled}
-            aria-label="Disable AI triage for all triggers"
-            onClick={() => setTriageDisabled(v => !v)}
-            className="w-full flex items-center justify-between">
-            <div className="text-left">
-              <span className="text-sm font-medium text-stone-900">
-                Disable AI triage for all triggers
-              </span>
-              <p className="text-xs text-stone-500 mt-0.5">
-                Triggers are still recorded to history — no LLM turn is run.
-              </p>
-            </div>
-            <div
-              className={`ml-3 flex-shrink-0 w-9 h-5 rounded-full transition-colors relative ${
-                triageDisabled ? 'bg-coral-400' : 'bg-stone-200'
-              }`}>
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
-                  triageDisabled ? 'translate-x-4' : 'translate-x-0.5'
-                }`}
-              />
-            </div>
-          </button>
-        </div>
+      <SettingsSection
+        title={t('composio.disableSpecificIntegrations')}
+        description={`${t('composio.integrationSlugsHelp')} ${t('composio.integrationSlugsExample')}. ${t('composio.integrationSlugsCaseInsensitive')}`}>
+        <SettingsRow
+          stacked
+          disabled={triageDisabled}
+          control={
+            <SettingsTextField
+              id="disabled-toolkits"
+              value={disabledToolkits}
+              onChange={e => setDisabledToolkits(e.target.value)}
+              placeholder={t('composio.integrationSlugsPlaceholder')}
+              disabled={triageDisabled}
+              aria-label={t('composio.disableSpecificIntegrations')}
+            />
+          }
+        />
+      </SettingsSection>
 
-        {/* Per-toolkit list */}
-        <div className={`space-y-2 ${triageDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
-          <label className="block text-sm font-medium text-stone-800" htmlFor="disabled-toolkits">
-            Disable AI triage for specific integrations
-          </label>
-          <p className="text-xs text-stone-500">
-            Comma-separated integration slugs, e.g. <span className="font-mono">gmail, slack</span>.
-            Case-insensitive.
-          </p>
-          <input
-            id="disabled-toolkits"
-            type="text"
-            value={disabledToolkits}
-            onChange={e => setDisabledToolkits(e.target.value)}
-            placeholder="gmail, slack, ..."
-            disabled={triageDisabled}
-            className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-900 placeholder-stone-400 focus:border-primary-400 focus:outline-none focus:ring-1 focus:ring-primary-400 disabled:cursor-not-allowed"
-          />
-        </div>
-
-        <button
+      <div className="flex items-center gap-3">
+        <Button
           type="button"
-          onClick={handleSave}
-          disabled={saving}
-          className="w-full py-2 rounded-xl bg-primary-600 text-white text-sm font-medium hover:bg-primary-500 transition-colors disabled:opacity-50">
-          {saving ? 'Saving…' : 'Save'}
-        </button>
-
-        {saveStatus === 'saved' && (
-          <p className="text-xs text-center text-green-600">Settings saved</p>
-        )}
-        {saveStatus === 'error' && (
-          <p className="text-xs text-center text-red-500">Failed to save. Try again.</p>
-        )}
+          variant="primary"
+          size="sm"
+          onClick={() => void handleSave()}
+          disabled={saving}>
+          {saving ? t('common.loading') : t('common.save')}
+        </Button>
+        <SettingsStatusLine
+          saving={saving}
+          savedNote={saveStatus === 'saved' ? t('composio.settingsSaved') : null}
+          error={saveStatus === 'error' ? t('composio.saveFailed') : null}
+          savingLabel={t('common.loading')}
+        />
       </div>
-    </div>
+    </>
   );
 };
 
