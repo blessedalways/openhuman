@@ -21,9 +21,31 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: hoisted.invoke, isTauri: hoiste
 vi.mock('../../../../services/analytics', () => ({ triggerSentryTestEvent: hoisted.trigger }));
 
 vi.mock('../../../../utils/config', () => ({
+  APP_BINARY_VERSION: '0.0.0-test',
   get APP_ENVIRONMENT() {
     return hoisted.appEnvironment;
   },
+  APP_VERSION: '0.0.0-test',
+  BUILD_SHA: 'test',
+  CORE_CARGO_VERSION: '0.0.0-test',
+  GA_MEASUREMENT_ID: undefined,
+  IS_DEV: true,
+  OPENPANEL_API_URL: 'https://panel.tinyhumans.ai/api',
+  OPENPANEL_CLIENT_ID: undefined,
+  SENTRY_DSN: undefined,
+  SENTRY_RELEASE: 'openhuman@test',
+  SENTRY_SMOKE_TEST: false,
+  TAURI_CARGO_VERSION: '0.0.0-test',
+  // Pulled transitively via `resetWalkthrough` → configPersistence.
+  CORE_RPC_URL: 'http://127.0.0.1:7788/rpc',
+  BACKEND_URL: 'http://localhost:5005',
+  // Required by coreModeSlice (pulled transitively via renderWithProviders).
+  E2E_DEFAULT_CORE_MODE: '',
+}));
+
+vi.mock('../../../walkthrough/AppWalkthrough', () => ({
+  resetWalkthrough: vi.fn(),
+  setWalkthroughPending: vi.fn(),
 }));
 
 vi.mock('../../hooks/useSettingsNavigation', () => ({
@@ -56,6 +78,20 @@ describe('DeveloperOptionsPanel — CoreModeBadge', () => {
     expect(screen.getByText(/Embedded core sidecar/i)).toBeInTheDocument();
   });
 
+  test('shows the gateway id, and no URL or token, when coreMode is a gateway', async () => {
+    // A provisioned gateway's URL and bearer are the shell's — minted per
+    // activation and never persisted here — so the id is all this panel has,
+    // and all a developer needs in order to find it in Settings.
+    const Panel = (await import('../DeveloperOptionsPanel')).default;
+
+    renderWithProviders(<Panel />, {
+      preloadedState: { coreMode: { mode: { kind: 'gateway', gatewayId: 'builder' } } },
+    });
+
+    expect(await screen.findByText('builder')).toBeInTheDocument();
+    expect(screen.queryByText(/^http/)).not.toBeInTheDocument();
+  });
+
   test('shows "Cloud" pill plus URL and masked token tail when coreMode is cloud', async () => {
     vi.resetModules();
     const Panel = await importPanel();
@@ -79,7 +115,7 @@ describe('DeveloperOptionsPanel — CoreModeBadge', () => {
         coreMode: { mode: { kind: 'cloud', url: 'https://core.example.com/rpc' } },
       },
     });
-    expect(screen.getByText(/not set — RPC will 401/i)).toBeInTheDocument();
+    expect(screen.getByText(/not set: RPC will 401/i)).toBeInTheDocument();
   });
 
   test('shows "not set" warning when coreMode is unset', async () => {
@@ -87,6 +123,28 @@ describe('DeveloperOptionsPanel — CoreModeBadge', () => {
     const Panel = await importPanel();
     renderWithProviders(<Panel />, { preloadedState: { coreMode: { mode: { kind: 'unset' } } } });
     expect(screen.getByText(/Core mode: not set/i)).toBeInTheDocument();
+  });
+
+  test('localizes developer menu destinations', async () => {
+    hoisted.isTauri.mockReturnValue(false);
+    vi.resetModules();
+    const Panel = await importPanel();
+    const { I18nProvider } = await import('../../../../lib/i18n/I18nContext');
+    renderWithProviders(
+      <I18nProvider>
+        <Panel />
+      </I18nProvider>,
+      { preloadedState: { locale: { current: 'zh-CN' } } }
+    );
+
+    // 'AI 配置' was removed from Developer Options in Pass A, and the whole
+    // Knowledge & Memory group was retired. Assert a destination that IS
+    // present: 事件日志 (Event Log).
+    expect(screen.getByText('事件日志')).toBeInTheDocument();
+    expect(screen.queryByText('屏幕感知')).not.toBeInTheDocument();
+    // Composio triggers moved to the Connections Composio page — assert a
+    // destination that IS still present: MCP 服务器 (MCP Server).
+    expect(screen.getByText('MCP 服务器')).toBeInTheDocument();
   });
 });
 

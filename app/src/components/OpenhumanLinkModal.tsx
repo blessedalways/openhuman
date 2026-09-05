@@ -11,16 +11,15 @@
  * Mounted once at AppShell root.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 
 import { useChannelDefinitions } from '../hooks/useChannelDefinitions';
+import { useT } from '../lib/i18n/I18nContext';
 import {
   ensureNotificationPermission,
   getNotificationPermissionState,
   type NotificationPermissionState,
   showNativeNotification,
 } from '../lib/nativeNotifications/tauriBridge';
-import { isTauri, purgeWebviewAccount } from '../services/webviewAccountService';
 import { addAccount, removeAccount, setActiveAccount } from '../store/accountsSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import {
@@ -29,10 +28,13 @@ import {
   type AccountStatus,
   PROVIDERS,
 } from '../types/accounts';
-import { BILLING_DASHBOARD_URL } from '../utils/links';
+import { BILLING_DASHBOARD_URL, DISCORD_INVITE_URL } from '../utils/links';
 import { openUrl } from '../utils/openUrl';
+import { isTauri } from '../utils/tauriCommands/common';
 import { ProviderIcon } from './accounts/providerIcons';
 import ChannelSetupModal from './channels/ChannelSetupModal';
+import Button from './ui/Button';
+import ModalShell from './ui/ModalShell';
 
 interface OpenhumanLinkEvent {
   path: string;
@@ -40,13 +42,29 @@ interface OpenhumanLinkEvent {
 
 export const OPENHUMAN_LINK_EVENT = 'openhuman-link';
 
+const ALLOWED_PATHS = [
+  'settings/notifications',
+  'settings/billing',
+  'settings/messaging',
+  'community/discord',
+  'community/discord-report',
+  'accounts/setup',
+] as const;
+
+type AllowedPath = (typeof ALLOWED_PATHS)[number];
+
+const ALLOWED_PATHS_SET = new Set<string>(ALLOWED_PATHS);
+
 const OpenhumanLinkModal = () => {
-  const [activePath, setActivePath] = useState<string | null>(null);
+  const { t } = useT();
+  const [activePath, setActivePath] = useState<AllowedPath | null>(null);
 
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<OpenhumanLinkEvent>).detail;
-      if (detail?.path) setActivePath(detail.path);
+      if (detail?.path && ALLOWED_PATHS_SET.has(detail.path)) {
+        setActivePath(detail.path as AllowedPath);
+      }
     };
     window.addEventListener(OPENHUMAN_LINK_EVENT, handler);
     return () => window.removeEventListener(OPENHUMAN_LINK_EVENT, handler);
@@ -64,34 +82,13 @@ const OpenhumanLinkModal = () => {
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onClick={close}
-      role="dialog"
-      aria-modal="true">
-      <div
-        className="w-full max-w-md rounded-2xl bg-white shadow-xl overflow-hidden"
-        onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-stone-100 px-5 py-3">
-          <h2 className="text-sm font-semibold text-stone-900">{titleForPath(activePath)}</h2>
-          <button
-            type="button"
-            onClick={close}
-            aria-label="Close"
-            className="rounded p-1 text-stone-500 hover:bg-stone-100 hover:text-stone-800">
-            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 6l12 12M6 18L18 6"
-              />
-            </svg>
-          </button>
-        </div>
-        <div className="p-5">{renderBody(activePath, close)}</div>
-      </div>
-    </div>
+    <ModalShell
+      onClose={close}
+      title={titleForPath(activePath, t)}
+      titleId="openhuman-link-modal-title"
+      contentClassName="p-5">
+      {renderBody(activePath, close)}
+    </ModalShell>
   );
 };
 
@@ -102,14 +99,15 @@ const OpenhumanLinkModal = () => {
  * so the user gets feedback instead of a flashing screen.
  */
 const MessagingSetupBridge = ({ onClose }: { onClose: () => void }) => {
+  const { t } = useT();
   const { definitions, loading } = useChannelDefinitions();
   const telegram = useMemo(() => definitions.find(d => d.id === 'telegram') ?? null, [definitions]);
 
   if (loading && !telegram) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-        <div className="rounded-2xl bg-white px-6 py-4 text-sm text-stone-600 shadow-xl">
-          Loading channel setup…
+        <div className="rounded-2xl bg-surface px-6 py-4 text-sm text-content-secondary shadow-xl">
+          {t('app.openhumanLink.loadingChannelSetup')}
         </div>
       </div>
     );
@@ -121,19 +119,13 @@ const MessagingSetupBridge = ({ onClose }: { onClose: () => void }) => {
         className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
         onClick={onClose}>
         <div
-          className="rounded-2xl bg-white p-6 text-sm text-stone-700 shadow-xl max-w-sm"
+          className="rounded-2xl bg-surface p-6 text-sm text-content-secondary shadow-xl max-w-sm"
           onClick={e => e.stopPropagation()}>
-          <p>
-            Telegram channel definition isn't available right now. Try again from Settings →
-            Messaging.
-          </p>
+          <p>{t('app.openhumanLink.telegramUnavailable')}</p>
           <div className="mt-3 flex justify-end">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50">
-              Close
-            </button>
+            <Button variant="secondary" size="sm" onClick={onClose}>
+              {t('common.close')}
+            </Button>
           </div>
         </div>
       </div>
@@ -143,24 +135,24 @@ const MessagingSetupBridge = ({ onClose }: { onClose: () => void }) => {
   return <ChannelSetupModal definition={telegram} onClose={onClose} />;
 };
 
-function titleForPath(path: string): string {
+function titleForPath(path: AllowedPath, t: (k: string) => string): string {
   switch (path) {
     case 'settings/notifications':
-      return 'Allow notifications';
+      return t('app.openhumanLink.title.notifications');
     case 'settings/billing':
-      return 'Billing & credits';
+      return t('app.openhumanLink.title.billing');
     case 'settings/messaging':
-      return 'Connect a chat channel';
+      return t('app.openhumanLink.title.messaging');
     case 'community/discord':
-      return 'Join the community';
+      return t('app.openhumanLink.title.discord');
+    case 'community/discord-report':
+      return t('app.openhumanLink.title.discordReport');
     case 'accounts/setup':
-      return 'Connect your apps';
-    default:
-      return 'Settings';
+      return t('app.openhumanLink.title.accounts');
   }
 }
 
-function renderBody(path: string, close: () => void) {
+function renderBody(path: AllowedPath, close: () => void) {
   switch (path) {
     case 'settings/notifications':
       return <NotificationsBody close={close} />;
@@ -174,24 +166,17 @@ function renderBody(path: string, close: () => void) {
       return null;
     case 'community/discord':
       return <DiscordBody close={close} />;
+    case 'community/discord-report':
+      return <DiscordReportBody close={close} />;
     case 'accounts/setup':
       return <AccountsSetupBody close={close} />;
-    default:
-      return (
-        <div className="space-y-3 text-sm text-stone-700">
-          <p>
-            This setting isn't ready in the popup yet. Open the full settings page when you're
-            ready.
-          </p>
-          <DoneFooter close={close} />
-        </div>
-      );
   }
 }
 
 // ── Notifications ────────────────────────────────────────────────────────
 
 const NotificationsBody = ({ close }: { close: () => void }) => {
+  const { t } = useT();
   const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
   const [permissionState, setPermissionState] = useState<NotificationPermissionState>('unknown');
@@ -217,9 +202,7 @@ const NotificationsBody = ({ close }: { close: () => void }) => {
     try {
       if (!isTauri()) {
         setStatus('error');
-        setError(
-          'Native notifications are only available in the desktop app (run `pnpm dev:app`).'
-        );
+        setError(t('app.openhumanLink.notifications.desktopOnly'));
         return;
       }
 
@@ -228,22 +211,17 @@ const NotificationsBody = ({ close }: { close: () => void }) => {
         const nextState = await getNotificationPermissionState({ requestIfNeeded: false });
         setPermissionState(nextState);
         setStatus('error');
-        setError(
-          'Notification permission is off. Enable OpenHuman in System Settings → Notifications, then retry.'
-        );
+        setError(t('app.openhumanLink.notifications.permissionOff'));
         return;
       }
       const sendResult = await showNativeNotification({
-        title: 'OpenHuman is good to go',
-        body: 'You will get pings here when something needs your attention.',
+        title: t('app.openhumanLink.notifications.welcomeTitle'),
+        body: t('app.openhumanLink.notifications.welcomeBody'),
         tag: 'welcome-notification-test',
       });
       if (!sendResult.delivered) {
         setStatus('error');
-        setError(
-          sendResult.error ??
-            'OpenHuman could not trigger a system notification. Check OS notification settings and retry.'
-        );
+        setError(sendResult.error ?? t('app.openhumanLink.notifications.triggerFailed'));
         return;
       }
       setPermissionState('granted');
@@ -255,45 +233,39 @@ const NotificationsBody = ({ close }: { close: () => void }) => {
   };
 
   return (
-    <div className="space-y-4 text-sm text-stone-700">
-      <p>
-        OpenHuman uses native notifications so it can ping you when something needs your attention,
-        even when the chat window is hidden.
-      </p>
+    <div className="space-y-4 text-sm text-content-secondary">
+      <p>{t('app.openhumanLink.notifications.intro')}</p>
       {permissionState === 'denied' && (
-        <div className="rounded-xl border border-coral-200 bg-coral-50 p-3 text-xs text-coral-700">
-          Notifications are currently blocked.
+        <div className="rounded-xl border border-coral-200 bg-coral-50 dark:bg-coral-500/15 p-3 text-xs text-coral-700 dark:text-coral-300">
+          {t('app.openhumanLink.notifications.blocked')}
           <br />
-          1. Open System Settings → Notifications → OpenHuman
+          {t('app.openhumanLink.notifications.blockedStep1')}
           <br />
-          2. Turn on Allow Notifications
+          {t('app.openhumanLink.notifications.blockedStep2')}
           <br />
-          3. Return here and tap Retry test notification
+          {t('app.openhumanLink.notifications.blockedStep3')}
         </div>
       )}
       {(permissionState === 'prompt' || permissionState === 'unknown') && (
-        <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-xs text-stone-700">
-          First step: tap Send test notification and allow permission in the macOS prompt.
+        <div className="rounded-xl border border-line bg-surface-muted p-3 text-xs text-content-secondary">
+          {t('app.openhumanLink.notifications.promptHint')}
         </div>
       )}
-      <button
-        type="button"
-        onClick={() => void handleAllow()}
-        disabled={status === 'sending'}
-        className="w-full rounded-xl bg-primary-500 text-white text-sm font-medium py-2.5 hover:bg-primary-600 transition-colors disabled:opacity-60">
+      <Button onClick={() => void handleAllow()} disabled={status === 'sending'} className="w-full">
         {status === 'sending'
-          ? 'Asking your OS…'
+          ? t('app.openhumanLink.notifications.asking')
           : status === 'error'
-            ? 'Retry test notification'
-            : 'Send test notification'}
-      </button>
+            ? t('app.openhumanLink.notifications.retry')
+            : t('app.openhumanLink.notifications.send')}
+      </Button>
       {status === 'sent' && (
-        <p className="text-xs text-sage-700">
-          Test notification sent. If you didn’t receive it, go to System Settings → Notifications →
-          OpenHuman, turn on Allow Notifications, and set Banner Style to Persistent.
+        <p className="text-xs text-sage-700">{t('app.openhumanLink.notifications.sent')}</p>
+      )}
+      {status === 'error' && (
+        <p className="text-xs text-coral-600">
+          {t('app.openhumanLink.notifications.sendFailed').replace('{error}', error ?? '')}
         </p>
       )}
-      {status === 'error' && <p className="text-xs text-coral-600">Couldn't send: {error}</p>}
       <DoneFooter close={close} />
     </div>
   );
@@ -302,67 +274,98 @@ const NotificationsBody = ({ close }: { close: () => void }) => {
 // ── Billing ──────────────────────────────────────────────────────────────
 
 const BillingBody = ({ close }: { close: () => void }) => {
+  const { t } = useT();
   return (
-    <div className="space-y-4 text-sm text-stone-700">
-      <div className="rounded-xl border border-stone-200 bg-stone-50 p-4">
-        <p className="text-xs uppercase tracking-wide text-stone-500">Trial credit</p>
-        <p className="mt-1 text-2xl font-semibold text-stone-900">$1.00</p>
-        <p className="mt-1 text-xs text-stone-500">
-          More than enough to play around. Top up or pick a plan when you want real usage.
+    <div className="space-y-4 text-sm text-content-secondary">
+      <div className="rounded-xl border border-line bg-surface-muted p-4">
+        <p className="text-xs uppercase tracking-wide text-content-muted">
+          {t('app.openhumanLink.billing.trialCredit')}
+        </p>
+        <p className="mt-1 text-2xl font-semibold text-content">
+          {t('onboarding.runtimeChoice.cloud.creditHighlight')}
+        </p>
+        <p className="mt-1 text-xs text-content-muted">
+          {t('app.openhumanLink.billing.trialDesc')}
         </p>
       </div>
-      <button
-        type="button"
+      <Button
         onClick={() => {
           void openUrl(BILLING_DASHBOARD_URL).catch(() => {});
         }}
-        className="w-full rounded-xl bg-primary-500 text-white text-sm font-medium py-2.5 hover:bg-primary-600 transition-colors">
-        Open dashboard in browser
-      </button>
-      <DoneFooter close={close} skipLabel="Stay on trial" />
+        className="w-full">
+        {t('app.openhumanLink.billing.openDashboard')}
+      </Button>
+      <DoneFooter close={close} skipLabel={t('app.openhumanLink.billing.stayOnTrial')} />
     </div>
   );
 };
 
 // ── Discord ──────────────────────────────────────────────────────────────
 
-const DISCORD_INVITE_URL = 'https://discord.tinyhumans.ai/';
-
 const DiscordBody = ({ close }: { close: () => void }) => {
+  const { t } = useT();
   return (
-    <div className="space-y-4 text-sm text-stone-700">
-      <p>
-        Hop into our Discord and link your OpenHuman account. You'll get exclusive early access to
-        features, free credits to play with, a great community to nerd out with, and yes, free
-        merch.
-      </p>
-      <ul className="space-y-1.5 text-xs text-stone-600 pl-1">
+    <div className="space-y-4 text-sm text-content-secondary">
+      <p>{t('app.openhumanLink.discord.intro')}</p>
+      <ul className="space-y-1.5 text-xs text-content-secondary pl-1">
         <li className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 flex-shrink-0" />
-          Exclusive feature access
+          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 shrink-0" />
+          {t('app.openhumanLink.discord.perk1')}
         </li>
         <li className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 flex-shrink-0" />
-          Free credits for active members
+          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 shrink-0" />
+          {t('app.openhumanLink.discord.perk2')}
         </li>
         <li className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 flex-shrink-0" />
-          Community of builders and operators
+          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 shrink-0" />
+          {t('app.openhumanLink.discord.perk3')}
         </li>
         <li className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 flex-shrink-0" />
-          Free merch when you stick around
+          <span className="h-1.5 w-1.5 rounded-full bg-primary-400 shrink-0" />
+          {t('app.openhumanLink.discord.perk4')}
         </li>
       </ul>
-      <button
-        type="button"
-        onClick={() => {
-          void openUrl(DISCORD_INVITE_URL).catch(() => {});
+      <Button
+        onClick={async () => {
+          try {
+            await openUrl(DISCORD_INVITE_URL);
+          } catch {
+            // Ignore launcher errors from OS URL handler failures.
+          }
         }}
-        className="w-full rounded-xl bg-primary-500 text-white text-sm font-medium py-2.5 hover:bg-primary-600 transition-colors">
-        Open Discord invite
-      </button>
-      <DoneFooter close={close} skipLabel="Maybe later" />
+        className="w-full">
+        {t('app.openhumanLink.discord.openInvite')}
+      </Button>
+      <DoneFooter close={close} skipLabel={t('app.openhumanLink.maybeLater')} />
+    </div>
+  );
+};
+
+/**
+ * Error-report variant of the Discord modal. Shown when an agent error pill
+ * with path "community/discord-report" is clicked. Distinct from DiscordBody
+ * (join-community flow):
+ *  - Leads with an apology/acknowledgement copy.
+ *  - Offers an "Open Discord" primary button to jump straight to the server
+ *    (and closes the modal).
+ */
+const DiscordReportBody = ({ close }: { close: () => void }) => {
+  const { t } = useT();
+
+  return (
+    <div className="space-y-4 text-sm text-content-secondary">
+      <p>{t('app.openhumanLink.discordReport.intro')}</p>
+      <Button
+        onClick={async () => {
+          try {
+            await openUrl(DISCORD_INVITE_URL);
+          } finally {
+            close();
+          }
+        }}
+        className="w-full">
+        {t('app.openhumanLink.discordReport.openDiscord')}
+      </Button>
     </div>
   );
 };
@@ -377,6 +380,7 @@ const DiscordBody = ({ close }: { close: () => void }) => {
  */
 const ACCOUNTS_SETUP_PROVIDERS: readonly AccountProvider[] = [
   'whatsapp',
+  'wechat',
   'telegram',
   'slack',
   'discord',
@@ -395,27 +399,31 @@ function makeAccountId(): string {
   return `acct-${Date.now().toString(36)}`;
 }
 
-/** Status label + color for a given account lifecycle status. */
-function statusDisplay(status: AccountStatus): { label: string; dotClass: string } {
+/**
+ * Translation key + color for a given account lifecycle status. Returns a
+ * `labelKey` (not a literal) so the caller can localize it via `useT()` —
+ * this is a module-level helper with no hook scope of its own.
+ */
+export function statusDisplay(status: AccountStatus): { labelKey: string; dotClass: string } {
   switch (status) {
     case 'open':
-      return { label: 'Connected', dotClass: 'bg-emerald-500' };
+      return { labelKey: 'app.openhumanLink.status.connected', dotClass: 'bg-emerald-500' };
     case 'loading':
-      return { label: 'Loading…', dotClass: 'bg-amber-400' };
+      return { labelKey: 'app.openhumanLink.status.loading', dotClass: 'bg-amber-400' };
     case 'pending':
-      return { label: 'Needs sign-in', dotClass: 'bg-amber-400' };
+      return { labelKey: 'app.openhumanLink.status.needsSignIn', dotClass: 'bg-amber-400' };
     case 'timeout':
-      return { label: 'Timed out', dotClass: 'bg-red-400' };
+      return { labelKey: 'app.openhumanLink.status.timedOut', dotClass: 'bg-red-400' };
     case 'error':
-      return { label: 'Error', dotClass: 'bg-red-400' };
+      return { labelKey: 'app.openhumanLink.status.error', dotClass: 'bg-red-400' };
     case 'closed':
-      return { label: 'Closed', dotClass: 'bg-stone-300' };
+      return { labelKey: 'app.openhumanLink.status.closed', dotClass: 'bg-stone-300' };
   }
 }
 
 const AccountsSetupBody = ({ close }: { close: () => void }) => {
+  const { t } = useT();
   const dispatch = useAppDispatch();
-  const navigate = useNavigate();
   const accountsById = useAppSelector(s => s.accounts.accounts);
   const order = useAppSelector(s => s.accounts.order);
 
@@ -445,7 +453,6 @@ const AccountsSetupBody = ({ close }: { close: () => void }) => {
     if (currentlyOn) {
       const existing = accountByProvider.get(providerId);
       if (!existing) return;
-      void purgeWebviewAccount(existing.id).catch(() => {});
       setNewlyAdded(prev => {
         const next = new Map(prev);
         next.delete(existing.id);
@@ -467,26 +474,23 @@ const AccountsSetupBody = ({ close }: { close: () => void }) => {
 
   const handleDone = () => {
     close();
-    // Navigate to /chat and activate the first newly-added account so its
-    // WebviewHost mounts and the auth flow starts immediately.
+    // Activate the first newly-added account so the shell-level WebviewHost
+    // opens the auth flow immediately without mutating the current route.
     const firstNew = [...newlyAdded.keys()][0];
     if (firstNew) {
       dispatch(setActiveAccount(firstNew));
-      navigate('/chat');
     }
   };
 
   // Dynamic CTA based on what's been toggled on
   const firstNewLabel = [...newlyAdded.values()][0];
-  const doneLabel = firstNewLabel ? `Continue with ${firstNewLabel} sign-in` : 'Done';
+  const doneLabel = firstNewLabel
+    ? t('app.openhumanLink.accounts.continueWith').replace('{label}', firstNewLabel)
+    : t('app.openhumanLink.accounts.done');
 
   return (
-    <div className="space-y-4 text-sm text-stone-700">
-      <p>
-        Pick the chat apps and inboxes you already use. We'll add them as built-in webviews here so
-        you can ditch six browser tabs and stick with one app, and the agent can listen in across
-        all of them in the background.
-      </p>
+    <div className="space-y-4 text-sm text-content-secondary">
+      <p>{t('app.openhumanLink.accounts.intro')}</p>
       <div className="space-y-2">
         {providerDescriptors.map(p => {
           const acct = accountByProvider.get(p.id);
@@ -495,32 +499,34 @@ const AccountsSetupBody = ({ close }: { close: () => void }) => {
           return (
             <div
               key={p.id}
-              className="flex items-center gap-3 rounded-xl border border-stone-100 bg-white p-3">
+              className="flex items-center gap-3 rounded-xl border border-line-subtle bg-surface p-3">
               <ProviderIcon provider={p.id} className="h-5 w-5 flex-none" />
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium text-stone-900">{p.label}</div>
+                <div className="text-sm font-medium text-content">{p.label}</div>
                 {on && status ? (
                   <div className="flex items-center gap-1.5">
                     <span
                       className={`inline-block h-1.5 w-1.5 rounded-full ${statusDisplay(status).dotClass}`}
                     />
-                    <span className="text-xs text-stone-500">{statusDisplay(status).label}</span>
+                    <span className="text-xs text-content-muted">
+                      {t(statusDisplay(status).labelKey)}
+                    </span>
                   </div>
                 ) : (
-                  <p className="line-clamp-1 text-xs text-stone-500">{p.description}</p>
+                  <p className="line-clamp-1 text-xs text-content-muted">{p.description}</p>
                 )}
               </div>
               <button
                 type="button"
                 role="switch"
                 aria-checked={on}
-                aria-label={`${on ? 'Disconnect' : 'Connect'} ${p.label}`}
+                aria-label={`${on ? t('skills.disconnect') : t('skills.connect')} ${p.label}`}
                 onClick={() => handleToggle(p.id, p.label, on)}
-                className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${
-                  on ? 'bg-primary-500' : 'bg-stone-200'
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  on ? 'bg-primary-500' : 'bg-surface-strong'
                 }`}>
                 <span
-                  className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                  className={`inline-block h-5 w-5 transform rounded-full bg-surface shadow transition-transform ${
                     on ? 'translate-x-5' : 'translate-x-0.5'
                   }`}
                 />
@@ -529,10 +535,7 @@ const AccountsSetupBody = ({ close }: { close: () => void }) => {
           );
         })}
       </div>
-      <p className="text-xs text-stone-400">
-        Toggling on adds a private webview. You'll sign in the first time you open it — credentials
-        stay on your device.
-      </p>
+      <p className="text-xs text-content-faint">{t('app.openhumanLink.accounts.webviewNote')}</p>
       <DoneFooter close={close} onDone={handleDone} doneLabel={doneLabel} />
     </div>
   );
@@ -543,28 +546,27 @@ const AccountsSetupBody = ({ close }: { close: () => void }) => {
 const DoneFooter = ({
   close,
   onDone,
-  doneLabel = 'Done',
-  skipLabel = 'Skip for now',
+  doneLabel,
+  skipLabel,
 }: {
   close: () => void;
   onDone?: () => void;
   doneLabel?: string;
   skipLabel?: string;
-}) => (
-  <div className="flex items-center justify-between gap-3 pt-1">
-    <button
-      type="button"
-      onClick={close}
-      className="text-xs font-medium text-stone-500 hover:text-stone-800">
-      {skipLabel}
-    </button>
-    <button
-      type="button"
-      onClick={onDone ?? close}
-      className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50">
-      {doneLabel}
-    </button>
-  </div>
-);
+}) => {
+  const { t } = useT();
+  const resolvedDone = doneLabel ?? t('app.openhumanLink.done');
+  const resolvedSkip = skipLabel ?? t('app.openhumanLink.skipForNow');
+  return (
+    <div className="flex items-center justify-between gap-3 pt-1">
+      <Button variant="tertiary" size="sm" onClick={close}>
+        {resolvedSkip}
+      </Button>
+      <Button variant="secondary" size="sm" onClick={onDone ?? close}>
+        {resolvedDone}
+      </Button>
+    </div>
+  );
+};
 
 export default OpenhumanLinkModal;

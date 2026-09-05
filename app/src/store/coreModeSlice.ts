@@ -1,9 +1,20 @@
 /**
  * coreModeSlice — persists the user's chosen core connection mode across
- * launches.  Two kinds of mode exist:
+ * launches.  Three kinds of mode exist:
  *
- *   local  — embedded in-process core; spawned by the Tauri shell on demand.
- *   cloud  — user-supplied HTTP(S) URL to a remote core RPC endpoint.
+ *   local    — embedded in-process core; spawned by the Tauri shell on demand.
+ *   cloud    — user-supplied HTTP(S) URL to a remote core RPC endpoint.
+ *   gateway  — a core the Tauri shell provisions and runs somewhere else: in a
+ *              Docker container, on a machine reached over SSH, or a container
+ *              on a machine over SSH (`app/src-tauri/src/gateway/`).
+ *
+ * The gateway mode stores only an **id**.  Everything about how to reach that
+ * core — an SSH destination, an identity path, a bearer — lives shell-side in
+ * `gateways.json` and is never handed to the renderer, because a renderer XSS
+ * can read anything in `localStorage` (see the audit-U3 note on
+ * `CORE_TOKEN_STORAGE_KEY` in `configPersistence.ts`).  Cloud mode predates
+ * that reasoning and still keeps its token here; new credentials do not follow
+ * it.
  *
  * `unset` is the initial value shown to first-time users; the BootCheckGate
  * forces the user to pick before the rest of the app mounts.  After that the
@@ -11,6 +22,10 @@
  * it is pre-login and not tied to any particular user identity.
  */
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
+import { REHYDRATE } from 'redux-persist';
+
+import { E2E_DEFAULT_CORE_MODE } from '../utils/config';
+import { normalizeRpcUrl } from '../utils/configPersistence';
 
 export type CoreMode =
   | { kind: 'unset' }
@@ -25,6 +40,15 @@ export type CoreMode =
        * a token) still hydrates; the BootCheckGate picker requires a value.
        */
       token?: string;
+    }
+  | {
+      kind: 'gateway';
+      /**
+       * Which shell-side gateway record to activate.  Resolved through the
+       * `gateway_activate` Tauri command, which answers with the URL and
+       * bearer; those are never persisted here.
+       */
+      gatewayId: string;
     };
 
 export interface CoreModeState {
@@ -35,6 +59,11 @@ export interface CoreModeState {
 const RPC_URL_STORAGE_KEY = 'openhuman_core_rpc_url';
 const CORE_TOKEN_STORAGE_KEY = 'openhuman_core_rpc_token';
 const CORE_MODE_STORAGE_KEY = 'openhuman_core_mode';
+/**
+ * Which gateway record `kind: 'gateway'` refers to.  An id, never a spec —
+ * see the note at the top of this file.
+ */
+const GATEWAY_ID_STORAGE_KEY = 'openhuman_core_gateway_id';
 
 /**
  * Derive the initial mode synchronously from `localStorage`.
@@ -51,6 +80,10 @@ const CORE_MODE_STORAGE_KEY = 'openhuman_core_mode';
  * can recover the exact mode on reload regardless of the persist flush race.
  */
 function deriveInitialMode(): CoreMode {
+  if (E2E_DEFAULT_CORE_MODE === 'local') {
+    return { kind: 'local' };
+  }
+
   if (typeof localStorage === 'undefined') return { kind: 'unset' };
   try {
     const mode = localStorage.getItem(CORE_MODE_STORAGE_KEY)?.trim();
@@ -58,7 +91,13 @@ function deriveInitialMode(): CoreMode {
     if (mode === 'cloud') {
       const url = localStorage.getItem(RPC_URL_STORAGE_KEY)?.trim();
       const token = localStorage.getItem(CORE_TOKEN_STORAGE_KEY)?.trim();
-      if (url && token) return { kind: 'cloud', url, token };
+      if (url && token) return { kind: 'cloud', url: normalizeRpcUrl(url), token };
+    }
+    if (mode === 'gateway') {
+      const gatewayId = localStorage.getItem(GATEWAY_ID_STORAGE_KEY)?.trim();
+      // Without an id there is nothing to activate, so fall through to unset
+      // and let the picker ask again rather than failing at activation time.
+      if (gatewayId) return { kind: 'gateway', gatewayId };
     }
   } catch {
     /* localStorage unavailable — fall through to unset */
@@ -87,6 +126,19 @@ const coreModeSlice = createSlice({
     resetCoreMode(state) {
       state.mode = { kind: 'unset' };
     },
+  },
+  extraReducers: builder => {
+    builder.addCase(REHYDRATE, (state, action) => {
+      const rehydrateAction = action as typeof action & { key?: string };
+      if (rehydrateAction.key !== 'coreMode') return;
+
+      // The plain marker is written synchronously before boot-check work can
+      // reload the renderer. Let it win over stale async redux-persist blobs.
+      const synchronousMode = deriveInitialMode();
+      if (synchronousMode.kind !== 'unset') {
+        state.mode = synchronousMode;
+      }
+    });
   },
 });
 

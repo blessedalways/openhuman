@@ -1,5 +1,5 @@
 ---
-description: How to build OpenHuman from source - toolchain, vendored Tauri CLI, sidecar staging.
+description: How to build OpenHuman from source - toolchain, vendored Tauri CLI, and local desktop builds.
 icon: wrench
 ---
 
@@ -17,8 +17,33 @@ This guide covers two paths:
 ## Prerequisites
 
 - `git`
-- `node` + `pnpm` (see `pnpm-workspace.yaml`)
-- Rust toolchain (see `rust-toolchain.toml`)
+- Node.js 24 or newer (see `app/package.json`)
+- `pnpm@10.10.0` (see the root `package.json` `packageManager` field)
+- Rust 1.93.0 through `rustup` with `rustfmt` and `clippy` (see `rust-toolchain.toml`)
+- CMake, required by native Rust dependencies
+- Git submodules under `app/src-tauri/vendor/`, required for the vendored CEF-aware Tauri CLI
+- Platform desktop build tools: Xcode Command Line Tools on macOS, or the Tauri GTK/WebKit/AppIndicator package set on Linux
+
+macOS Homebrew quick start:
+
+```bash
+brew install node@24 pnpm rustup-init cmake
+rustup toolchain install 1.93.0 --profile minimal
+rustup component add rustfmt clippy --toolchain 1.93.0
+```
+
+Arch Linux quick start:
+
+```bash
+sudo pacman -S --needed nodejs npm rustup cmake base-devel clang openssl \
+  alsa-lib xdotool libxtst libxi libevdev gtk3 webkit2gtk-4.1 \
+  libayatana-appindicator librsvg patchelf nss nspr at-spi2-core \
+  libcups libdrm libxkbcommon libxcomposite libxdamage libxfixes \
+  libxrandr mesa pango cairo libxshmfence
+npm install -g pnpm@10.10.0
+rustup toolchain install 1.93.0 --profile minimal
+rustup component add rustfmt clippy --toolchain 1.93.0
+```
 
 ## Build from source (local compile)
 
@@ -29,27 +54,27 @@ Run from the repository root:
 git clone https://github.com/tinyhumansai/openhuman.git
 cd openhuman
 
-# 2) Install JS deps (workspace)
+# 2) Fetch vendored Tauri/CEF sources
+git submodule update --init --recursive
+
+# 3) Install JS deps (workspace)
 pnpm install
 
-# 3) Build Rust core binary
-cargo build --manifest-path Cargo.toml --bin openhuman-core
-
-# 4) Stage core sidecar for the desktop app
-cd app
-pnpm core:stage
-
-# 5) Build desktop app artifacts
+# 4) Build desktop app artifacts
 pnpm build
 ```
 
 For local development instead of production build:
 
 ```bash
+# Web-only UI development
 pnpm dev
+
+# Desktop app development with the vendored Tauri/CEF CLI: run from the workspace root
+pnpm --filter openhuman-app dev:app
 ```
 
-## Install latest stable release (macOS/Linux)
+## Install latest stable release (macOS/Linux x64)
 
 Primary install command:
 
@@ -63,7 +88,27 @@ Installer behavior:
 - Validates artifact digest when available
 - Installs locally (no sudo by default)
 - macOS: installs `OpenHuman.app` into `~/Applications`
-- Linux: installs AppImage as `~/.local/bin/openhuman` and writes a desktop entry
+- Linux x64: installs AppImage as `~/.local/bin/openhuman` and writes a desktop entry
+
+### Arch Linux package recipe
+
+The repository includes an `openhuman-bin` AUR recipe at
+[`packages/arch/openhuman-bin`](../../packages/arch/openhuman-bin/). It uses the
+official x86_64 AppImage as the binary source, extracts the bundled application
+tree during `makepkg`, installs a desktop entry, and exposes `/usr/bin/openhuman`.
+
+Until the package is published on AUR, build it locally on Arch:
+
+```bash
+cd packages/arch/openhuman-bin
+makepkg --syncdeps --install
+```
+
+After publication, Arch users can install it with:
+
+```bash
+yay -S openhuman-bin
+```
 
 Useful flags:
 

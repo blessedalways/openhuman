@@ -1,3 +1,5 @@
+import { useT } from '../../lib/i18n/I18nContext';
+
 interface MemoryStatsBarProps {
   totalDocs: number;
   totalFiles: number;
@@ -39,6 +41,7 @@ function formatNumber(value: number): string {
 }
 
 export function MemoryStatsBar(props: MemoryStatsBarProps) {
+  const { t } = useT();
   const {
     totalDocs,
     totalFiles,
@@ -55,40 +58,42 @@ export function MemoryStatsBar(props: MemoryStatsBarProps) {
 
   const stats = [
     {
-      label: 'Storage',
+      label: t('stats.storage'),
       value: estimatedStorageBytes > 0 ? formatBytes(estimatedStorageBytes) : '--',
-      sub: totalFiles > 0 ? `${formatNumber(totalFiles)} files` : undefined,
+      sub: totalFiles > 0 ? `${formatNumber(totalFiles)} ${t('stats.files')}` : undefined,
       color: 'text-primary-500',
     },
     {
-      label: 'Documents',
+      label: t('stats.documents'),
       value: formatNumber(totalDocs),
-      sub: docsToday > 0 ? `+${docsToday} today` : undefined,
-      color: 'text-emerald-600',
+      sub: docsToday > 0 ? `+${docsToday} ${t('stats.today')}` : undefined,
+      color: 'text-emerald-600 dark:text-emerald-300',
     },
     {
-      label: 'Namespaces',
+      label: t('stats.namespaces'),
       value: formatNumber(totalNamespaces),
       sub: undefined,
-      color: 'text-amber-600',
+      color: 'text-amber-600 dark:text-amber-300',
     },
     {
-      label: 'Relations',
+      label: t('stats.relations'),
       value: formatNumber(totalRelations),
       sub: undefined,
-      color: 'text-lavender-600',
+      color: 'text-violet-600 dark:text-violet-300',
     },
     {
-      label: 'First Memory',
+      label: t('stats.firstMemory'),
       value: oldestDocTimestamp ? formatTimeAgo(oldestDocTimestamp) : '--',
-      sub: newestDocTimestamp ? `Latest: ${formatTimeAgo(newestDocTimestamp)}` : undefined,
-      color: 'text-sky-600',
+      sub: newestDocTimestamp
+        ? `${t('stats.latest')}: ${formatTimeAgo(newestDocTimestamp)}`
+        : undefined,
+      color: 'text-sky-600 dark:text-sky-300',
     },
     {
-      label: 'Sessions',
+      label: t('stats.sessions'),
       value: totalSessions !== null ? formatNumber(totalSessions) : '--',
-      sub: totalTokens !== null ? `${formatNumber(totalTokens)} tokens` : undefined,
-      color: 'text-rose-600',
+      sub: totalTokens !== null ? `${formatNumber(totalTokens)} ${t('stats.tokens')}` : undefined,
+      color: 'text-rose-600 dark:text-rose-300',
     },
   ];
 
@@ -97,14 +102,18 @@ export function MemoryStatsBar(props: MemoryStatsBarProps) {
       {stats.map(stat => (
         <div
           key={stat.label}
-          className="rounded-xl border border-stone-200 bg-stone-50 p-3 transition-colors hover:bg-stone-100">
-          <div className="text-[11px] uppercase tracking-wide text-stone-500 mb-1">
+          className="rounded-xl border border-line bg-surface-muted p-3 transition-colors hover:bg-surface-hover dark:bg-surface-muted">
+          <div className="text-[11px] uppercase tracking-wide text-content-muted mb-1">
             {stat.label}
           </div>
           <div className={`text-xl font-semibold ${stat.color}`}>
-            {loading ? <div className="h-7 w-16 rounded bg-stone-200 animate-pulse" /> : stat.value}
+            {loading ? (
+              <div className="h-7 w-16 rounded bg-surface-strong animate-pulse" />
+            ) : (
+              stat.value
+            )}
           </div>
-          {stat.sub && <div className="text-[11px] text-stone-500 mt-0.5">{stat.sub}</div>}
+          {stat.sub && <div className="text-[11px] text-content-muted mt-0.5">{stat.sub}</div>}
         </div>
       ))}
     </div>

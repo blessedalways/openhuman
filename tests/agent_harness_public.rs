@@ -1,46 +1,16 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use openhuman_core::openhuman::agent::harness::{
-    check_interrupt, current_parent, with_parent_context, InterruptFence, ParentExecutionContext,
+    current_parent, with_parent_context, ParentExecutionContext,
 };
 use openhuman_core::openhuman::agent::hooks::{
     fire_hooks, sanitize_tool_output, PostTurnHook, ToolCallRecord, TurnContext,
 };
 use openhuman_core::openhuman::config::AgentConfig;
 use openhuman_core::openhuman::memory::{Memory, MemoryCategory, MemoryEntry};
-use openhuman_core::openhuman::providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use parking_lot::Mutex;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Notify;
-
-struct StubProvider;
-
-#[async_trait]
-impl Provider for StubProvider {
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<String> {
-        Ok("ok".into())
-    }
-
-    async fn chat(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
-        Ok(ChatResponse {
-            text: Some("ok".into()),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
-    }
-}
 
 struct StubMemory;
 
@@ -115,30 +85,43 @@ fn sample_turn() -> TurnContext {
         }],
         turn_duration_ms: 15,
         session_id: Some("s1".into()),
+        agent_id: None,
+        entrypoint: None,
         iteration_count: 1,
     }
 }
 
 fn stub_parent_context() -> ParentExecutionContext {
     ParentExecutionContext {
-        provider: Arc::new(StubProvider),
+        agent_definition_id: "orchestrator".into(),
+        allowed_subagent_ids: ["test".to_string(), "researcher".to_string()]
+            .into_iter()
+            .collect(),
+        turn_model_source:
+            openhuman_core::openhuman::agent::tinyagents::TurnModelSource::from_model(Arc::new(
+                tinyagents_harness::testkit::ScriptedModel::replies(vec!["ok"]),
+            )),
         all_tools: Arc::new(vec![]),
         all_tool_specs: Arc::new(vec![]),
+        visible_tool_names: std::collections::HashSet::new(),
+        subagent_tool_ceiling_names: std::collections::HashSet::new(),
         model_name: "stub-model".into(),
         temperature: 0.4,
         workspace_dir: std::path::PathBuf::from("/tmp"),
+        workspace_descriptor: None,
         memory: Arc::new(StubMemory),
         agent_config: AgentConfig::default(),
-        skills: Arc::new(vec![]),
+        workflows: Arc::new(vec![]),
         memory_context: Arc::new(Some("ctx".into())),
         session_id: "test-session".into(),
         channel: "test-channel".into(),
         connected_integrations: vec![],
-        composio_client: None,
-        tool_call_format: openhuman_core::openhuman::context::prompt::ToolCallFormat::PFormat,
+        tool_call_format:
+            openhuman_core::openhuman::agent::context::prompt::ToolCallFormat::PFormat,
         session_key: "test-session".into(),
         session_parent_prefix: None,
         on_progress: None,
+        run_queue: None,
     }
 }
 
@@ -167,31 +150,9 @@ impl PostTurnHook for RecordingHook {
     }
 }
 
-#[test]
-fn interrupt_fence_shares_and_resets_state() {
-    let fence = InterruptFence::default();
-    assert!(!fence.is_interrupted());
-    assert!(check_interrupt(&fence).is_ok());
-
-    let clone = fence.clone();
-    let raw = fence.flag_handle();
-    fence.trigger();
-    assert!(clone.is_interrupted());
-    assert!(raw.load(Ordering::Relaxed));
-    assert!(check_interrupt(&fence).is_err());
-
-    raw.store(false, Ordering::Relaxed);
-    fence.reset();
-    assert!(!fence.is_interrupted());
-}
-
-#[tokio::test]
-async fn interrupt_signal_handler_is_installable() {
-    let fence = InterruptFence::new();
-    fence.install_signal_handler();
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(!fence.is_interrupted());
-}
+// The legacy `InterruptFence` / `check_interrupt` surface was removed in #4249
+// (user-driven cancellation is now the tinyagents steering/cancellation channel),
+// so the public-API tests that exercised it are gone with it.
 
 #[tokio::test]
 async fn parent_context_is_visible_only_within_scope() {

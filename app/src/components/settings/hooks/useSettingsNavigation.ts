@@ -1,42 +1,54 @@
+// [settings] navigation hook — route resolution for the two-pane settings
+// layout. Uses the settingsRouteRegistry as the single source of truth so
+// every registered route resolves without a parallel switch-statement.
+import debug from 'debug';
 import { useCallback } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
-export type SettingsRoute =
+import { entryRoute, findEntryByRoute, SETTINGS_ROUTE_REGISTRY } from '../settingsRouteRegistry';
+
+const log = debug('settings:nav');
+
+// ---------------------------------------------------------------------------
+// SettingsRoute type — derived from the registry so it stays in sync.
+// ---------------------------------------------------------------------------
+
+type SettingsRoute =
   | 'home'
+  | 'agents'
+  | 'agent-access'
   | 'account'
-  | 'features'
-  | 'ai-models'
-  | 'connections'
-  | 'messaging'
-  | 'cron-jobs'
-  | 'screen-intelligence'
-  | 'autocomplete'
   | 'privacy'
   | 'billing'
-  | 'team'
-  | 'team-members'
-  | 'team-invites'
   | 'developer-options'
-  | 'ai'
-  | 'local-model'
+  | 'llm'
   | 'voice'
   | 'tools'
-  | 'memory-data'
-  | 'memory-debug'
   | 'recovery-phrase'
-  | 'webhooks-debug'
-  | 'agent-chat'
-  | 'screen-awareness-debug'
-  | 'autocomplete-debug'
-  | 'voice-debug'
-  | 'local-model-debug'
+  | 'wallet-balances'
   | 'notifications'
-  | 'notification-routing'
-  | 'intelligence'
-  | 'webhooks-triggers'
-  | 'composio-triggers';
+  | 'personality'
+  | 'appearance'
+  | 'approval-history'
+  | 'integrations'
+  | 'composio-triggers'
+  | 'mcp-server'
+  | 'sandbox-settings'
+  | 'permissions'
+  | 'activity-level'
+  | 'devices'
+  | 'usage'
+  | 'security'
+  | 'migration'
+  | 'meetings'
+  | 'embeddings'
+  | 'search'
+  | 'skills-runner'
+  | 'event-log'
+  | 'tool-policy-diagnostics'
+  | 'about';
 
-export interface BreadcrumbItem {
+interface BreadcrumbItem {
   label: string;
   onClick?: () => void;
 }
@@ -44,11 +56,59 @@ export interface BreadcrumbItem {
 interface SettingsNavigationHook {
   currentRoute: SettingsRoute;
   navigateToSettings: (route?: SettingsRoute | string) => void;
-  navigateToTeamManagement: (teamId: string) => void;
   navigateBack: () => void;
   closeSettings: () => void;
   breadcrumbs: BreadcrumbItem[];
 }
+
+// ---------------------------------------------------------------------------
+// Route extraction
+//
+// Prior implementation used `path.includes()` which is fragile against
+// substring collisions (e.g. '/settings/ai' matching '/settings/ai-debug').
+// We now extract the slug via an exact-segment split so each path maps to
+// exactly one route, then fall back to the registry for known routes.
+// ---------------------------------------------------------------------------
+
+/** Extract the settings sub-path from a full pathname. */
+const extractSettingsSlug = (pathname: string): string => {
+  // Strip the leading /settings/ and take the first path segment.
+  // e.g. /settings/agents/edit/123 → 'agents'
+  const match = /^\/settings\/(.+)$/.exec(pathname);
+  if (!match) return '';
+  return match[1];
+};
+
+const getCurrentRoute = (pathname: string): SettingsRoute => {
+  const slug = extractSettingsSlug(pathname);
+  if (!slug) return 'home';
+
+  // --- agent editor sub-routes ---
+  if (/^agents\/(new|edit)/.test(slug)) return 'agents';
+
+  // --- exact first-segment lookup via registry ---
+  const firstSegment = slug.split('/')[0];
+
+  // Try to find the route by first segment first (most routes are single-segment).
+  const entry = findEntryByRoute(firstSegment);
+  if (entry) {
+    log('getCurrentRoute: %s → %s', pathname, entry.id);
+    return entry.id as SettingsRoute;
+  }
+
+  // A few routes have ids that don't match their URL segment (build-info → about).
+  // Check all registry entries whose resolved route matches.
+  const byRoute = SETTINGS_ROUTE_REGISTRY.find(e => entryRoute(e) === firstSegment);
+  if (byRoute) {
+    log('getCurrentRoute (via route alias): %s → %s', pathname, byRoute.id);
+    return byRoute.id as SettingsRoute;
+  }
+
+  // Legacy redirect targets that don't have a registry entry.
+
+  log('getCurrentRoute: unknown slug "%s", defaulting to home', firstSegment);
+  return 'home';
+};
 
 export const useSettingsNavigation = (): SettingsNavigationHook => {
   const navigate = useNavigate();
@@ -66,68 +126,12 @@ export const useSettingsNavigation = (): SettingsNavigationHook => {
     [navigate]
   );
 
-  // Determine current settings route from URL
-  const getCurrentRoute = (): SettingsRoute => {
-    const path = location.pathname;
-    // Check specific team management paths first (more specific)
-    if (path.includes('/settings/team/manage/') && path.includes('/members')) return 'team-members';
-    if (path.includes('/settings/team/manage/') && path.includes('/invites')) return 'team-invites';
-    if (path.includes('/settings/team/manage/')) return 'team';
-    // Then check regular team paths (less specific)
-    if (path.includes('/settings/team/members')) return 'team-members';
-    if (path.includes('/settings/team/invites')) return 'team-invites';
-    if (path.includes('/settings/team')) return 'team';
-    if (path.includes('/settings/account')) return 'account';
-    if (path.includes('/settings/features')) return 'features';
-    if (path.includes('/settings/ai-models')) return 'ai-models';
-    if (path.includes('/settings/connections')) return 'connections';
-    if (path.includes('/settings/messaging')) return 'messaging';
-    if (path.includes('/settings/cron-jobs')) return 'cron-jobs';
-    if (path.includes('/settings/screen-awareness-debug')) return 'screen-awareness-debug';
-    if (path.includes('/settings/screen-intelligence')) return 'screen-intelligence';
-    if (path.includes('/settings/autocomplete-debug')) return 'autocomplete-debug';
-    if (path.includes('/settings/autocomplete')) return 'autocomplete';
-    if (path.includes('/settings/privacy')) return 'privacy';
-    if (path.includes('/settings/billing')) return 'billing';
-    if (path.includes('/settings/developer-options')) return 'developer-options';
-    if (path.includes('/settings/ai')) return 'ai';
-    if (path.includes('/settings/local-model-debug')) return 'local-model-debug';
-    if (path.includes('/settings/local-model')) return 'local-model';
-    if (path.includes('/settings/voice-debug')) return 'voice-debug';
-    if (path.includes('/settings/voice')) return 'voice';
-    if (path.includes('/settings/tools')) return 'tools';
-    if (path.includes('/settings/memory-data')) return 'memory-data';
-    if (path.includes('/settings/memory-debug')) return 'memory-debug';
-    if (path.includes('/settings/webhooks-debug')) return 'webhooks-debug';
-    if (path.includes('/settings/webhooks-triggers')) return 'webhooks-triggers';
-    if (path.includes('/settings/composio-triggers')) return 'composio-triggers';
-    if (path.includes('/settings/intelligence')) return 'intelligence';
-    if (path.includes('/settings/recovery-phrase')) return 'recovery-phrase';
-    if (path.includes('/settings/agent-chat')) return 'agent-chat';
-    // Notification routes must be checked in specificity order so the more
-    // specific `notification-routing` path doesn't get swallowed by the
-    // shorter `notifications` prefix.
-    if (path.includes('/settings/notification-routing')) return 'notification-routing';
-    if (path.includes('/settings/notifications')) return 'notifications';
-    return 'home';
-  };
-
-  const currentRoute = getCurrentRoute();
+  const currentRoute = getCurrentRoute(location.pathname);
 
   const navigateToSettings = useCallback(
     (route: SettingsRoute | string = 'home') => {
-      if (route === 'home') {
-        navigate('/settings');
-      } else {
-        navigate(`/settings/${route}`);
-      }
-    },
-    [navigate]
-  );
-
-  const navigateToTeamManagement = useCallback(
-    (teamId: string) => {
-      navigate(`/settings/team/manage/${teamId}`);
+      const target = route === 'home' ? '/settings' : `/settings/${route}`;
+      navigate(target);
     },
     [navigate]
   );
@@ -141,107 +145,27 @@ export const useSettingsNavigation = (): SettingsNavigationHook => {
   }, [currentRoute, goBackWithFallback]);
 
   const closeSettings = useCallback(() => {
-    goBackWithFallback('/home');
-  }, [goBackWithFallback]);
-
-  const settingsCrumb: BreadcrumbItem = { label: 'Settings', onClick: () => navigate('/settings') };
-
-  const accountCrumb: BreadcrumbItem = {
-    label: 'Account',
-    onClick: () => navigate('/settings/account'),
-  };
-
-  const featuresCrumb: BreadcrumbItem = {
-    label: 'Features',
-    onClick: () => navigate('/settings/features'),
-  };
-
-  const aiModelsCrumb: BreadcrumbItem = {
-    label: 'AI & Models',
-    onClick: () => navigate('/settings/ai-models'),
-  };
-
-  const teamCrumb: BreadcrumbItem = { label: 'Team', onClick: () => navigate('/settings/team') };
-
-  const developerCrumb: BreadcrumbItem = {
-    label: 'Developer Options',
-    onClick: () => navigate('/settings/developer-options'),
-  };
-
-  const getBreadcrumbs = (): BreadcrumbItem[] => {
-    switch (currentRoute) {
-      // Section pages
-      case 'account':
-      case 'features':
-      case 'ai-models':
-        return [settingsCrumb];
-
-      // Leaf panels under account
-      case 'recovery-phrase':
-      case 'team':
-      case 'connections':
-      case 'privacy':
-        return [settingsCrumb, accountCrumb];
-
-      case 'billing':
-        return [settingsCrumb];
-
-      // Leaf panels under features
-      case 'screen-intelligence':
-      case 'autocomplete':
-      case 'voice':
-      case 'messaging':
-      case 'tools':
-        return [settingsCrumb, featuresCrumb];
-
-      // Leaf panels under AI & Models
-      case 'local-model':
-        return [settingsCrumb, aiModelsCrumb];
-
-      // Team sub-pages
-      case 'team-members':
-      case 'team-invites':
-        return [settingsCrumb, accountCrumb, teamCrumb];
-
-      // Developer sub-pages
-      case 'ai':
-      case 'agent-chat':
-      case 'cron-jobs':
-      case 'screen-awareness-debug':
-      case 'autocomplete-debug':
-      case 'voice-debug':
-      case 'local-model-debug':
-      case 'webhooks-debug':
-      case 'memory-data':
-      case 'memory-debug':
-      case 'intelligence':
-      case 'webhooks-triggers':
-      case 'composio-triggers':
-      case 'notification-routing':
-        return [settingsCrumb, developerCrumb];
-
-      // Developer options section page
-      case 'developer-options':
-        return [settingsCrumb];
-
-      // Notifications panel sits at the top level of Settings.
-      case 'notifications':
-        return [settingsCrumb];
-
-      case 'home':
-      default:
-        return [];
+    // Settings is a routed page, so "close" means leaving it: step back to
+    // whatever the user was on, or land on /home for a deep link with no
+    // history behind it. `replace` in the fallback so Back doesn't bounce
+    // straight back into Settings.
+    const historyState = window.history.state as { idx?: number } | null;
+    if (typeof historyState?.idx === 'number' && historyState.idx > 0) {
+      navigate(-1);
+      return;
     }
-  };
+    navigate('/home', { replace: true });
+  }, [navigate]);
 
-  const breadcrumbs = getBreadcrumbs();
+  // -------------------------------------------------------------------------
+  // Breadcrumbs — derived from the registry.
+  //
+  // Breadcrumbs were replaced by the two-pane sidebar — the trail is no longer
+  // rendered anywhere. The field is kept (always empty) so the ~50 panel call
+  // sites keep compiling until the prop is mechanically removed.
+  // -------------------------------------------------------------------------
 
-  return {
-    currentRoute,
-    navigateToSettings,
-    navigateToTeamManagement,
-    navigateBack,
-    closeSettings,
-    breadcrumbs,
-  };
+  const breadcrumbs: BreadcrumbItem[] = [];
+
+  return { currentRoute, navigateToSettings, navigateBack, closeSettings, breadcrumbs };
 };

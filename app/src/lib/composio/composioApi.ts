@@ -1,6 +1,6 @@
 /**
  * Imperative RPC wrapper for the Composio domain — typed counterpart
- * to `src/openhuman/composio/*` on the Rust side.
+ * to `src/openhuman/integrations/composio/*` on the Rust side.
  *
  * Every function here calls the core sidecar via JSON-RPC. The core
  * in turn proxies to the openhuman backend's
@@ -13,6 +13,7 @@
 import { callCoreRpc } from '../../services/coreRpcClient';
 import type {
   ComposioActiveTriggersResponse,
+  ComposioAgentReadyToolkitsResponse,
   ComposioAuthorizeResponse,
   ComposioAvailableTriggersResponse,
   ComposioConnectionsResponse,
@@ -20,6 +21,7 @@ import type {
   ComposioDisableTriggerResponse,
   ComposioEnableTriggerResponse,
   ComposioExecuteResponse,
+  ComposioGithubReposResponse,
   ComposioToolkitsResponse,
   ComposioToolsResponse,
   ComposioUserScopePref,
@@ -47,15 +49,83 @@ function unwrapCliEnvelope<T>(value: unknown): T {
   return value as T;
 }
 
+/**
+ * Shorter-than-default per-call timeout the Connections page's loading
+ * state opts into for the two RPCs it waits on (`listToolkits` +
+ * `listConnections`).
+ *
+ * Both fetches are *non-critical on that surface*: the toolkit catalog has
+ * a 24h stale cache AND a hardcoded `KNOWN_COMPOSIO_TOOLKITS` fallback, so a
+ * slow or dead backend should degrade to the fallback fast rather than
+ * pinning the Connections grid on a loading skeleton. The skeleton window is
+ * bounded by the *slower* of these two calls (the hook clears `loading` only
+ * after `Promise.allSettled([getToolkitCatalog(), listConnections()])`
+ * settles — see `useComposioIntegrations` in ./hooks.ts), so BOTH must opt
+ * into the shorter budget. Without this the window stretches to the global
+ * `CORE_RPC_TIMEOUT_MS` (30s) on a cold cache against a down backend.
+ *
+ * It is deliberately **opt-in** via the `timeoutMs` option rather than the
+ * wrapper default: `listConnections` is also called by the GitHub repo
+ * picker, SmartIssuePicker, the add-memory-source dialog and the connect
+ * modal's poll loop, where a slow-but-successful 8–30s call must still be
+ * allowed to complete rather than being failed early (#4079 review).
+ */
+export const COMPOSIO_FETCH_TIMEOUT_MS = 8_000;
+
+/** Per-call options shared by the bounded read wrappers. */
+interface ComposioReadOptions {
+  /**
+   * Override the RPC timeout (ms). Omit to inherit the global
+   * `CORE_RPC_TIMEOUT_MS`. Pass `COMPOSIO_FETCH_TIMEOUT_MS` only from the
+   * Connections-page loading path (see the constant's doc comment).
+   */
+  timeoutMs?: number;
+}
+
 // ── Read operations ───────────────────────────────────────────────
 
-export async function listToolkits(): Promise<ComposioToolkitsResponse> {
-  const raw = await callCoreRpc<unknown>({ method: 'openhuman.composio_list_toolkits' });
+export async function listToolkits(
+  options?: ComposioReadOptions
+): Promise<ComposioToolkitsResponse> {
+  const raw = await callCoreRpc<unknown>({
+    method: 'openhuman.composio_list_toolkits',
+    // Timeout is opt-in: the Connections loading skeleton passes the shorter
+    // budget so the hardcoded fallback surfaces fast (#3933); other callers
+    // inherit the global default.
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  });
   return unwrapCliEnvelope<ComposioToolkitsResponse>(raw);
 }
 
-export async function listConnections(): Promise<ComposioConnectionsResponse> {
-  const raw = await callCoreRpc<unknown>({ method: 'openhuman.composio_list_connections' });
+/**
+ * Fetch the slugs of toolkits that have an agent-ready curated
+ * catalog on the core side. The response is sorted alphabetically
+ * and is safe to cache once per session — the set only changes
+ * with core releases.
+ *
+ * Used by the Skills grid (issue #2283) to label connected
+ * toolkits without a catalog as "preview / coming soon" so users
+ * don't trigger the max-iterations failure that uncurated
+ * connections cause.
+ */
+export async function listAgentReadyToolkits(): Promise<ComposioAgentReadyToolkitsResponse> {
+  const raw = await callCoreRpc<unknown>({
+    method: 'openhuman.composio_list_agent_ready_toolkits',
+  });
+  return unwrapCliEnvelope<ComposioAgentReadyToolkitsResponse>(raw);
+}
+
+export async function listConnections(
+  options?: ComposioReadOptions
+): Promise<ComposioConnectionsResponse> {
+  const raw = await callCoreRpc<unknown>({
+    method: 'openhuman.composio_list_connections',
+    // Timeout is opt-in (see `listToolkits`): only the Connections loading
+    // path passes the shorter budget. Shared callers (repo/issue pickers,
+    // add-memory-source, connect-modal poll) inherit the global default so a
+    // slow-but-successful call still completes (#4079 review).
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  });
   return unwrapCliEnvelope<ComposioConnectionsResponse>(raw);
 }
 
@@ -73,23 +143,36 @@ export async function listTools(toolkits?: string[]): Promise<ComposioToolsRespo
  * Begin an OAuth handoff for `toolkit`. The returned `connectUrl`
  * must be opened in a browser for the user to complete the flow.
  * The core publishes a `ComposioConnectionCreated` event on success.
+ *
+ * `extraParams` is merged into the backend request body. Required for
+ * toolkits that need additional fields (e.g. `whatsapp` needs `waba_id`).
  */
-export async function authorize(toolkit: string): Promise<ComposioAuthorizeResponse> {
+export async function authorize(
+  toolkit: string,
+  extraParams?: Record<string, string>
+): Promise<ComposioAuthorizeResponse> {
   const raw = await callCoreRpc<unknown>({
     method: 'openhuman.composio_authorize',
-    params: { toolkit },
+    params: extraParams ? { toolkit, extra_params: extraParams } : { toolkit },
   });
   return unwrapCliEnvelope<ComposioAuthorizeResponse>(raw);
 }
 
 /**
  * Delete an existing Composio connection. Backend verifies ownership
- * before forwarding to Composio.
+ * before forwarding to Composio
  */
-export async function deleteConnection(connectionId: string): Promise<ComposioDeleteResponse> {
+export async function deleteConnection(
+  connectionId: string,
+  options?: { clearMemory?: boolean }
+): Promise<ComposioDeleteResponse> {
+  const params: { connection_id: string; clear_memory?: boolean } = { connection_id: connectionId };
+  if (options?.clearMemory) {
+    params.clear_memory = true;
+  }
   const raw = await callCoreRpc<unknown>({
     method: 'openhuman.composio_delete_connection',
-    params: { connection_id: connectionId },
+    params,
   });
   return unwrapCliEnvelope<ComposioDeleteResponse>(raw);
 }
@@ -158,6 +241,21 @@ export async function execute(
 }
 
 /**
+ * List GitHub repositories available through the user's authorized
+ * Composio connection. Wraps `openhuman.composio_list_github_repos`
+ * which hits the dedicated backend endpoint (not `composio_execute`).
+ */
+export async function listGithubRepos(connectionId?: string): Promise<ComposioGithubReposResponse> {
+  const params: Record<string, unknown> = {};
+  if (connectionId) params.connection_id = connectionId;
+  const raw = await callCoreRpc<unknown>({
+    method: 'openhuman.composio_list_github_repos',
+    params,
+  });
+  return unwrapCliEnvelope<ComposioGithubReposResponse>(raw);
+}
+
+/**
  * Run a sync pass for a Composio connection by dispatching to the
  * toolkit's native provider implementation (Gmail, Slack, Notion, …).
  * Persists the fetched items into the memory layer — chunks land in
@@ -212,6 +310,11 @@ export async function listAvailableTriggers(
   const raw = await callCoreRpc<unknown>({
     method: 'openhuman.composio_list_available_triggers',
     params,
+    // A 401 here is a single trigger-catalog read failure, not whole-session
+    // death (the connection itself is still active). Suppress the global
+    // sign-out so the trigger panel can show an in-place "Sign in again" CTA
+    // instead of being torn down (#4281, #2286).
+    suppressAuthExpiredEvent: true,
   });
   return unwrapCliEnvelope<ComposioAvailableTriggersResponse>(raw);
 }
@@ -222,7 +325,13 @@ export async function listAvailableTriggers(
 export async function listTriggers(toolkit?: string): Promise<ComposioActiveTriggersResponse> {
   const params: Record<string, unknown> = {};
   if (toolkit) params.toolkit = toolkit;
-  const raw = await callCoreRpc<unknown>({ method: 'openhuman.composio_list_triggers', params });
+  const raw = await callCoreRpc<unknown>({
+    method: 'openhuman.composio_list_triggers',
+    params,
+    // Loaded alongside the available-triggers catalog in the same panel —
+    // keep its 401 handling local too (see `listAvailableTriggers`).
+    suppressAuthExpiredEvent: true,
+  });
   return unwrapCliEnvelope<ComposioActiveTriggersResponse>(raw);
 }
 

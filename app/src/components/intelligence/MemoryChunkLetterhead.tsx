@@ -2,6 +2,7 @@
  * Letterhead: the from / to / date frontmatter of a chunk, rendered
  * as correspondence (dl-style with monospace labels in a fixed column).
  */
+import { useT } from '../../lib/i18n/I18nContext';
 import type { Chunk } from '../../utils/tauriCommands';
 
 interface LetterheadParts {
@@ -11,17 +12,21 @@ interface LetterheadParts {
 }
 
 function parseSourceParts(chunk: Chunk): LetterheadParts {
-  const left = chunk.source_id.split('|');
-  const senderRaw = left[0];
-  const recipient = left[1] ?? chunk.owner;
-  const afterColon = senderRaw.includes(':') ? senderRaw.split(':').slice(1).join(':') : senderRaw;
+  const [senderRaw = '', recipientRaw] = chunk.source_id.split('|');
+  const recipient = recipientRaw?.trim() || chunk.owner;
+  const normalizedSender = senderRaw.trim();
+  const afterColon = normalizedSender.includes(':')
+    ? normalizedSender.split(':').slice(1).join(':').trim()
+    : normalizedSender;
 
   // Heuristic for known prefixes: prefer the human-readable display when we have one,
   // else fall back to the raw email/handle.
   const isEmailish = /@/.test(afterColon);
   // Try to recover a personalized name from the chunk's tags (first person/* tag)
   const personTag = chunk.tags.find(t => t.startsWith('person/'));
-  const personName = personTag ? personTag.slice('person/'.length).replace(/-/g, ' ') : null;
+  const personName = personTag
+    ? personTag.slice('person/'.length).replace(/[-_]+/g, ' ').trim()
+    : null;
 
   if (isEmailish && personName) {
     return { fromName: personName, fromAddress: afterColon, toAddress: recipient };
@@ -37,21 +42,22 @@ function parseSourceParts(chunk: Chunk): LetterheadParts {
 
 function formatLetterDate(ms: number): string {
   const d = new Date(ms);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mi = String(d.getUTCMinutes()).padStart(2, '0');
-  return `${yyyy}·${mm}·${dd} · ${hh}:${mi} utc`;
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${yyyy}·${mm}·${dd} · ${hh}:${mi}`;
 }
 
 export function MemoryChunkLetterhead({ chunk }: { chunk: Chunk }) {
+  const { t } = useT();
   const parts = parseSourceParts(chunk);
   return (
     <header className="mw-letterhead" data-testid="memory-chunk-letterhead">
       <dl style={{ margin: 0 }}>
         <div className="mw-letterhead-row">
-          <dt className="mw-letterhead-label">from</dt>
+          <dt className="mw-letterhead-label">{t('intelligence.memoryChunk.letterhead.from')}</dt>
           <dd className="mw-letterhead-value" style={{ margin: 0 }}>
             {parts.fromName}
             {parts.fromAddress && parts.fromAddress !== parts.fromName && (
@@ -60,7 +66,7 @@ export function MemoryChunkLetterhead({ chunk }: { chunk: Chunk }) {
           </dd>
         </div>
         <div className="mw-letterhead-row">
-          <dt className="mw-letterhead-label">to</dt>
+          <dt className="mw-letterhead-label">{t('intelligence.memoryChunk.letterhead.to')}</dt>
           <dd className="mw-letterhead-value" style={{ margin: 0 }}>
             {parts.toAddress}
           </dd>

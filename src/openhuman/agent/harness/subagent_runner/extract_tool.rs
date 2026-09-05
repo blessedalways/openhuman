@@ -6,9 +6,13 @@
 //! That dragged along system-prompt scaffolding, a tool-loop, and an
 //! extra inference round for a workload that really only needs one
 //! completion call. So the tool now drives `provider.chat_with_system`
-//! directly against the extraction model (`"summarization-v1"` — same
-//! string [`super::definition::ModelSpec::Hint("summarization").resolve`]
-//! would have produced, so router entries keyed on it still apply).
+//! directly. Both the provider AND the model id are resolved by the runner
+//! through the `summarization` role (`create_chat_provider("summarization")`)
+//! and handed in, so this extraction follows the user's `memory_provider`
+//! routing — managed (`summarization-v1`), BYOK, or local — exactly like every
+//! other summarization path, instead of borrowing the parent agent's provider
+//! with a hardcoded tier string (which 400'd on BYOK/local providers that don't
+//! know the literal `summarization-v1`).
 //!
 //! Transcript discipline: the LLM call still costs tokens, so every
 //! extraction round-trip is persisted as its own `session_raw/` JSONL (+
@@ -21,34 +25,49 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use serde_json::{json, Value};
+use tinyagents_graph::parallel::{map_reduce, FailurePolicy, ParallelOptions};
 
 use super::handoff::{chunk_content, ResultHandoffCache, HANDOFF_MAX_ENTRIES};
 use crate::openhuman::agent::harness::session::transcript::{
     resolve_keyed_transcript_path, write_transcript, MessageUsage, TranscriptMeta, TurnUsage,
 };
-use crate::openhuman::providers::{ChatMessage, Provider};
+use crate::openhuman::agent::messages::ChatMessage;
+use crate::openhuman::agent::tinyagents::TurnModelSource;
 use crate::openhuman::tools::{Tool, ToolCategory, ToolResult};
+use tinyinference::message::Message;
+use tinyinference::model::ModelRequest;
 
 // ── Tunables ──────────────────────────────────────────────────────────
-
-/// Model id used for `extract_from_result` LLM calls. Mirrors the
-/// resolution `ModelSpec::Hint("summarization").resolve(...)` would have
-/// produced for the retired summarizer sub-agent so routing table
-/// entries that targeted the summarizer continue to apply.
-const EXTRACT_MODEL_ID: &str = "summarization-v1";
 
 /// Temperature for extraction calls. Low but non-zero so the model can
 /// pick reasonable phrasings when rewriting identifiers into a compact
 /// answer, without straying into creative territory.
 const EXTRACT_TEMPERATURE: f64 = 0.2;
 
-/// Char budget per extraction call. Chosen so a single chunk + prompt
-/// scaffolding + output stays well below the extraction model's context
-/// window (~196k tokens) — at ~4 chars/token that leaves comfortable
-/// headroom for the extraction contract and response.
-const EXTRACT_CHUNK_CHAR_BUDGET: usize = 60_000;
+/// Convert a context window (tokens) into the per-chunk char budget. A payload
+/// at or under this budget is extracted in a single shot over its **entire**
+/// content — higher quality than the chunk+concat fallback, which has no reduce
+/// stage and can miss facts that span a chunk boundary. Headroom is reserved for
+/// the extraction contract, the query, and the response.
+///
+/// `window_tokens = None` means neither the provider nor the static registry
+/// could size the model — only reached for **cloud** models the registry doesn't
+/// know (an unknown *local* model resolves to its small provider-profile window
+/// via [`ExtractFromResultTool::extract_chunk_char_budget`], not here), so a
+/// large window is a safe assumption.
+fn chunk_char_budget_for_window(window_tokens: Option<u64>) -> usize {
+    /// Last-resort window (tokens) when the model is unsizable — see above.
+    const FALLBACK_WINDOW_TOKENS: u64 = 128_000;
+    /// Approximate chars per token used for budgeting.
+    const CHARS_PER_TOKEN: u64 = 4;
+    /// Fraction of the window spent on the payload slice; the remainder covers
+    /// the prompt scaffolding, query, and model response.
+    const USABLE_PCT: u64 = 70;
+
+    let window = window_tokens.unwrap_or(FALLBACK_WINDOW_TOKENS);
+    (window * USABLE_PCT / 100 * CHARS_PER_TOKEN) as usize
+}
 
 /// System prompt fed to the provider on every `extract_from_result`
 /// call. Lifted in spirit from the old `summarizer` agent's prompt but
@@ -69,7 +88,15 @@ empty string — do not invent information.";
 /// with a toolkit scope).
 pub(super) struct ExtractFromResultTool {
     cache: Arc<ResultHandoffCache>,
-    provider: Arc<dyn Provider>,
+    /// The turn's model source (issue #4249, Phase 3 / Motion A): the tool builds
+    /// a summarizer crate `ChatModel` from it per call and queries the model's
+    /// context window through it, so it no longer names the `Provider` trait.
+    source: TurnModelSource,
+    /// Model id for the extraction summary calls. Resolved by the
+    /// runner through the `summarization` role (alongside `provider`), so it
+    /// tracks the user's `memory_provider` routing + `cloud_llm_model` override
+    /// instead of a hardcoded tier string.
+    model: String,
     /// Workspace root for transcript writes.
     workspace_dir: PathBuf,
     /// Parent session chain joined with `__`, e.g.
@@ -87,19 +114,40 @@ pub(super) struct ExtractFromResultTool {
 impl ExtractFromResultTool {
     pub(super) fn new(
         cache: Arc<ResultHandoffCache>,
-        provider: Arc<dyn Provider>,
+        source: TurnModelSource,
+        model: String,
         workspace_dir: PathBuf,
         parent_chain: String,
         owner_agent_id: String,
     ) -> Self {
         Self {
             cache,
-            provider,
+            source,
+            model,
             workspace_dir,
             parent_chain,
             owner_agent_id,
             call_seq: StdMutex::new(0),
         }
+    }
+
+    /// Resolve the per-chunk char budget for `self.model` against the chosen
+    /// provider's context window.
+    ///
+    /// Asks the **provider** first: a local runtime (Ollama / LM Studio) reports
+    /// its real loaded / profile window here (~8k tokens for Ollama), so an
+    /// unknown *local* model is budgeted against its actual small context and the
+    /// payload is chunked — instead of assuming a 128k window and sending an
+    /// oversized single-shot prompt that overflows the local context (Codex P2).
+    /// Falls back to the static registry, then the cloud-safe default in
+    /// [`chunk_char_budget_for_window`].
+    async fn extract_chunk_char_budget(&self) -> usize {
+        let window = self
+            .source
+            .effective_context_window(&self.model)
+            .await
+            .or_else(|| crate::openhuman::inference::context_window_for_model(&self.model));
+        chunk_char_budget_for_window(window)
     }
 
     fn next_call_seq(&self) -> u64 {
@@ -168,8 +216,19 @@ impl Tool for ExtractFromResultTool {
             }
         };
 
+        // Allow test harnesses to lower the chunk budget so multi-chunk
+        // extraction can be exercised on compacted payloads. Never consulted
+        // in production (env var absent).
+        let effective_chunk_budget = match std::env::var("OPENHUMAN_TEST_EXTRACT_CHUNK_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(budget) => budget,
+            None => self.extract_chunk_char_budget().await,
+        };
+
         // Fast path: payload fits in a single provider turn.
-        if cached.content.len() <= EXTRACT_CHUNK_CHAR_BUDGET {
+        if cached.content.len() <= effective_chunk_budget {
             tracing::debug!(
                 tool = %cached.tool_name,
                 bytes = cached.content.len(),
@@ -195,22 +254,22 @@ impl Tool for ExtractFromResultTool {
         // failure when the upstream provider stalls. For
         // listing/extraction queries concatenation is equivalent; for
         // top-N / global-ordering queries the caller can post-process.
-        let chunks = chunk_content(&cached.content, EXTRACT_CHUNK_CHAR_BUDGET);
+        let chunks = chunk_content(&cached.content, effective_chunk_budget);
         tracing::info!(
             tool = %cached.tool_name,
             total_bytes = cached.content.len(),
             chunk_count = chunks.len(),
-            chunk_budget = EXTRACT_CHUNK_CHAR_BUDGET,
+            chunk_budget = effective_chunk_budget,
             "[extract_from_result] chunked extraction"
         );
 
         // Map stage: each chunk extracts items matching `query` from
-        // ITS OWN slice only. Dispatched with bounded concurrency —
-        // `buffer_unordered(MAP_CONCURRENCY)` keeps at most N calls in
-        // flight at any time. Fully parallel `join_all` was generating
-        // 504-gateway-timeout storms from the staging proxy when 7+
-        // concurrent calls piled onto the upstream; batching at 3
-        // trades some wall-clock time for reliability.
+        // ITS OWN slice only. Dispatched through the shared bounded fan-out
+        // (`tinyagents_graph::parallel::map_reduce`), which keeps at most
+        // `MAP_CONCURRENCY` calls in flight and hands results back in input
+        // order. Fully parallel `join_all` was generating 504-gateway-timeout
+        // storms from the staging proxy when 7+ concurrent calls piled onto the
+        // upstream; batching at 3 trades some wall-clock time for reliability.
         const MAP_CONCURRENCY: usize = 3;
         let total_chunks = chunks.len();
 
@@ -220,17 +279,27 @@ impl Tool for ExtractFromResultTool {
         let workspace_dir = self.workspace_dir.clone();
         let parent_chain = self.parent_chain.clone();
         let owner_agent_id = self.owner_agent_id.clone();
+        // One summarizer model for the whole chunk fan-out; each concurrent
+        // future clones the Arc (issue #4249, Phase 3 / Motion A). Model +
+        // temperature are baked into the model, so the per-call request only
+        // carries the messages.
+        let chat = self
+            .source
+            .build_summarizer(&self.model, EXTRACT_TEMPERATURE)?;
+        // Model id for the per-chunk transcript metadata (the chat call itself
+        // bakes it into `chat`).
+        let model = self.model.clone();
 
-        // Consume `chunks` with `into_iter` so each async block owns
-        // its `String` — `buffer_unordered` polls the stream lazily
-        // and needs futures with no borrows into the enclosing scope.
-        let map_futures = chunks.into_iter().enumerate().map(|(i, chunk)| {
-            let provider = self.provider.clone();
+        // Each chunk's future owns its `String`: the fan-out polls lazily and
+        // needs futures with no borrows into the enclosing scope.
+        let extract_chunk = move |i: usize, chunk: String| {
+            let chat = chat.clone();
             let tool_name = cached.tool_name.clone();
             let query = query.to_string();
             let workspace_dir = workspace_dir.clone();
             let parent_chain = parent_chain.clone();
             let owner_agent_id = owner_agent_id.clone();
+            let model = model.clone();
             async move {
                 let user_prompt = format!(
                     "Tool name: {tool_name}\nChunk {idx} of {total}\n\n\
@@ -243,14 +312,17 @@ impl Tool for ExtractFromResultTool {
                     idx = i + 1,
                     total = total_chunks,
                 );
-                let result = provider
-                    .chat_with_system(
-                        Some(EXTRACT_SYSTEM_PROMPT),
-                        &user_prompt,
-                        EXTRACT_MODEL_ID,
-                        EXTRACT_TEMPERATURE,
+                let result = chat
+                    .invoke(
+                        &(),
+                        ModelRequest::new(vec![
+                            Message::system(EXTRACT_SYSTEM_PROMPT.to_string()),
+                            Message::user(user_prompt.clone()),
+                        ]),
                     )
-                    .await;
+                    .await
+                    .map(|r| r.text())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()));
 
                 // Persist this chunk's transcript before returning, so
                 // a partial failure higher up the stream still leaves
@@ -272,41 +344,54 @@ impl Tool for ExtractFromResultTool {
                         Ok(s) => Ok(*s),
                         Err(s) => Err(s.as_str()),
                     },
-                    EXTRACT_MODEL_ID,
+                    &model,
                 );
 
-                (i, result)
+                // The per-chunk result is the fan-out's *item*, not its error:
+                // a failed chunk is dropped below with a warning, and must not
+                // abort its siblings.
+                Ok(result)
             }
-        });
+        };
 
-        let mut map_results: Vec<(usize, _)> = futures::stream::iter(map_futures)
-            .buffer_unordered(MAP_CONCURRENCY)
-            .collect()
-            .await;
-        // `buffer_unordered` yields futures in completion order; restore
-        // original chunk order so the concatenated output matches the
-        // natural ordering of the underlying tool result (e.g. Notion's
-        // reverse-chrono page list).
-        map_results.sort_by_key(|(i, _)| *i);
+        // `map_reduce` returns outcomes in input order, so the concatenated
+        // output keeps the natural ordering of the underlying tool result
+        // (e.g. Notion's reverse-chrono page list) with no re-sort here.
+        let outcome = map_reduce(
+            chunks,
+            ParallelOptions::default()
+                .with_max_concurrency(MAP_CONCURRENCY)
+                .with_failure_policy(FailurePolicy::BestEffort),
+            extract_chunk,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        let partials: Vec<String> = map_results
+        let partials: Vec<String> = outcome
+            .outcomes
             .into_iter()
-            .filter_map(|(i, r)| match r {
-                Ok(text) => {
-                    let trimmed = text.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
+            .filter_map(|item| {
+                let i = item.index;
+                // `BestEffort` never fails an item at the fan-out level; the
+                // inner `Result` is the provider call's own outcome.
+                let r = item.result.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+                match r {
+                    Ok(text) => {
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        chunk_idx = i,
-                        error = %e,
-                        "[extract_from_result] map-stage provider call failed; dropping partial"
-                    );
-                    None
+                    Err(e) => {
+                        tracing::warn!(
+                            chunk_idx = i,
+                            error = %e,
+                            "[extract_from_result] map-stage provider call failed; dropping partial"
+                        );
+                        None
+                    }
                 }
             })
             .collect();
@@ -341,14 +426,18 @@ impl ExtractFromResultTool {
 
         let call_seq = self.next_call_seq();
         let provider_result = self
-            .provider
-            .chat_with_system(
-                Some(EXTRACT_SYSTEM_PROMPT),
-                &user_prompt,
-                EXTRACT_MODEL_ID,
-                EXTRACT_TEMPERATURE,
+            .source
+            .build_summarizer(&self.model, EXTRACT_TEMPERATURE)?
+            .invoke(
+                &(),
+                ModelRequest::new(vec![
+                    Message::system(EXTRACT_SYSTEM_PROMPT.to_string()),
+                    Message::user(user_prompt.clone()),
+                ]),
             )
-            .await;
+            .await
+            .map(|r| r.text())
+            .map_err(|e| anyhow::anyhow!(e.to_string()));
 
         // Persist the transcript before returning — the LLM call cost
         // tokens regardless of whether we ultimately return success.
@@ -368,7 +457,7 @@ impl ExtractFromResultTool {
                 Ok(s) => Ok(*s),
                 Err(s) => Err(s.as_str()),
             },
-            EXTRACT_MODEL_ID,
+            &self.model,
         );
 
         match provider_result {
@@ -465,19 +554,28 @@ fn write_extract_transcript(
     // the blanks when we wire richer accounting later.
     let ts_rfc3339 = chrono::Utc::now().to_rfc3339();
     let turn_usage = TurnUsage {
+        provider: "extract_from_result".to_string(),
         model: model.to_string(),
         usage: MessageUsage {
             input: 0,
             output: 0,
             cached_input: 0,
+            context_window: 0,
             cost_usd: 0.0,
         },
         ts: ts_rfc3339.clone(),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        iteration: 1,
     };
 
     let meta = TranscriptMeta {
         agent_name: format!("{owner_agent_id}::extract_from_result"),
+        agent_id: Some(owner_agent_id.to_string()),
+        agent_type: Some("extractor".to_string()),
         dispatcher: "native".into(),
+        provider: Some(turn_usage.provider.clone()),
+        model: Some(turn_usage.model.clone()),
         created: ts_rfc3339.clone(),
         updated: ts_rfc3339,
         turn_count: 1,
@@ -485,7 +583,8 @@ fn write_extract_transcript(
         output_tokens: 0,
         cached_input_tokens: 0,
         charged_amount_usd: 0.0,
-        thread_id: crate::openhuman::providers::thread_context::current_thread_id(),
+        thread_id: crate::openhuman::agent::tinyagents::thread_context::current_thread_id(),
+        task_id: None,
     };
 
     if let Err(e) = write_transcript(&path, &messages, &meta, Some(&turn_usage)) {
@@ -502,3 +601,7 @@ fn write_extract_transcript(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "extract_tool_tests.rs"]
+mod tests;

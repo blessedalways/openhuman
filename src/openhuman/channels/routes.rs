@@ -4,8 +4,8 @@ use super::context::{
     clear_sender_history, conversation_history_key, ChannelRouteSelection, ChannelRuntimeContext,
 };
 use super::traits;
-use super::{Channel, SendMessage};
-use crate::openhuman::providers::{self, Provider};
+use super::{Channel, ChannelSendExt, SendMessage};
+use crate::openhuman::inference::provider;
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::Path;
@@ -20,6 +20,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    TelegramRemote(super::providers::telegram::TelegramRemoteCommand),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -37,13 +38,25 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord")
 }
 
+fn supports_telegram_remote_control(channel_name: &str) -> bool {
+    channel_name == "telegram"
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
         return None;
     }
 
-    let trimmed = content.trim();
-    if !trimmed.starts_with('/') {
+    if supports_telegram_remote_control(channel_name) {
+        if let Some(remote) =
+            super::providers::telegram::remote_control::parse_telegram_remote_command(content)
+        {
+            return Some(ChannelRuntimeCommand::TelegramRemote(remote));
+        }
+    }
+
+    if !supports_runtime_model_switch(channel_name) {
         return None;
     }
 
@@ -83,7 +96,7 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
         return None;
     }
 
-    let providers_list = providers::list_providers();
+    let providers_list = provider::list_providers();
     for provider in providers_list {
         if provider.name.eq_ignore_ascii_case(candidate)
             || provider
@@ -153,16 +166,18 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-pub(crate) async fn get_or_create_provider(
+pub(crate) async fn get_or_create_turn_model_source(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
-) -> anyhow::Result<Arc<dyn Provider>> {
+) -> anyhow::Result<crate::openhuman::agent::tinyagents::TurnModelSource> {
     if provider_name == ctx.default_provider.as_str() {
-        return Ok(Arc::clone(&ctx.provider));
+        return ctx.turn_model_source.as_ref().cloned().ok_or_else(|| {
+            anyhow::anyhow!("no injected channel model source for '{provider_name}'")
+        });
     }
 
     if let Some(existing) = ctx
-        .provider_cache
+        .turn_model_source_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(provider_name)
@@ -171,29 +186,9 @@ pub(crate) async fn get_or_create_provider(
         return Ok(existing);
     }
 
-    let api_url = if provider_name == ctx.default_provider.as_str() {
-        ctx.api_url.as_deref()
-    } else {
-        None
-    };
-
-    let provider = providers::create_resilient_provider_with_options(
-        api_url,
-        None,
-        &ctx.reliability,
-        &ctx.provider_runtime_options,
-    )?;
-    let provider: Arc<dyn Provider> = Arc::from(provider);
-
-    if let Err(err) = provider.warmup().await {
-        tracing::warn!(provider = provider_name, "Provider warmup failed: {err}");
-    }
-
-    let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
-    let cached = cache
-        .entry(provider_name.to_string())
-        .or_insert_with(|| Arc::clone(&provider));
-    Ok(Arc::clone(cached))
+    anyhow::bail!(
+        "no injected channel model source for '{provider_name}'; production routes use crate-native model sources"
+    )
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -236,7 +231,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
     response.push_str("Available providers:\n");
-    for provider in providers::list_providers() {
+    for provider in provider::list_providers() {
         if provider.aliases.is_empty() {
             let _ = writeln!(response, "- {}", provider.name);
         } else {
@@ -268,29 +263,30 @@ pub(crate) async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::TelegramRemote(remote) => {
+            super::providers::telegram::remote_control::build_remote_command_response(
+                ctx, msg, remote,
+            )
+            .await
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
-
-                        format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                Some(provider_name) => {
+                    tracing::debug!(
+                        provider = %provider_name,
+                        "[channels] validated crate-native provider route from catalog"
+                    );
+                    if provider_name != current.provider {
+                        current.provider = provider_name.clone();
+                        set_route_selection(ctx, &sender_key, current.clone());
+                        clear_sender_history(ctx, &sender_key);
                     }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
-                    }
-                },
+                    format!(
+                        "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                        current.model
+                    )
+                }
                 None => format!(
                     "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
                 ),
@@ -317,7 +313,9 @@ pub(crate) async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send_with_outbound_intent(
+            &SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+        )
         .await
     {
         tracing::warn!(

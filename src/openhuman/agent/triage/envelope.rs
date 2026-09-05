@@ -10,6 +10,18 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::openhuman::threads::todos::ops::BoardLocation;
+
+/// Links a trigger to the task-board card it concerns, so the triage
+/// `apply_decision` arm can hand the card to the deterministic dispatcher
+/// (claim + autonomous run + write-back) instead of the one-shot triage
+/// sub-agent. `None` for triggers with no board card (composio/webhook/cron).
+#[derive(Debug, Clone)]
+pub struct TaskCardLink {
+    pub card_id: String,
+    pub location: BoardLocation,
+}
+
 /// Where the trigger came from, plus source-specific identifiers the
 /// triage prompt wants to surface (toolkit/trigger slug, cron job id,
 /// webhook tunnel id, etc.).
@@ -82,8 +94,12 @@ pub struct TriggerEnvelope {
 
     /// Wall-clock receipt time — stamped by the caller so the triage
     /// pipeline can report a meaningful `latency_ms` when it
-    /// publishes [`crate::core::event_bus::DomainEvent::TriggerEvaluated`].
+    /// publishes [`crate::core::events::DomainEvent::TriggerEvaluated`].
     pub received_at: DateTime<Utc>,
+
+    /// Set when this trigger corresponds to a task-board card, so the
+    /// triage escalation arm routes it through the deterministic dispatcher.
+    pub card_link: Option<TaskCardLink>,
 }
 
 impl TriggerEnvelope {
@@ -118,6 +134,7 @@ impl TriggerEnvelope {
             display_label: format!("composio/{toolkit}/{trigger}"),
             payload,
             received_at: Utc::now(),
+            card_link: None,
         }
     }
 
@@ -136,6 +153,7 @@ impl TriggerEnvelope {
             display_label: format!("webhook/{method}/{path}"),
             payload,
             received_at: Utc::now(),
+            card_link: None,
         }
     }
 
@@ -153,6 +171,7 @@ impl TriggerEnvelope {
             display_label: format!("cron/{job_name}"),
             payload: serde_json::json!({ "output": output }),
             received_at: Utc::now(),
+            card_link: None,
         }
     }
 
@@ -171,124 +190,19 @@ impl TriggerEnvelope {
             display_label: format!("external/{caller_id}"),
             payload,
             received_at: Utc::now(),
+            card_link: None,
         }
+    }
+
+    /// Attach a task-board card link so the triage escalation arm dispatches
+    /// the card deterministically (claim + autonomous run + write-back).
+    #[must_use]
+    pub fn with_task_card(mut self, card_id: String, location: BoardLocation) -> Self {
+        self.card_link = Some(TaskCardLink { card_id, location });
+        self
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn composio_envelope_builds_expected_label_and_slug() {
-        let env = TriggerEnvelope::from_composio(
-            "gmail",
-            "GMAIL_NEW_GMAIL_MESSAGE",
-            "trig-1",
-            "uuid-1",
-            json!({ "from": "a@b.com" }),
-        );
-        assert_eq!(env.display_label, "composio/gmail/GMAIL_NEW_GMAIL_MESSAGE");
-        assert_eq!(env.external_id, "uuid-1");
-        assert_eq!(env.source.slug(), "composio");
-        match env.source {
-            TriggerSource::Composio { toolkit, trigger } => {
-                assert_eq!(toolkit, "gmail");
-                assert_eq!(trigger, "GMAIL_NEW_GMAIL_MESSAGE");
-            }
-            _ => panic!("expected Composio variant"),
-        }
-        assert_eq!(env.payload["from"], "a@b.com");
-    }
-
-    #[test]
-    fn composio_envelope_falls_back_to_metadata_id_when_uuid_missing() {
-        let env = TriggerEnvelope::from_composio(
-            "notion",
-            "NOTION_PAGE_UPDATED",
-            "trig-fallback",
-            "",
-            json!({}),
-        );
-        assert_eq!(env.external_id, "trig-fallback");
-    }
-
-    #[test]
-    fn webview_source_has_stable_slug_and_fields() {
-        let source = TriggerSource::WebviewIntegration {
-            provider: "slack".to_string(),
-            account_id: "acct-123".to_string(),
-        };
-        assert_eq!(source.slug(), "webview");
-        match source {
-            TriggerSource::WebviewIntegration {
-                provider,
-                account_id,
-            } => {
-                assert_eq!(provider, "slack");
-                assert_eq!(account_id, "acct-123");
-            }
-            _ => panic!("expected WebviewIntegration variant"),
-        }
-    }
-
-    #[test]
-    fn webhook_envelope_builds_expected_label_and_slug() {
-        let env = TriggerEnvelope::from_webhook(
-            "tunnel-uuid-1",
-            "POST",
-            "/hooks/test",
-            json!({ "event": "push" }),
-        );
-        assert_eq!(env.display_label, "webhook/POST//hooks/test");
-        assert_eq!(env.external_id, "tunnel-uuid-1");
-        assert_eq!(env.source.slug(), "webhook");
-        match env.source {
-            TriggerSource::Webhook {
-                tunnel_id,
-                method,
-                path,
-            } => {
-                assert_eq!(tunnel_id, "tunnel-uuid-1");
-                assert_eq!(method, "POST");
-                assert_eq!(path, "/hooks/test");
-            }
-            _ => panic!("expected Webhook variant"),
-        }
-        assert_eq!(env.payload["event"], "push");
-    }
-
-    #[test]
-    fn cron_envelope_builds_expected_label_and_slug() {
-        let env = TriggerEnvelope::from_cron("job-1", "morning_briefing", "Briefing complete");
-        assert_eq!(env.display_label, "cron/morning_briefing");
-        assert_eq!(env.external_id, "job-1");
-        assert_eq!(env.source.slug(), "cron");
-        match env.source {
-            TriggerSource::Cron { job_id, job_name } => {
-                assert_eq!(job_id, "job-1");
-                assert_eq!(job_name, "morning_briefing");
-            }
-            _ => panic!("expected Cron variant"),
-        }
-        assert_eq!(env.payload["output"], "Briefing complete");
-    }
-
-    #[test]
-    fn external_envelope_builds_expected_label_and_slug() {
-        let env =
-            TriggerEnvelope::from_external("caller-abc", "ci_pipeline", json!({ "ref": "main" }));
-        assert_eq!(env.display_label, "external/caller-abc");
-        assert_eq!(env.external_id, "caller-abc");
-        assert_eq!(env.source.slug(), "external");
-        match env.source {
-            TriggerSource::External { caller_id, reason } => {
-                assert_eq!(caller_id, "caller-abc");
-                assert_eq!(reason, "ci_pipeline");
-            }
-            _ => panic!("expected External variant"),
-        }
-        assert_eq!(env.payload["ref"], "main");
-    }
-}
+#[path = "envelope_tests.rs"]
+mod tests;

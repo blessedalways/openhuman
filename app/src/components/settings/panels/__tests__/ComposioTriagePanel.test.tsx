@@ -18,10 +18,6 @@ vi.mock('../../hooks/useSettingsNavigation', () => ({
   }),
 }));
 
-vi.mock('../../components/SettingsHeader', () => ({
-  default: ({ title }: { title: string }) => <div data-testid="settings-header">{title}</div>,
-}));
-
 async function importPanel() {
   vi.resetModules();
   const mod = await import('../ComposioTriagePanel');
@@ -50,7 +46,6 @@ describe('ComposioTriagePanel', () => {
       expect(screen.queryByText('Loading…')).toBeNull();
     });
 
-    expect(screen.getByText('Integration Triggers')).toBeInTheDocument();
     expect(screen.getByLabelText('Disable AI triage for all triggers')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('gmail, slack, ...')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();

@@ -1,9 +1,9 @@
 import type { TooltipRenderProps } from 'react-joyride';
 
-/** Emoji accents per step — adds visual personality to each tooltip.
- *  10 entries map to: home-card, home-cta, chat, integrations, channels,
- *  intelligence, settings, quick-access tabs, notifications, final. */
-const STEP_ICONS = ['🏠', '💬', '🗨️', '🧩', '📱', '🧠', '⚙️', '⚡', '🔔', '🎉'];
+import { useT } from '../../lib/i18n/I18nContext';
+
+/** Emoji accents per walkthrough step. */
+const STEP_ICONS = ['💬', '👋', '🗨️', '🧩', '📱', '⚙️', '💬', '👤', '🧠', '🌐', '🔌', '✉️', '🎉'];
 
 /**
  * Premium tooltip for the post-onboarding Joyride walkthrough.
@@ -23,6 +23,7 @@ const WalkthroughTooltip = ({
   size,
   isLastStep,
 }: TooltipRenderProps) => {
+  const { t } = useT();
   const progress = ((index + 1) / size) * 100;
   const icon = STEP_ICONS[index] ?? '✨';
 
@@ -32,11 +33,12 @@ const WalkthroughTooltip = ({
       className="w-80 font-sans animate-in fade-in slide-in-from-bottom-2 duration-300"
       style={{ animation: 'tooltipEnter 0.3s ease-out' }}>
       {/* Frosted card */}
-      <div className="bg-white/95 backdrop-blur-md rounded-2xl shadow-xl border border-stone-200/60 overflow-hidden">
+      <div className="bg-surface/95 backdrop-blur-md rounded-2xl shadow-xl border border-line/60 dark:border-line overflow-hidden">
         {/* Progress bar — thin, smooth fill */}
-        <div className="h-1 bg-stone-100">
+        <div className="h-1 bg-surface-subtle">
           <div
-            className="h-full bg-gradient-to-r from-[#2F6EF4] to-[#5B9BF3] transition-all duration-500 ease-out rounded-r-full"
+            data-testid="walkthrough-progress-bar"
+            className="h-full bg-linear-to-r from-[#2F6EF4] to-[#5B9BF3] transition-all duration-500 ease-out rounded-r-full"
             style={{ width: `${progress}%` }}
           />
         </div>
@@ -49,18 +51,22 @@ const WalkthroughTooltip = ({
             </span>
             <div className="flex-1 min-w-0">
               {step.title && (
-                <h3 className="text-[15px] font-semibold text-stone-900 leading-snug">
+                <h3 className="text-[15px] font-semibold text-content leading-snug">
                   {step.title}
                 </h3>
               )}
-              <span className="text-[11px] text-stone-400 tabular-nums">
-                {index + 1} of {size}
+              <span className="text-[11px] text-content-faint tabular-nums">
+                {t('walkthrough.tooltip.stepCounter')
+                  .replace('{n}', String(index + 1))
+                  .replace('{total}', String(size))}
               </span>
             </div>
           </div>
 
           {/* Body */}
-          <div className="text-[13px] text-stone-600 leading-relaxed mb-5">{step.content}</div>
+          <div className="text-[13px] text-content-secondary leading-relaxed mb-5">
+            {step.content}
+          </div>
 
           {/* Actions */}
           <div className="flex items-center gap-2">
@@ -68,8 +74,8 @@ const WalkthroughTooltip = ({
             {!isLastStep && (
               <button
                 {...skipProps}
-                className="text-[11px] text-stone-400 hover:text-stone-600 transition-colors px-2 py-1.5 rounded-lg hover:bg-stone-100">
-                Skip tour
+                className="text-[11px] text-content-faint hover:text-content-secondary transition-colors px-2 py-1.5 rounded-lg hover:bg-surface-hover">
+                {t('walkthrough.tooltip.skip')}
               </button>
             )}
 
@@ -79,8 +85,8 @@ const WalkthroughTooltip = ({
             {index > 0 && (
               <button
                 {...backProps}
-                className="text-[12px] text-stone-500 hover:text-stone-800 border border-stone-200 hover:border-stone-300 transition-all px-4 py-2 rounded-xl hover:shadow-sm">
-                Back
+                className="text-[12px] text-content-muted hover:text-content border border-line hover:border-line-strong dark:hover:border-line-strong transition-all px-4 py-2 rounded-xl hover:shadow-xs">
+                {t('common.back')}
               </button>
             )}
 
@@ -88,8 +94,8 @@ const WalkthroughTooltip = ({
             {continuous && (
               <button
                 {...primaryProps}
-                className="text-[12px] text-white bg-[#2F6EF4] hover:bg-[#2563d4] active:scale-[0.97] transition-all px-4 py-2 rounded-xl font-medium shadow-sm hover:shadow-md">
-                {isLastStep ? "Let's go!" : 'Next →'}
+                className="text-[12px] text-white bg-[#2F6EF4] hover:bg-[#2563d4] active:scale-[0.97] transition-all px-4 py-2 rounded-xl font-medium shadow-xs hover:shadow-md">
+                {isLastStep ? t('walkthrough.tooltip.letsGo') : t('walkthrough.tooltip.next')}
               </button>
             )}
           </div>

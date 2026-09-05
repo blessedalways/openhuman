@@ -11,16 +11,19 @@
 //!     calls and core `tracing::*` calls funnel into the same file via
 //!     [`tracing_log::LogTracer`].
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Once, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
 
 use nu_ansi_term::{Color, Style};
 use tracing::{Event, Level};
+#[cfg(feature = "file-logging")]
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -28,23 +31,92 @@ use tracing_subscriber::Layer;
 
 static INIT: Once = Once::new();
 
-/// Holds the non-blocking writer guard for the file appender. Must live for
-/// the entire process lifetime — dropping it stops the background flushing
-/// thread and silently swallows pending log records.
-static FILE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+/// Holds the non-blocking writer guard for the file appender. Dropping it
+/// stops the background flushing thread and releases the OS file handle on
+/// the active `openhuman-YYYY-MM-DD.log`, which on Windows is required
+/// before the parent `<data_dir>/logs/` directory can be removed (issue
+/// #1615 — the file is held by the Tauri host process, not the embedded
+/// core, so `CoreProcessHandle::shutdown` alone does not release it).
+///
+/// Wrapped in `Mutex<Option<_>>` instead of `OnceLock` so [`shutdown_file_guard`]
+/// can `take` and drop the guard mid-process during `reset_local_data`.
+/// After a `take`, the file layer's writer becomes a no-op (the background
+/// thread has exited); see [`shutdown_file_guard`] docs for the consequence
+/// on subsequent log records.
+#[cfg(feature = "file-logging")]
+static FILE_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
 
 /// Resolved path to the active log file directory. Populated by
 /// [`init_for_embedded`] so UI commands (e.g. `reveal_logs_folder`) can find
 /// it without re-deriving the data dir.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Default `RUST_LOG` when it is unset: either global levels or only the inline autocomplete module tree.
+const TUI_LOG_CAPACITY: usize = 2_000;
+const TUI_LOG_LINE_MAX_CHARS: usize = 4_096;
+static TUI_LOG_BUFFER: OnceLock<std::sync::Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct TuiLogMakeWriter {
+    buffer: std::sync::Arc<Mutex<VecDeque<String>>>,
+}
+
+struct TuiLogWriter {
+    buffer: std::sync::Arc<Mutex<VecDeque<String>>>,
+    pending: Vec<u8>,
+}
+
+impl<'a> MakeWriter<'a> for TuiLogMakeWriter {
+    type Writer = TuiLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TuiLogWriter {
+            buffer: self.buffer.clone(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl Write for TuiLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.publish();
+        Ok(())
+    }
+}
+
+impl TuiLogWriter {
+    fn publish(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let rendered = String::from_utf8_lossy(&self.pending);
+        if let Ok(mut lines) = self.buffer.lock() {
+            for line in rendered.lines().filter(|line| !line.is_empty()) {
+                if lines.len() == TUI_LOG_CAPACITY {
+                    lines.pop_front();
+                }
+                lines.push_back(line.chars().take(TUI_LOG_LINE_MAX_CHARS).collect());
+            }
+        }
+        self.pending.clear();
+    }
+}
+
+impl Drop for TuiLogWriter {
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
+/// Default `RUST_LOG` when it is unset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliLogDefault {
     /// Typical server/CLI logging (`info`, or `debug` when `verbose`).
     Global,
-    /// Silence other modules; only `openhuman_core::openhuman::autocomplete::*` emits logs.
-    AutocompleteOnly,
 }
 
 /// Custom log formatter for the OpenHuman CLI.
@@ -192,7 +264,11 @@ pub fn init_for_cli_run(verbose: bool, default_scope: CliLogDefault) {
             .with(sentry_tracing_layer())
             .try_init();
 
-        // Bridge the `log` crate.
+        // Bridge the `log` crate. Rides with `file-logging` because
+        // `tracing-log` is the other crate that gate owns; with it off, `log::*`
+        // records from dependencies stop reaching tracing in EVERY init path,
+        // not only the file ones.
+        #[cfg(feature = "file-logging")]
         let _ = tracing_log::LogTracer::init();
     });
 }
@@ -216,12 +292,18 @@ pub fn init_for_cli_run(verbose: bool, default_scope: CliLogDefault) {
 /// the Tauri shell should call this before any CLI path could initialize a
 /// stderr-only subscriber.
 pub fn init_for_embedded(data_dir: &Path, verbose: bool) {
+    // `data_dir` is only read to build the rolling-file appender's directory,
+    // which the `file-logging` gate compiles out. Discarded explicitly here
+    // rather than silencing the whole function with `#[allow(unused_variables)]`
+    // — a blanket allow on a body this size would also hide the next genuinely
+    // unused binding someone adds.
+    #[cfg(not(feature = "file-logging"))]
+    let _ = data_dir;
     INIT.call_once(|| {
         let scope = CliLogDefault::Global;
         seed_rust_log(verbose, scope);
         let filter = build_env_filter(verbose, scope);
 
-        let logs_dir = data_dir.join("logs");
         // Build the file appender first, but keep the writer guard + path in
         // locals — only commit to `FILE_GUARD` / `LOG_DIR` after `try_init()`
         // succeeds. Otherwise a competing global subscriber would cause
@@ -229,36 +311,48 @@ pub fn init_for_embedded(data_dir: &Path, verbose: bool) {
         // path even though no file layer is attached. Errors are surfaced via
         // `eprintln!` (the tracing subscriber isn't installed yet here) using
         // the same `[logging]` prefix as the dir-creation diagnostic.
-        let pending_file: Option<(_, tracing_appender::non_blocking::WorkerGuard, PathBuf)> =
-            match std::fs::create_dir_all(&logs_dir) {
-                Ok(()) => match tracing_appender::rolling::Builder::new()
-                    .rotation(tracing_appender::rolling::Rotation::DAILY)
-                    .filename_prefix("openhuman")
-                    .filename_suffix("log")
-                    .max_log_files(7)
-                    .build(&logs_dir)
-                {
-                    Ok(appender) => {
-                        let (writer, guard) = tracing_appender::non_blocking(appender);
-                        Some((writer, guard, logs_dir.clone()))
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "[logging] failed to create file appender in {}: {err}",
-                            logs_dir.display()
-                        );
-                        None
-                    }
-                },
+        // The file appender and its layer are the whole of this gate. Their
+        // concrete type embeds `tracing_appender`'s `NonBlocking` writer, which
+        // is why the off-state cannot simply be a `None` of the same type — the
+        // type does not exist in that build. Hence paired `.with()` chains
+        // below rather than one chain and an optional layer.
+        #[cfg(feature = "file-logging")]
+        let logs_dir = data_dir.join("logs");
+        #[cfg(feature = "file-logging")]
+        let pending_file: Option<(
+            _,
+            tracing_appender::non_blocking::WorkerGuard,
+            PathBuf,
+        )> = match std::fs::create_dir_all(&logs_dir) {
+            Ok(()) => match tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("openhuman")
+                .filename_suffix("log")
+                .max_log_files(7)
+                .build(&logs_dir)
+            {
+                Ok(appender) => {
+                    let (writer, guard) = tracing_appender::non_blocking(appender);
+                    Some((writer, guard, logs_dir.clone()))
+                }
                 Err(err) => {
                     eprintln!(
-                        "[logging] failed to create logs dir {}: {err}",
+                        "[logging] failed to create file appender in {}: {err}",
                         logs_dir.display()
                     );
                     None
                 }
-            };
+            },
+            Err(err) => {
+                eprintln!(
+                    "[logging] failed to create logs dir {}: {err}",
+                    logs_dir.display()
+                );
+                None
+            }
+        };
 
+        #[cfg(feature = "file-logging")]
         let file_layer = pending_file.as_ref().map(|(writer, _, _)| {
             let constraints = parse_log_file_constraints();
             tracing_subscriber::fmt::layer()
@@ -280,16 +374,31 @@ pub fn init_for_embedded(data_dir: &Path, verbose: bool) {
                 event_matches_file_constraints(meta, &stderr_constraints)
             }));
 
-        match tracing_subscriber::registry()
+        #[cfg(feature = "file-logging")]
+        let init_result = tracing_subscriber::registry()
             .with(filter)
             .with(stderr_layer)
             .with(file_layer)
             .with(sentry_tracing_layer())
-            .try_init()
-        {
-            Ok(()) => {
+            .try_init();
+        // Same chain minus the file layer. Stderr and Sentry are unaffected by
+        // this gate, so a build without file logging still logs everywhere it
+        // did before — it just keeps nothing on disk.
+        #[cfg(not(feature = "file-logging"))]
+        let init_result = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(sentry_tracing_layer())
+            .try_init();
+
+        match init_result {
+            Ok(()) =>
+            {
+                #[cfg(feature = "file-logging")]
                 if let Some((_, guard, dir)) = pending_file {
-                    let _ = FILE_GUARD.set(guard);
+                    if let Ok(mut slot) = FILE_GUARD.lock() {
+                        *slot = Some(guard);
+                    }
                     let _ = LOG_DIR.set(dir);
                 }
             }
@@ -304,8 +413,134 @@ pub fn init_for_embedded(data_dir: &Path, verbose: bool) {
             }
         }
 
+        #[cfg(feature = "file-logging")]
         let _ = tracing_log::LogTracer::init();
     });
+}
+
+/// Initialize logging for the terminal chat UI (`openhuman tui` / `chat`).
+///
+/// **File-only, never stderr.** The TUI owns the whole terminal (alternate
+/// screen + raw mode); a single `tracing`/`log` line written to stdout or
+/// stderr would corrupt the rendered UI. So — unlike [`init_for_cli_run`]
+/// (stderr) and [`init_for_embedded`] (stderr + file) — this installs **only**
+/// a daily-rotated file appender at `<data_dir>/logs/openhuman-YYYY-MM-DD.log`
+/// plus the Sentry layer (which keeps no console handle). Core boot logs and
+/// the `[tui]` state-transition logs land in that file for post-mortem
+/// debugging without ever touching the screen.
+///
+/// Idempotent (`Once`-guarded, shared with the other init entry points). If a
+/// subscriber was somehow already installed, this is a no-op and logging keeps
+/// whatever destination the first caller chose — still never stderr from *this*
+/// path. Returns the resolved log directory on success (for a status line), or
+/// `None` when the file appender could not be created.
+pub fn init_for_tui(data_dir: &Path, verbose: bool) -> Option<PathBuf> {
+    // See `init_for_embedded` — same reason, same narrow discard.
+    #[cfg(not(feature = "file-logging"))]
+    let _ = data_dir;
+    INIT.call_once(|| {
+        let scope = CliLogDefault::Global;
+        seed_rust_log(verbose, scope);
+        let filter = build_env_filter(verbose, scope);
+
+        #[cfg(feature = "file-logging")]
+        let logs_dir = data_dir.join("logs");
+        #[cfg(feature = "file-logging")]
+        let pending_file: Option<(
+            _,
+            tracing_appender::non_blocking::WorkerGuard,
+            PathBuf,
+        )> = match std::fs::create_dir_all(&logs_dir) {
+            Ok(()) => match tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("openhuman")
+                .filename_suffix("log")
+                .max_log_files(7)
+                .build(&logs_dir)
+            {
+                Ok(appender) => {
+                    let (writer, guard) = tracing_appender::non_blocking(appender);
+                    Some((writer, guard, logs_dir.clone()))
+                }
+                Err(err) => {
+                    // No tracing subscriber yet, but we deliberately do NOT
+                    // eprintln! here (the TUI is about to take the terminal).
+                    // Losing this one diagnostic is the correct trade.
+                    let _ = err;
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        #[cfg(feature = "file-logging")]
+        let file_layer = pending_file.as_ref().map(|(writer, _, _)| {
+            let constraints = parse_log_file_constraints();
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .event_format(CleanCliFormat)
+                .with_writer(writer.clone())
+                .with_filter(tracing_subscriber::filter::filter_fn(move |meta| {
+                    event_matches_file_constraints(meta, &constraints)
+                }))
+        });
+
+        let tui_buffer = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        let tui_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .event_format(CleanCliFormat)
+            .with_writer(TuiLogMakeWriter {
+                buffer: tui_buffer.clone(),
+            });
+
+        // NOTE: no stderr layer here — that is the whole point of this entry
+        // point. Only the file layer + Sentry are attached.
+        // NOTE: still no stderr layer in either arm. A stderr fallback here
+        // would write into the alternate screen and corrupt the TUI, so the
+        // off-state keeps only the in-memory `tui_layer` — which is what the
+        // Logs tab reads anyway.
+        #[cfg(feature = "file-logging")]
+        let tui_init_ok = tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(tui_layer)
+            .with(sentry_tracing_layer())
+            .try_init()
+            .is_ok();
+        #[cfg(not(feature = "file-logging"))]
+        let tui_init_ok = tracing_subscriber::registry()
+            .with(filter)
+            .with(tui_layer)
+            .with(sentry_tracing_layer())
+            .try_init()
+            .is_ok();
+
+        if tui_init_ok {
+            let _ = TUI_LOG_BUFFER.set(tui_buffer);
+            #[cfg(feature = "file-logging")]
+            if let Some((_, guard, dir)) = pending_file {
+                if let Ok(mut slot) = FILE_GUARD.lock() {
+                    *slot = Some(guard);
+                }
+                let _ = LOG_DIR.set(dir);
+            }
+        }
+
+        #[cfg(feature = "file-logging")]
+        let _ = tracing_log::LogTracer::init();
+    });
+
+    log_directory().map(Path::to_path_buf)
+}
+
+/// Snapshot the bounded in-memory log stream rendered by the terminal Logs tab.
+/// The file appender remains authoritative for long-term retention.
+pub fn tui_log_lines() -> Vec<String> {
+    TUI_LOG_BUFFER
+        .get()
+        .and_then(|buffer| buffer.lock().ok())
+        .map(|lines| lines.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Path to the active log directory (set by [`init_for_embedded`]). Returns
@@ -313,6 +548,48 @@ pub fn init_for_embedded(data_dir: &Path, verbose: bool) {
 /// CLI runs).
 pub fn log_directory() -> Option<&'static Path> {
     LOG_DIR.get().map(PathBuf::as_path)
+}
+
+/// Drop the file appender's worker guard so the rolling `openhuman-*.log`
+/// file handle held by *this* process is released.
+///
+/// Returns `true` if a guard was taken (and dropped here), `false` if no
+/// guard was installed (CLI run, init failed, or already shut down). After
+/// this call:
+///
+///   * the non-blocking writer's background thread exits as part of `drop`,
+///   * the OS file handle on today's log file is closed,
+///   * subsequent `tracing::*` records routed to the file layer are silently
+///     discarded (the writer becomes a no-op) until the process restarts.
+///
+/// **Used by**: the Tauri shell's `reset_local_data` command, which must be
+/// able to `remove_dir_all(<data_dir>)` on Windows. Without releasing this
+/// guard the host process holds an open handle inside `<data_dir>/logs/`
+/// and Windows returns `ERROR_SHARING_VIOLATION` (os error 32). The stderr
+/// and Sentry layers stay attached because they don't keep files open.
+///
+/// **Not idempotent in the recover-after-call sense**: there is no re-init
+/// path. A subsequent `init_for_embedded` is a no-op (the `Once` guard has
+/// already fired), so file logging stays off until the next process launch.
+/// `reset_local_data` is followed by `ensure_running()` which restarts the
+/// embedded core but does *not* re-install the subscriber — by design, the
+/// user is expected to restart the app shortly after a reset.
+#[cfg(feature = "file-logging")]
+pub fn shutdown_file_guard() -> bool {
+    let Ok(mut slot) = FILE_GUARD.lock() else {
+        return false;
+    };
+    slot.take().is_some()
+}
+
+/// Off-state: there is no file writer to shut down, so nothing was taken.
+///
+/// Kept as a real function rather than `#[cfg]`-ing the caller, because the
+/// Tauri `reset_local_data` command calls this unconditionally and has no
+/// reason to know whether file logging was compiled in.
+#[cfg(not(feature = "file-logging"))]
+pub fn shutdown_file_guard() -> bool {
+    false
 }
 
 fn seed_rust_log(verbose: bool, default_scope: CliLogDefault) {
@@ -327,10 +604,6 @@ fn seed_rust_log(verbose: bool, default_scope: CliLogDefault) {
                 "info".to_string()
             }
         }
-        CliLogDefault::AutocompleteOnly => {
-            let level = if verbose { "trace" } else { "debug" };
-            format!("off,openhuman_core::openhuman::autocomplete={level}")
-        }
     };
     std::env::set_var("RUST_LOG", default);
 }
@@ -340,26 +613,40 @@ fn build_env_filter(verbose: bool, default_scope: CliLogDefault) -> tracing_subs
         CliLogDefault::Global => {
             tracing_subscriber::EnvFilter::new(if verbose { "debug" } else { "info" })
         }
-        CliLogDefault::AutocompleteOnly => {
-            let level = if verbose { "trace" } else { "debug" };
-            tracing_subscriber::EnvFilter::new(format!(
-                "off,openhuman_core::openhuman::autocomplete={level}"
-            ))
-        }
     })
 }
 
+#[cfg(feature = "crash-reporting")]
 fn sentry_tracing_layer<S>() -> impl Layer<S>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
     sentry::integrations::tracing::layer().event_filter(|md: &tracing::Metadata<'_>| {
+        // Events emitted from `report_error_message` are captured directly via
+        // `sentry::capture_message` at the call site (see
+        // `core::observability::REPORT_ERROR_TRACING_TARGET` for rationale).
+        // Skip them here so we don't double-report.
+        if md.target() == crate::core::observability::REPORT_ERROR_TRACING_TARGET {
+            return sentry::integrations::tracing::EventFilter::Ignore;
+        }
         match *md.level() {
             Level::ERROR => sentry::integrations::tracing::EventFilter::Event,
             Level::WARN | Level::INFO => sentry::integrations::tracing::EventFilter::Breadcrumb,
             _ => sentry::integrations::tracing::EventFilter::Ignore,
         }
     })
+}
+
+/// Sentry-free build: the Sentry breadcrumb/event bridge collapses to a no-op
+/// `Identity` layer so the two `.with(sentry_tracing_layer())` call sites keep
+/// compiling unchanged (they add a layer that does nothing). Same signature as
+/// the `crash-reporting` version above.
+#[cfg(not(feature = "crash-reporting"))]
+fn sentry_tracing_layer<S>() -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    tracing_subscriber::layer::Identity::new()
 }
 
 #[cfg(test)]
@@ -371,8 +658,17 @@ mod tests {
     /// concurrent env-var writes would race.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serialize tests that mutate the process-global `FILE_GUARD` static.
+    /// Without this, `shutdown_file_guard_takes_installed_guard` can race
+    /// any concurrent test that calls `init_for_embedded` (or that itself
+    /// stashes / takes the guard), making one of them observe a guard it
+    /// did not install. Mirror of the `SCHEDULE_LOCK` pattern in
+    /// `app/src-tauri/src/reset_reboot_schedule.rs::tests`.
+    #[cfg(feature = "file-logging")]
+    static FILE_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_clean_rust_log<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUST_LOG").ok();
         std::env::remove_var("RUST_LOG");
         let result = f();
@@ -416,26 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn seed_rust_log_autocomplete_scopes_to_module() {
-        with_clean_rust_log(|| {
-            seed_rust_log(false, CliLogDefault::AutocompleteOnly);
-            assert_eq!(
-                std::env::var("RUST_LOG").unwrap(),
-                "off,openhuman_core::openhuman::autocomplete=debug"
-            );
-        });
-        with_clean_rust_log(|| {
-            seed_rust_log(true, CliLogDefault::AutocompleteOnly);
-            assert_eq!(
-                std::env::var("RUST_LOG").unwrap(),
-                "off,openhuman_core::openhuman::autocomplete=trace"
-            );
-        });
-    }
-
-    #[test]
     fn seed_rust_log_respects_existing_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUST_LOG").ok();
         std::env::set_var("RUST_LOG", "warn");
         seed_rust_log(true, CliLogDefault::Global);
@@ -451,12 +729,12 @@ mod tests {
     fn build_env_filter_returns_a_filter() {
         // Smoke test: shouldn't panic and should produce *some* filter regardless of inputs.
         let _ = build_env_filter(false, CliLogDefault::Global);
-        let _ = build_env_filter(true, CliLogDefault::AutocompleteOnly);
+        let _ = build_env_filter(true, CliLogDefault::Global);
     }
 
     #[test]
     fn parse_log_file_constraints_handles_csv_and_whitespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("OPENHUMAN_LOG_FILE_CONSTRAINTS").ok();
         std::env::set_var("OPENHUMAN_LOG_FILE_CONSTRAINTS", "rpc, , agent ,memory");
         let parsed = parse_log_file_constraints();
@@ -480,5 +758,84 @@ mod tests {
         if LOG_DIR.get().is_none() {
             assert!(log_directory().is_none());
         }
+    }
+
+    // Constructs a real `tracing_appender` appender, so it only exists when
+    // the crate does.
+    #[cfg(feature = "file-logging")]
+    #[test]
+    fn shutdown_file_guard_takes_installed_guard() {
+        let _g = FILE_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Simulate `init_for_embedded` having stashed a writer guard, then
+        // assert that `shutdown_file_guard` empties the slot and reports
+        // truthfully.
+        let dir = tempfile::tempdir().expect("tempdir for guard test");
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("guard-test")
+            .filename_suffix("log")
+            .build(dir.path())
+            .expect("rolling appender for guard test");
+        let (_writer, guard) = tracing_appender::non_blocking(appender);
+        {
+            let mut slot = FILE_GUARD.lock().expect("file guard mutex poisoned");
+            // Save any pre-existing guard (a prior test in this process may
+            // have installed one) and restore it after the assertion runs.
+            let prior = slot.replace(guard);
+            drop(slot);
+
+            assert!(
+                shutdown_file_guard(),
+                "expected shutdown_file_guard to take the installed guard"
+            );
+            assert!(
+                !shutdown_file_guard(),
+                "second call must be a no-op when the slot is already empty"
+            );
+
+            // Restore the prior guard so unrelated tests that depend on
+            // `init_for_embedded` having installed one are not surprised.
+            if let Ok(mut slot) = FILE_GUARD.lock() {
+                *slot = prior;
+            }
+        }
+    }
+
+    #[test]
+    fn tui_log_writer_keeps_a_bounded_ordered_ring() {
+        let buffer = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = TuiLogWriter {
+            buffer: buffer.clone(),
+            pending: Vec::new(),
+        };
+        for index in 0..=TUI_LOG_CAPACITY {
+            writeln!(writer, "line-{index}").expect("write log line");
+            writer.flush().expect("flush log line");
+        }
+        let lines = buffer.lock().expect("buffer lock");
+        assert_eq!(lines.len(), TUI_LOG_CAPACITY);
+        assert_eq!(lines.front().map(String::as_str), Some("line-1"));
+        let expected_last = format!("line-{TUI_LOG_CAPACITY}");
+        assert_eq!(
+            lines.back().map(String::as_str),
+            Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn tui_log_writer_caps_individual_lines() {
+        let buffer = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = TuiLogWriter {
+            buffer: buffer.clone(),
+            pending: Vec::new(),
+        };
+        writeln!(writer, "{}", "x".repeat(TUI_LOG_LINE_MAX_CHARS + 50)).expect("write long line");
+        writer.flush().expect("flush long line");
+        let lines = buffer.lock().expect("buffer lock");
+        assert_eq!(
+            lines.front().map(|line| line.chars().count()),
+            Some(TUI_LOG_LINE_MAX_CHARS)
+        );
     }
 }

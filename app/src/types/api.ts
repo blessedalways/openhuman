@@ -77,8 +77,6 @@ export interface CurrentPlanData {
   subscription: { id: string; status: string; currentPeriodEnd: string; quantity: number } | null;
   monthlyBudgetUsd: number;
   weeklyBudgetUsd: number;
-  /** Max USD per 10-hour rolling inference window for this plan tier (server field name: fiveHourCapUsd). */
-  fiveHourCapUsd: number;
 }
 
 export interface PurchasePlanData {
@@ -96,6 +94,3 @@ export interface CoinbaseChargeData {
   status: string;
   expiresAt: string;
 }
-
-// API Endpoints
-export type GetMeResponse = ApiResponse<User>;

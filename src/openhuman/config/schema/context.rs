@@ -1,12 +1,12 @@
 //! Context management configuration.
 //!
-//! Knobs for the global `src/openhuman/context/` module — budget
+//! Knobs for the global `src/openhuman/agent/context/` module — budget
 //! thresholds, summarization trigger percentages, microcompact behavior,
 //! and the session-memory extraction cadence. Wired into the root
 //! [`super::Config`] as the `context` section; env overrides live in
 //! [`super::load`].
 
-use crate::openhuman::context::session_memory::SessionMemoryConfig;
+use crate::openhuman::agent::context::session_memory::SessionMemoryConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 /// `config.toml` and fall back to the defaults shipped in
 /// [`ContextConfig::default`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct ContextConfig {
-    /// Master switch. When `false`, [`crate::openhuman::context::ContextManager`]
+    /// Master switch. When `false`, [`crate::openhuman::agent::context::ContextManager`]
     /// skips every reduction stage and the summarizer is never invoked.
     /// Useful for tests and diagnostics; not recommended for production.
     #[serde(default = "default_enabled")]
@@ -26,10 +27,8 @@ pub struct ContextConfig {
     #[serde(default = "default_true")]
     pub microcompact_enabled: bool,
 
-    /// Enable stage 4 (autocompact) — dispatch the summarizer when
-    /// microcompact cannot free enough tokens. Disabling this makes the
-    /// pipeline return `PipelineOutcome::NoOp` at the soft threshold and
-    /// trust the caller to surface the situation via the guard.
+    /// Enable stage 4 (autocompact) — install the TinyAgents summarization
+    /// middleware when the transcript approaches the model context window.
     #[serde(default = "default_true")]
     pub autocompact_enabled: bool,
 
@@ -39,7 +38,7 @@ pub struct ContextConfig {
     pub microcompact_keep_recent: usize,
 
     /// Maximum byte length of a single tool-result body before the
-    /// context pipeline's tool-result budget stage truncates it.
+    /// TinyAgents tool-output middleware budget stage truncates it.
     /// `0` disables the cap. Applied inline at tool-execution time
     /// before the result enters history, so it is cache-safe.
     ///
@@ -82,7 +81,7 @@ pub struct ContextConfig {
     )]
     pub summarizer_max_payload_tokens: usize,
 
-    /// Session-memory extraction thresholds (stage 5 of the pipeline).
+    /// Session-memory extraction thresholds.
     #[serde(default)]
     pub session_memory: SessionMemoryConfig,
 
@@ -102,6 +101,21 @@ pub struct ContextConfig {
     /// downstream consumer expects strict JSON tool output.
     #[serde(default = "default_true")]
     pub prefer_markdown_tool_output: bool,
+
+    /// Master switch for native tool-output compaction (Stage 1a). When
+    /// `true` (the default), large structured tool outputs (build/test logs,
+    /// diffs, JSON arrays) are content-aware compressed in
+    /// `Agent::execute_tool_call` *before* the [`Self::tool_result_budget_bytes`]
+    /// byte cap and before they enter history. The compression never drops the
+    /// first/last/high-signal lines and only ever shrinks output, so it is on
+    /// by default.
+    ///
+    /// This is invisible infrastructure (like microcompact/autocompact): no
+    /// user-facing UI. The only reason to flip it off is a support / debugging
+    /// / A/B bisect, via config or the `OPENHUMAN_COMPACTION=0` env override.
+    /// See `compaction-plan.md`.
+    #[serde(default = "default_true")]
+    pub compaction_enabled: bool,
 }
 
 fn default_enabled() -> bool {
@@ -113,16 +127,16 @@ fn default_true() -> bool {
 }
 
 fn default_microcompact_keep_recent() -> usize {
-    crate::openhuman::context::DEFAULT_KEEP_RECENT_TOOL_RESULTS
+    crate::openhuman::agent::context::DEFAULT_KEEP_RECENT_TOOL_RESULTS
 }
 
 fn default_tool_result_budget_bytes() -> usize {
-    crate::openhuman::context::DEFAULT_TOOL_RESULT_BUDGET_BYTES
+    crate::openhuman::agent::context::DEFAULT_TOOL_RESULT_BUDGET_BYTES
 }
 
 fn default_summarizer_payload_threshold_tokens() -> usize {
     // Re-enabled at 4000 tokens after the recursive-dispatch root cause
-    // was fixed by the `omit_skills_catalog = true` guard on the
+    // was fixed by the narrow sub-agent prompt built for the
     // summarizer archetype (which prevents it from seeing `spawn_subagent`
     // and thus cannot recurse). 0 would leave this entirely disabled.
     4000
@@ -145,6 +159,7 @@ impl Default for ContextConfig {
             session_memory: SessionMemoryConfig::default(),
             summarizer_model: None,
             prefer_markdown_tool_output: default_true(),
+            compaction_enabled: default_true(),
         }
     }
 }

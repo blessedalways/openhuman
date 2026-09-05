@@ -1,7 +1,5 @@
 import type { User } from '../../types/api';
 import type { TeamInvite, TeamMember, TeamWithRole } from '../../types/team';
-import type { AccessibilityStatus } from '../../utils/tauriCommands/accessibility';
-import type { AutocompleteStatus } from '../../utils/tauriCommands/autocomplete';
 import type { LocalAiStatus } from '../../utils/tauriCommands/localAi';
 import type { ServiceStatus } from '../../utils/tauriCommands/service';
 
@@ -14,15 +12,26 @@ export interface CoreOnboardingTasks {
   updatedAtMs?: number;
 }
 
+export interface KeyringConsentPreference {
+  storageMode: string;
+  consentedAtMs?: number;
+}
+
+export interface KeyringStatus {
+  available: boolean;
+  failureReason?: string | null;
+  activeMode: string;
+  backendName: string;
+}
+
 export interface CoreLocalState {
   encryptionKey: string | null;
   onboardingTasks: CoreOnboardingTasks | null;
+  keyringConsent: KeyringConsentPreference | null;
 }
 
 export interface CoreRuntimeSnapshot {
-  screenIntelligence: AccessibilityStatus | null;
   localAi: LocalAiStatus | null;
-  autocomplete: AutocompleteStatus | null;
   service: ServiceStatus | null;
 }
 
@@ -37,11 +46,10 @@ export interface CoreAppSnapshot {
   currentUser: User | null;
   onboardingCompleted: boolean;
   /**
-   * Whether the chat-based welcome-agent flow has finished. Mirrors
-   * `Config::chat_onboarding_completed` in the Rust core (see
-   * `src/openhuman/config/schema/types.rs`). Flipped to `true` by the
-   * welcome agent calling `complete_onboarding(action: "complete")`.
-   * Drives the UI "welcome lockdown" — see {@link isWelcomeLocked}.
+   * Deprecated — the welcome agent has been removed. This field is retained
+   * in the snapshot for backward compatibility. It is always effectively `true`
+   * for existing users and has no effect on routing or UI behavior.
+   * @deprecated since welcome-agent removal
    */
   chatOnboardingCompleted: boolean;
   analyticsEnabled: boolean;
@@ -54,9 +62,27 @@ export interface CoreAppSnapshot {
    * privacy-conservative gate added in #1299. The webview meet flow
    * reads this before invoking `handoffToOrchestrator`.
    */
-  meetAutoOrchestratorHandoff: boolean;
   localState: CoreLocalState;
+  keyringStatus: KeyringStatus;
   runtime: CoreRuntimeSnapshot;
+  /**
+   * Whether `currentUser` is being served from the core's stored snapshot
+   * because the backend could not be refreshed (#5930). Plan tier, credits and
+   * feature flags read off a stale `currentUser` may be wrong.
+   *
+   * Optional on the type, always concrete at runtime: `normalizeSnapshot`
+   * defaults it and `emptySnapshot` carries it. Optional so a snapshot literal
+   * — of which there are several in tests — stays valid without restating a
+   * field it does not care about. Read it as `?? false`.
+   */
+  currentUserStale?: boolean;
+  /**
+   * Seconds since the backend last answered, or `null` when it has not answered
+   * at all this process — the age is then genuinely unknown, not zero. A
+   * surface deciding whether to warn owns its own threshold; the core does not
+   * pick one.
+   */
+  currentUserStaleSeconds?: number | null;
 }
 
 export interface CoreState {
@@ -75,9 +101,16 @@ const emptySnapshot: CoreAppSnapshot = {
   onboardingCompleted: false,
   chatOnboardingCompleted: false,
   analyticsEnabled: false,
-  meetAutoOrchestratorHandoff: false,
-  localState: { encryptionKey: null, onboardingTasks: null },
-  runtime: { screenIntelligence: null, localAi: null, autocomplete: null, service: null },
+  localState: { encryptionKey: null, onboardingTasks: null, keyringConsent: null },
+  keyringStatus: {
+    available: true,
+    failureReason: null,
+    activeMode: 'os_keyring',
+    backendName: 'os',
+  },
+  runtime: { localAi: null, service: null },
+  currentUserStale: false,
+  currentUserStaleSeconds: null,
 };
 
 let currentState: CoreState = {
@@ -97,29 +130,20 @@ export function setCoreStateSnapshot(next: CoreState): void {
   currentState = next;
 }
 
+// Expose the snapshot getter on `window` so WDIO E2E specs can read the
+// authenticated user id (held in core state, not redux) to scope socket
+// readiness, account-switch races, and other backing-state assertions.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __OPENHUMAN_CORE_STATE__?: () => CoreState }).__OPENHUMAN_CORE_STATE__ =
+    getCoreStateSnapshot;
+}
+
 /**
- * Is the UI currently locked to the welcome-agent conversation? (#883)
- *
- * [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough.
- * Function body always returns `false` so existing callers compile without
- * changes. The welcome-lock UI affordances are also commented out at each
- * call site but the function signature is preserved to avoid import errors.
- *
- * Original implementation:
- * Returns `true` when the authenticated user has completed the React
- * wizard (`onboardingCompleted`) but the chat-based welcome flow has
- * not yet finalized (`chatOnboardingCompleted === false`).
+ * @deprecated The welcome agent has been removed. Always returns `false`.
+ * Kept for any remaining imports to compile without changes.
  */
-// [#1123] Commented out — welcome-agent onboarding replaced by Joyride walkthrough
 export function isWelcomeLocked(_snapshot: CoreAppSnapshot): boolean {
-  // [#1123] Always return false — welcome-lock replaced by Joyride walkthrough
   return false;
-  // Original implementation:
-  // return (
-  //   snapshot.auth.isAuthenticated &&
-  //   snapshot.onboardingCompleted &&
-  //   !snapshot.chatOnboardingCompleted
-  // );
 }
 
 export function patchCoreStateSnapshot(patch: {

@@ -1,13 +1,31 @@
-//! Skill discovery: scanning root directories, scope resolution, collision handling,
+//! Workflow discovery: scanning root directories, scope resolution, collision handling,
 //! and skill resource reading.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::ops_parse::{load_from_legacy_manifest, load_from_skill_md};
+use super::ops_parse::{load_from_legacy_manifest, load_from_workflow_md};
 use super::ops_types::{
-    Skill, SkillScope, MAX_SKILL_RESOURCE_BYTES, SKILL_JSON, SKILL_MD, TRUST_MARKER,
+    Workflow, WorkflowScope, MAX_WORKFLOW_RESOURCE_BYTES, SKILL_JSON, SKILL_MD, TRUST_MARKER,
+    WORKFLOW_MD,
 };
+
+const EXCLUDED_SKILL_DIRS: &[&str] = &[
+    ".git",
+    ".github",
+    ".hub",
+    ".archive",
+    ".venv",
+    "venv",
+    "node_modules",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
 
 /// Initialize the legacy skills directory in the specified workspace.
 ///
@@ -15,7 +33,7 @@ use super::ops_types::{
 /// is visible to the user. New-style skills should live under
 /// `<workspace>/.openhuman/skills/` instead, but this directory is kept for
 /// backward compatibility.
-pub fn init_skills_dir(workspace_dir: &Path) -> Result<(), String> {
+pub fn init_workflows_dir(workspace_dir: &Path) -> Result<(), String> {
     let skills_dir = workspace_dir.join("skills");
     std::fs::create_dir_all(&skills_dir).map_err(|e| {
         format!(
@@ -36,7 +54,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<(), String> {
 
 /// Backwards-compatible shim for callers that only have a workspace path.
 ///
-/// Delegates to [`discover_skills`] with the current user's home directory
+/// Delegates to [`discover_workflows`] with the current user's home directory
 /// so user-scope skills (`~/.openhuman/skills/`, `~/.agents/skills/`) are
 /// surfaced for existing production callers (`agent::harness::session::builder`,
 /// `channels::runtime::startup`). Previously this shim passed `None` for the
@@ -45,10 +63,33 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<(), String> {
 ///
 /// Project-scope (workspace) skills still take precedence over user-scope
 /// on name collisions.
-pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
+pub fn load_workflow_metadata(workspace_dir: &Path) -> Vec<Workflow> {
     let trusted = is_workspace_trusted(workspace_dir);
     let home = dirs::home_dir();
-    discover_skills_inner(home.as_deref(), Some(workspace_dir), trusted)
+    discover_workflows_inner(home.as_deref(), Some(workspace_dir), None, trusted)
+}
+
+/// Like [`load_workflow_metadata`], but additionally scans a profile-local
+/// skills root (`<workspace>/personalities/<id>/skills/`) when one is supplied.
+///
+/// Callers pass the active profile's root (resolved via
+/// `profiles::profile_skills_root`) so the returned catalog carries that
+/// profile's private skills. `None` reproduces [`load_workflow_metadata`]
+/// byte-for-byte, so the profile-less session and every other profile are
+/// unaffected. Profile-local skills win same-name collisions against global
+/// scopes (see [`WorkflowScope::Profile`]).
+pub fn load_workflow_metadata_for_profile(
+    workspace_dir: &Path,
+    profile_skills_root: Option<&Path>,
+) -> Vec<Workflow> {
+    let trusted = is_workspace_trusted(workspace_dir);
+    let home = dirs::home_dir();
+    discover_workflows_inner(
+        home.as_deref(),
+        Some(workspace_dir),
+        profile_skills_root,
+        trusted,
+    )
 }
 
 /// Discover skills from every supported location.
@@ -61,12 +102,31 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 ///
 /// On name collisions, project-scope wins over user-scope and a warning is
 /// attached to the retained skill.
-pub fn discover_skills(
+pub fn discover_workflows(
     home_dir: Option<&Path>,
     workspace_dir: Option<&Path>,
     trusted: bool,
-) -> Vec<Skill> {
-    discover_skills_inner(home_dir, workspace_dir, trusted)
+) -> Vec<Workflow> {
+    discover_workflows_inner(home_dir, workspace_dir, None, trusted)
+}
+
+/// Discover skills including a profile-local root, for a turn running under a
+/// specific agent profile.
+///
+/// `profile_skills_root` is `<workspace>/personalities/<id>/skills/` (resolved
+/// via `profiles::profile_skills_root`, which validates the id). It is scanned
+/// unconditionally — no trust marker is required, since the directory is
+/// core-managed under `workspace_dir` — and its bundles win same-name collisions
+/// against every global scope for this profile. `None` is identical to
+/// [`discover_workflows`], so other profiles and the default session never see
+/// these skills.
+pub fn discover_workflows_with_profile(
+    home_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    profile_skills_root: Option<&Path>,
+    trusted: bool,
+) -> Vec<Workflow> {
+    discover_workflows_inner(home_dir, workspace_dir, profile_skills_root, trusted)
 }
 
 /// Whether the workspace has opted into loading project-scope skills.
@@ -77,104 +137,275 @@ pub fn is_workspace_trusted(workspace_dir: &Path) -> bool {
     workspace_dir.join(".openhuman").join(TRUST_MARKER).exists()
 }
 
-pub(crate) fn discover_skills_inner(
+/// Which on-disk root category a bundle was discovered under.
+///
+/// `Workflow` roots (`.openhuman/workflows/`) hold task *automations* authored
+/// via "New workflow". `Skill` roots (`.openhuman/skills/`, `.agents/skills/`,
+/// and the legacy `<workspace>/skills/`) hold capability *skills*. Both are the
+/// same on-disk primitive (SKILL.md / WORKFLOW.md bundles) and the agent
+/// harness loads both — but the Automations UI lists only `Workflow`-root
+/// bundles (see [`discover_automations`]) so capability skills don't masquerade
+/// as task templates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RootKind {
+    Skill,
+    Workflow,
+}
+
+const ALL_ROOT_KINDS: &[RootKind] = &[RootKind::Skill, RootKind::Workflow];
+const WORKFLOW_ROOT_KINDS: &[RootKind] = &[RootKind::Workflow];
+
+pub(crate) fn discover_workflows_inner(
+    home_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    profile_skills_root: Option<&Path>,
+    trusted: bool,
+) -> Vec<Workflow> {
+    discover_filtered(
+        home_dir,
+        workspace_dir,
+        profile_skills_root,
+        trusted,
+        ALL_ROOT_KINDS,
+    )
+}
+
+/// Discover only *automation* bundles — those under the `workflows/` roots —
+/// for the Automations UI list (`openhuman.skills_list`).
+///
+/// Capability skills (under the `skills/` / `.agents/skills/` / legacy
+/// `<workspace>/skills/` roots) are deliberately excluded so they don't show up
+/// as task templates. They remain fully available to the agent harness and the
+/// run/describe paths via [`discover_workflows`] / [`load_workflow_metadata`].
+///
+/// Note: bundles authored *before* the skills→workflows rename live under the
+/// `skills/` roots and will therefore not appear in this automations-only view;
+/// new automations created via "New workflow" land in `~/.openhuman/workflows/`.
+pub fn discover_automations(
     home_dir: Option<&Path>,
     workspace_dir: Option<&Path>,
     trusted: bool,
-) -> Vec<Skill> {
+) -> Vec<Workflow> {
+    tracing::debug!(
+        trusted,
+        has_home = home_dir.is_some(),
+        has_workspace = workspace_dir.is_some(),
+        "[workflows] discover:automations:enter"
+    );
+    discover_filtered(home_dir, workspace_dir, None, trusted, WORKFLOW_ROOT_KINDS)
+}
+
+/// Shared discovery core. `kinds` selects which root categories to scan,
+/// letting the full surface ([`discover_workflows_inner`]) and the
+/// automations-only list ([`discover_automations`]) share collision handling.
+fn discover_filtered(
+    home_dir: Option<&Path>,
+    workspace_dir: Option<&Path>,
+    profile_skills_root: Option<&Path>,
+    trusted: bool,
+    kinds: &[RootKind],
+) -> Vec<Workflow> {
+    tracing::debug!(
+        trusted,
+        has_home = home_dir.is_some(),
+        has_workspace = workspace_dir.is_some(),
+        has_profile_root = profile_skills_root.is_some(),
+        include_skills = kinds.contains(&RootKind::Skill),
+        include_workflows = kinds.contains(&RootKind::Workflow),
+        "[workflows] discover:enter"
+    );
     // Scan order matters for collision resolution: the last scope to register
     // a name wins, so we scan user first, then project, then legacy.
-    let mut by_name: HashMap<String, Skill> = HashMap::new();
+    let mut by_name: HashMap<String, Workflow> = HashMap::new();
 
     if let Some(home) = home_dir {
-        for root in user_roots(home) {
-            absorb(&mut by_name, scan_root(&root, SkillScope::User));
+        for (root, kind) in user_roots(home) {
+            if kinds.contains(&kind) {
+                tracing::trace!(
+                    root = %root.display(),
+                    ?kind,
+                    scope = ?WorkflowScope::User,
+                    "[workflows] discover:branch:user"
+                );
+                absorb(&mut by_name, scan_root(&root, WorkflowScope::User));
+            }
         }
     }
 
     if let Some(ws) = workspace_dir {
         if trusted {
-            for root in project_roots(ws) {
-                absorb(&mut by_name, scan_root(&root, SkillScope::Project));
+            for (root, kind) in project_roots(ws) {
+                if kinds.contains(&kind) {
+                    tracing::trace!(
+                        root = %root.display(),
+                        ?kind,
+                        scope = ?WorkflowScope::Project,
+                        "[workflows] discover:branch:project"
+                    );
+                    absorb(&mut by_name, scan_root(&root, WorkflowScope::Project));
+                }
             }
         }
-        // Legacy `<workspace>/skills/` is always scanned so existing setups
-        // keep working without requiring users to move files or add the trust
-        // marker. Flagged with `legacy = true` so the UI can nudge migration.
-        absorb(
-            &mut by_name,
-            scan_root(&ws.join("skills"), SkillScope::Legacy),
-        );
+        // Legacy `<workspace>/skills/` is a skill root: scanned for the full
+        // surface (back-compat, no trust marker required) but excluded from the
+        // automations-only view. Flagged with `legacy = true` so the UI can
+        // nudge migration.
+        if kinds.contains(&RootKind::Skill) {
+            let legacy_root = ws.join("skills");
+            tracing::trace!(
+                root = %legacy_root.display(),
+                scope = ?WorkflowScope::Legacy,
+                "[workflows] discover:branch:legacy"
+            );
+            absorb(&mut by_name, scan_root(&legacy_root, WorkflowScope::Legacy));
+        }
     }
 
-    let mut out: Vec<Skill> = by_name.into_values().collect();
+    // Profile-local skills (`<workspace>/personalities/<id>/skills/`) are a skill
+    // root scoped to the *active* profile: scanned last and at the highest
+    // precedence so a profile-local bundle wins any same-name collision against
+    // the global scopes for its owner (see [`precedence`]). Excluded from the
+    // automations-only view for the same reason as the legacy skill root. No
+    // trust marker is consulted — the directory is core-managed under
+    // `workspace_dir`, seeded by `ensure_profile_home`.
+    if let Some(profile_root) = profile_skills_root {
+        if kinds.contains(&RootKind::Skill) {
+            tracing::debug!(
+                root = %profile_root.display(),
+                scope = ?WorkflowScope::Profile,
+                "[profiles] discover:branch:profile-local skills"
+            );
+            let before = by_name.len();
+            absorb(
+                &mut by_name,
+                scan_root(profile_root, WorkflowScope::Profile),
+            );
+            tracing::debug!(
+                names_before = before,
+                names_after = by_name.len(),
+                "[profiles] profile-local skills absorbed (profile scope wins same-name collisions)"
+            );
+        }
+    }
+
+    let mut out: Vec<Workflow> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    tracing::debug!(discovered_count = out.len(), "[workflows] discover:exit");
     out
 }
 
-fn user_roots(home: &Path) -> Vec<PathBuf> {
+fn user_roots(home: &Path) -> Vec<(PathBuf, RootKind)> {
+    // `workflows/` is the current layout (create writes here); the `skills/`
+    // roots are still scanned for back-compat with installs created before the
+    // skills→workflows rename. Order matters: `workflows/` is scanned last so a
+    // same-named entry there wins over a legacy `skills/` one.
     vec![
-        home.join(".openhuman").join("skills"),
-        home.join(".agents").join("skills"),
+        (home.join(".openhuman").join("skills"), RootKind::Skill),
+        (home.join(".agents").join("skills"), RootKind::Skill),
+        (
+            home.join(".openhuman").join("workflows"),
+            RootKind::Workflow,
+        ),
     ]
 }
 
-fn project_roots(workspace: &Path) -> Vec<PathBuf> {
+fn project_roots(workspace: &Path) -> Vec<(PathBuf, RootKind)> {
     vec![
-        workspace.join(".openhuman").join("skills"),
-        workspace.join(".agents").join("skills"),
+        (workspace.join(".openhuman").join("skills"), RootKind::Skill),
+        (workspace.join(".agents").join("skills"), RootKind::Skill),
+        (
+            workspace.join(".openhuman").join("workflows"),
+            RootKind::Workflow,
+        ),
     ]
 }
 
-fn absorb(by_name: &mut HashMap<String, Skill>, incoming: Vec<Skill>) {
+fn absorb(by_name: &mut HashMap<String, Workflow>, incoming: Vec<Workflow>) {
     for mut skill in incoming {
         let key = skill.name.clone();
-        if let Some(existing) = by_name.remove(&key) {
-            // Higher-precedence scope wins; lower loses and is dropped.
-            let (winner, loser) = if precedence(skill.scope) >= precedence(existing.scope) {
-                (&mut skill, existing)
-            } else {
-                // Put existing back; discard incoming.
-                let mut kept = existing;
-                kept.warnings.push(format!(
-                    "name '{}' also declared in {:?} scope at {} (ignored)",
-                    kept.name,
-                    skill.scope,
-                    skill
+        // A workflow's runnable identity is `dir_name`, while `name` is only
+        // display metadata. Collapse on either so a profile-local `foo/` also
+        // shadows a global `foo/` whose frontmatter happens to use a different
+        // display name. Otherwise registry lookup by slug could nondeterministically
+        // select the global copy.
+        let collision_keys: Vec<String> = by_name
+            .iter()
+            .filter(|(existing_name, existing)| {
+                existing_name.as_str() == key || existing.dir_name == skill.dir_name
+            })
+            .map(|(existing_name, _)| existing_name.clone())
+            .collect();
+
+        if let Some((_, highest_name, highest_scope)) = collision_keys
+            .iter()
+            .filter_map(|collision_key| by_name.get(collision_key))
+            .map(|existing| {
+                (
+                    precedence(existing.scope),
+                    existing.name.clone(),
+                    existing.scope,
+                )
+            })
+            .max_by_key(|(rank, _, _)| *rank)
+        {
+            if precedence(skill.scope) < precedence(highest_scope) {
+                if let Some(kept) = by_name.get_mut(&highest_name) {
+                    kept.warnings.push(format!(
+                        "workflow id '{}' or name '{}' also declared in {:?} scope at {} (ignored)",
+                        skill.dir_name,
+                        skill.name,
+                        skill.scope,
+                        skill
+                            .location
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    ));
+                }
+                continue;
+            }
+        }
+
+        for collision_key in collision_keys {
+            if let Some(loser) = by_name.remove(&collision_key) {
+                skill.warnings.push(format!(
+                    "shadowed {:?}-scope skill '{}' (workflow id '{}') at {}",
+                    loser.scope,
+                    loser.name,
+                    loser.dir_name,
+                    loser
                         .location
                         .as_deref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "<unknown>".to_string())
                 ));
-                by_name.insert(key, kept);
-                continue;
-            };
-            winner.warnings.push(format!(
-                "shadowed {:?}-scope skill at {} with same name",
-                loser.scope,
-                loser
-                    .location
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string())
-            ));
+            }
         }
         by_name.insert(key, skill);
     }
 }
 
-fn precedence(scope: SkillScope) -> u8 {
+fn precedence(scope: WorkflowScope) -> u8 {
     match scope {
-        SkillScope::Legacy => 0,
-        SkillScope::User => 1,
-        SkillScope::Project => 2,
+        WorkflowScope::Legacy => 0,
+        WorkflowScope::User => 1,
+        WorkflowScope::Project => 2,
+        // Profile-local skills win against every global scope for their owner.
+        WorkflowScope::Profile => 3,
     }
 }
 
-fn scan_root(root: &Path, scope: SkillScope) -> Vec<Skill> {
+fn scan_root(root: &Path, scope: WorkflowScope) -> Vec<Workflow> {
+    let mut out = Vec::new();
+    scan_root_inner(root, scope, &mut out);
+    out.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
+    out
+}
+
+fn scan_root_inner(root: &Path, scope: WorkflowScope, out: &mut Vec<Workflow>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
 
     // `read_dir` order is unspecified. When two sibling directories declare
@@ -185,7 +416,6 @@ fn scan_root(root: &Path, scope: SkillScope) -> Vec<Skill> {
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|entry| entry.file_name());
 
-    let mut out = Vec::new();
     for entry in entries {
         // Use `file_type()` rather than `path.is_dir()` so a symlinked
         // child cannot be loaded as a skill. `is_dir()` dereferences
@@ -202,24 +432,42 @@ fn scan_root(root: &Path, scope: SkillScope) -> Vec<Skill> {
         }
         let path = entry.path();
         let dir_name = entry.file_name().to_string_lossy().to_string();
-        if dir_name.starts_with('.') {
+        if dir_name.starts_with('.') || EXCLUDED_SKILL_DIRS.contains(&dir_name.as_str()) {
             continue;
         }
         if let Some(skill) = load_skill_dir(&path, &dir_name, scope) {
             out.push(skill);
+            continue;
         }
+        scan_root_inner(&path, scope, out);
     }
-    out
 }
 
-fn load_skill_dir(dir: &Path, dir_name: &str, scope: SkillScope) -> Option<Skill> {
-    let skill_md = dir.join(SKILL_MD);
+fn load_skill_dir(dir: &Path, dir_name: &str, scope: WorkflowScope) -> Option<Workflow> {
+    // WORKFLOW.md is the current filename; SKILL.md is read for back-compat
+    // with workflows authored before the rename.
+    let workflow_md = dir.join(WORKFLOW_MD);
+    let legacy_md = dir.join(SKILL_MD);
     let legacy_manifest = dir.join(SKILL_JSON);
 
-    if skill_md.exists() {
-        return Some(load_from_skill_md(&skill_md, dir, dir_name, scope));
+    // `exists()` follows symlinks, so a manifest could point at an arbitrary
+    // file outside the bundle and discovery would ingest its contents into the
+    // catalog/prompt flow. Since the legacy `skills/` roots are scanned without
+    // a trust marker, require a real (non-symlink) regular file before loading.
+    let is_safe_manifest = |path: &Path| {
+        matches!(
+            std::fs::symlink_metadata(path),
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink()
+        )
+    };
+
+    if is_safe_manifest(&workflow_md) {
+        return Some(load_from_workflow_md(&workflow_md, dir, dir_name, scope));
     }
-    if legacy_manifest.exists() {
+    if is_safe_manifest(&legacy_md) {
+        return Some(load_from_workflow_md(&legacy_md, dir, dir_name, scope));
+    }
+    if is_safe_manifest(&legacy_manifest) {
         return Some(load_from_legacy_manifest(
             &legacy_manifest,
             dir,
@@ -233,8 +481,9 @@ fn load_skill_dir(dir: &Path, dir_name: &str, scope: SkillScope) -> Option<Skill
 /// Read a bundled skill resource as UTF-8 text, hardened against directory
 /// traversal, symlink escape, and oversized payloads.
 ///
-/// `skill_id` identifies the skill by its discovered `name` — the same field
-/// surfaced on [`Skill::name`]. The skill is resolved by running the standard
+/// `skill_id` identifies the skill by its discovered `name` or its on-disk
+/// `dir_name` slug — the same identifiers surfaced in the UI summary. The
+/// skill is resolved by running the standard
 /// discovery pipeline (`dirs::home_dir()` + `workspace_dir`, honoring the
 /// `.openhuman/trust` marker) and locating the matching entry; this keeps the
 /// read scoped to legitimately installed skills and reuses all the symlink /
@@ -248,21 +497,60 @@ fn load_skill_dir(dir: &Path, dir_name: &str, scope: SkillScope) -> Option<Skill
 /// * paths whose final component or any intermediate component is a symlink
 ///   (link-follow escape),
 /// * non-file targets (directories, sockets, fifos),
-/// * files larger than [`MAX_SKILL_RESOURCE_BYTES`],
+/// * files larger than [`MAX_WORKFLOW_RESOURCE_BYTES`],
 /// * non-UTF-8 byte contents (binary files must be surfaced some other way —
 ///   no lossy replacement).
 ///
 /// On success returns the file's contents as an owned `String`.
-pub fn read_skill_resource(
+pub fn read_workflow_resource(
     workspace_dir: &Path,
     skill_id: &str,
     relative_path: &Path,
+) -> Result<String, String> {
+    read_workflow_resource_with_profile(workspace_dir, skill_id, relative_path, None)
+}
+
+/// The dir_name/name set of skills discovered under a profile-local skills root.
+///
+/// Used by the `describe_workflow` / `read_workflow_resource` / `run_workflow`
+/// tools to treat a profile's private skills as implicitly allowed for their
+/// owner (they bypass the `allowed_skills` allowlist, mirroring `list_workflows`).
+/// Empty when no profile root is active, so the profile-less session and other
+/// profiles are unaffected.
+pub fn profile_local_skill_ids(
+    profile_skills_root: Option<&Path>,
+) -> std::collections::HashSet<String> {
+    let Some(root) = profile_skills_root else {
+        return std::collections::HashSet::new();
+    };
+    scan_root(root, WorkflowScope::Profile)
+        .into_iter()
+        .flat_map(|w| {
+            let mut ids = vec![w.name];
+            if !w.dir_name.is_empty() {
+                ids.push(w.dir_name);
+            }
+            ids
+        })
+        .collect()
+}
+
+/// Like [`read_workflow_resource`], but resolves the skill against the active
+/// profile's private skills root too (`<workspace>/personalities/<id>/skills/`)
+/// when `profile_skills_root` is supplied. `None` is byte-identical to
+/// [`read_workflow_resource`].
+pub fn read_workflow_resource_with_profile(
+    workspace_dir: &Path,
+    skill_id: &str,
+    relative_path: &Path,
+    profile_skills_root: Option<&Path>,
 ) -> Result<String, String> {
     tracing::debug!(
         skill_id = %skill_id,
         relative_path = %relative_path.display(),
         workspace = %workspace_dir.display(),
-        "[skills] read_skill_resource: entry"
+        has_profile_root = profile_skills_root.is_some(),
+        "[skills] read_workflow_resource: entry"
     );
 
     if skill_id.trim().is_empty() {
@@ -293,14 +581,14 @@ pub fn read_skill_resource(
     }
 
     // Resolve the skill by running the standard discovery pipeline. We reuse
-    // `load_skills` (which honors both user and workspace roots plus the
-    // trust marker) so the resource read is scoped to the exact same set of
-    // skills the UI would already have shown the user.
-    let skills = load_skills(workspace_dir);
-    let skill = skills
-        .into_iter()
-        .find(|s| s.name == skill_id)
-        .ok_or_else(|| format!("skill '{skill_id}' not found"))?;
+    // `load_workflow_metadata_for_profile` (which honors both user and workspace
+    // roots plus the trust marker, and the active profile's private root when
+    // supplied) so the resource read is scoped to the exact same set of skills
+    // the owner would already have seen listed.
+    let skill = resolve_workflow_for_resource(
+        load_workflow_metadata_for_profile(workspace_dir, profile_skills_root),
+        skill_id,
+    )?;
     let skill_root = skill
         .location
         .as_deref()
@@ -333,9 +621,9 @@ pub fn read_skill_resource(
     // Size gate — check via metadata before reading so we never allocate the
     // buffer for an oversized file.
     let size = leaf_meta.len();
-    if size > MAX_SKILL_RESOURCE_BYTES {
+    if size > MAX_WORKFLOW_RESOURCE_BYTES {
         return Err(format!(
-            "resource file is {size} bytes, exceeds limit of {MAX_SKILL_RESOURCE_BYTES}"
+            "resource file is {size} bytes, exceeds limit of {MAX_WORKFLOW_RESOURCE_BYTES}"
         ));
     }
 
@@ -371,8 +659,59 @@ pub fn read_skill_resource(
     tracing::debug!(
         skill_id = %skill_id,
         bytes = bytes.len(),
-        "[skills] read_skill_resource: success"
+        "[skills] read_workflow_resource: success"
     );
 
     Ok(content)
 }
+
+fn resolve_workflow_for_resource(
+    workflows: Vec<Workflow>,
+    skill_id: &str,
+) -> Result<Workflow, String> {
+    let mut dir_match: Option<Workflow> = None;
+    let mut name_match: Option<Workflow> = None;
+
+    for workflow in workflows {
+        if workflow.dir_name == skill_id {
+            if dir_match.is_some() {
+                return Err(format!(
+                    "skill id '{skill_id}' is ambiguous across multiple skill directories"
+                ));
+            }
+            dir_match = Some(workflow);
+            continue;
+        }
+
+        if workflow.name == skill_id {
+            if name_match.is_some() {
+                return Err(format!(
+                    "skill name '{skill_id}' is ambiguous; use the directory id"
+                ));
+            }
+            name_match = Some(workflow);
+        }
+    }
+
+    match (dir_match, name_match) {
+        (Some(dir_skill), Some(name_skill)) => {
+            if dir_skill.location == name_skill.location {
+                Ok(dir_skill)
+            } else {
+                Err(format!(
+                    "skill id '{skill_id}' matches both a directory id and a different skill name"
+                ))
+            }
+        }
+        (Some(skill), None) | (None, Some(skill)) => Ok(skill),
+        (None, None) => Err(format!("skill '{skill_id}' not found")),
+    }
+}
+
+#[cfg(test)]
+#[path = "ops_discover_include_skills_tests_tests.rs"]
+mod include_skills_tests;
+
+#[cfg(test)]
+#[path = "ops_discover_profile_scope_tests_tests.rs"]
+mod profile_scope_tests;

@@ -23,7 +23,6 @@
  *
  * There is **no** demo loop — the overlay is entirely event-driven.
  */
-import { invoke } from '@tauri-apps/api/core';
 import {
   currentMonitor,
   getCurrentWindow,
@@ -31,10 +30,19 @@ import {
   LogicalSize,
 } from '@tauri-apps/api/window';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { type Socket } from 'socket.io-client';
 
 import RotatingTetrahedronCanvas from '../components/RotatingTetrahedronCanvas';
+import { useT } from '../lib/i18n/I18nContext';
 import { callCoreRpc, getCoreHttpBaseUrl } from '../services/coreRpcClient';
+import { connectCoreSocket } from '../services/coreSocket';
+// `safeInvoke` (aliased to `invoke`) converts the CEF
+// `window.ipc.postMessage` synchronous throw — Sentry TAURI-REACT-7 /
+// TAURI-REACT-6 — into a rejected Promise so the existing `.catch(...)`
+// handler sees it as a normal IPC failure. The overlay window is the most
+// at-risk surface here because it boots into its own WebView where the
+// CEF IPC bridge can briefly be unwired.
+import { safeInvoke as invoke } from '../utils/tauriCommands/common';
 
 const OVERLAY_IDLE_WIDTH = 50;
 const OVERLAY_IDLE_HEIGHT = 50;
@@ -150,6 +158,7 @@ function OverlayBubbleChip({ bubble }: { bubble: OverlayBubble }) {
 // ── Main overlay root ────────────────────────────────────────────────────
 
 export default function OverlayApp() {
+  const { t } = useT();
   const [mode, setMode] = useState<OverlayMode>('idle');
   const [bubble, setBubble] = useState<OverlayBubble | null>(null);
   const [isHovered, setIsHovered] = useState(false);
@@ -280,18 +289,14 @@ export default function OverlayApp() {
 
     const connect = async () => {
       try {
-        const baseUrl = await resolveCoreSocketUrl();
-        if (disposed) return;
-
-        console.debug(`[overlay] connecting to core socket at ${baseUrl}`);
-        socket = io(baseUrl, {
-          path: '/socket.io/',
-          transports: ['websocket', 'polling'],
-          reconnection: true,
-          reconnectionDelay: 2000,
-          reconnectionAttempts: Infinity,
-          forceNew: true,
+        /* c8 ignore start — thin call site over the tested `connectCoreSocket` helper */
+        console.debug('[overlay] connecting to core socket');
+        socket = await connectCoreSocket({
+          getBaseUrl: resolveCoreSocketUrl,
+          isDisposed: () => disposed,
         });
+        if (!socket) return;
+        /* c8 ignore stop */
 
         socket.on('connect', () => {
           console.debug('[overlay] socket connected', socket?.id);
@@ -616,10 +621,10 @@ export default function OverlayApp() {
             type="button"
             aria-label={
               mode === 'stt'
-                ? 'Voice input active'
+                ? t('overlay.ariaVoiceActive')
                 : mode === 'attention'
-                  ? 'Attention message'
-                  : 'OpenHuman overlay'
+                  ? t('overlay.ariaAttention')
+                  : t('overlay.ariaOrb')
             }
             onMouseDown={handleDragStart}
             onMouseMove={handleMouseMove}
@@ -633,7 +638,7 @@ export default function OverlayApp() {
             }}
             className={`group relative flex cursor-grab items-center justify-center overflow-hidden rounded-full border transition-all duration-200 active:cursor-grabbing ${orbClassName} ${orbSizeClassName}`}
             style={orbStyle}
-            title="Drag to move · Double-click to reset position">
+            title={t('overlay.orbTitle')}>
             <div
               className={`pointer-events-none opacity-95 transition-transform duration-300 group-hover:scale-105 ${orbCanvasClassName}`}>
               <RotatingTetrahedronCanvas inverted={tetrahedronInverted} />

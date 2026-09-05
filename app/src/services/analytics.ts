@@ -1,32 +1,139 @@
 /**
  * Analytics & Sentry service
  *
- * Initializes Sentry for the React frontend with auto-send semantics:
- * captured errors are sanitized in `beforeSend` and forwarded to Sentry,
- * gated only by user analytics consent.
+ * Initializes Sentry for error reporting and OpenPanel for privacy-limited
+ * usage tracking. Both are gated on user analytics consent.
  *
- * Privacy guarantees enforced in `beforeSend`:
+ * Sentry privacy guarantees enforced in `beforeSend`:
  *   - No breadcrumbs, requests, extras, or arbitrary contexts (only OS /
  *     browser / device metadata kept)
  *   - No frame-level locals or source-context snippets
- *   - No PII — `user` is reduced to a stable anonymous id (or omitted)
+ *   - No PII — `user` is reduced to a stable account id (or omitted)
  *   - `sendDefaultPii: false` (no IP, no cookies)
  *   - All breadcrumb-producing integrations disabled
+ *
+ * OpenPanel privacy guarantees:
+ *   - Only page views and feature-engagement events from the allowlist are sent
+ *   - No user content, messages, credentials, or PII is ever included
  */
 import * as Sentry from '@sentry/react';
 
 import { getCoreStateSnapshot } from '../lib/coreState/store';
 import {
+  APP_BINARY_VERSION,
   APP_ENVIRONMENT,
+  APP_VERSION,
+  BUILD_SHA,
+  CORE_CARGO_VERSION,
+  GA_MEASUREMENT_ID,
   IS_DEV,
+  OPENPANEL_API_URL,
+  OPENPANEL_CLIENT_ID,
   SENTRY_DSN,
   SENTRY_RELEASE,
   SENTRY_SMOKE_TEST,
+  SUPPORT_URL,
+  SUPPORT_URL_ACCEPTS_REF,
+  TAURI_CARGO_VERSION,
 } from '../utils/config';
+import { startInteractionTracking } from './analyticsInteractions';
+import { currentAppPath, currentPageHash, normalizeAnalyticsPagePath } from './analyticsRoutes';
+
+// ---------------------------------------------------------------------------
+// Google Analytics 4 typings — raw gtag.js API
+// ---------------------------------------------------------------------------
+
+type GtagCommand = 'config' | 'event' | 'set' | 'js';
+interface GtagFn {
+  (...args: [GtagCommand, ...unknown[]]): void;
+}
+
+declare global {
+  interface Window {
+    dataLayer: unknown[];
+    gtag: GtagFn;
+  }
+}
+
+const OPENPANEL_TRACK_URL = `${OPENPANEL_API_URL}/track`;
+const MAX_PENDING_ANALYTICS_EVENTS = 20;
+
+// ---------------------------------------------------------------------------
+// Module-level state
+// ---------------------------------------------------------------------------
+
+let gaInitialized = false;
+let opInitialized = false;
+let analyticsConsentSynced = false;
+
+export type AnalyticsParams = Record<string, string | number | boolean>;
+
+interface PendingAnalyticsEvent {
+  type: 'event' | 'page_view';
+  name: string;
+  params?: AnalyticsParams;
+}
+
+const pendingAnalyticsEvents: PendingAnalyticsEvent[] = [];
+
+/**
+ * Shadow of the user's analytics consent state. Kept in sync by
+ * `syncAnalyticsConsent`. Default: `false` (deny until explicitly allowed).
+ */
+let analyticsEnabled = false;
+
+/**
+ * Allowlist of event names that may be sent to OpenPanel.
+ *
+ * Keeping an explicit allowlist prevents accidentally forwarding internal
+ * debug names or future ad-hoc calls that could carry sensitive information.
+ * Any `trackEvent` call with a name not in this set is dropped and a warning
+ * is logged.
+ */
+const ALLOWED_EVENT_NAMES = [
+  'app_open',
+  'onboarding_start',
+  'onboarding_step_complete',
+  'onboarding_complete',
+  'account_connect_start',
+  'account_connect_success',
+  'chat_message_sent',
+  'chat_message_shared',
+  'github_star_cta_clicked',
+  'github_star_cta_dismissed',
+  'automation_run_started',
+  'automation_run_resumed',
+  'automation_run_cancelled',
+  'memory_repair_succeeded',
+  'memory_tree_retry_succeeded',
+  'skill_install',
+  'skill_uninstall',
+  'tab_bar_change',
+  'tauri_browser_click',
+  'ui_click',
+  'ui_control_change',
+  'ui_form_submit',
+] as const;
+
+export type AnalyticsEventName = (typeof ALLOWED_EVENT_NAMES)[number];
+export const ALLOWED_EVENTS: ReadonlySet<string> = new Set(ALLOWED_EVENT_NAMES);
 
 /** Check if the current user has opted into analytics. */
 export function isAnalyticsEnabled(): boolean {
   return getCoreStateSnapshot().snapshot.analyticsEnabled;
+}
+
+/**
+ * Cross-realm-safe check for a `CoreRpcError` with `kind === 'timeout'`.
+ * Use a duck-typed match on `name` and `kind` so this service stays independent
+ * from the RPC client and works across test/module realms. Used by the Sentry
+ * `beforeSend` filter to drop the
+ * OPENHUMAN-REACT-15/11/10/12/Z/Y family at the source.
+ */
+function isCoreRpcTimeoutError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const candidate = err as { name?: unknown; kind?: unknown };
+  return candidate.name === 'CoreRpcError' && candidate.kind === 'timeout';
 }
 
 export function initSentry(): void {
@@ -48,6 +155,14 @@ export function initSentry(): void {
     tracesSampleRate: 0,
     defaultIntegrations: false,
     integrations: [
+      // #3963: `defaultIntegrations: false` (above) drops the integration that
+      // consumes the top-level `ignoreErrors` option (below), so the intended
+      // noise filter has been dead config since it was added. Re-include it
+      // explicitly so `ignoreErrors` runs again. It executes as an event
+      // processor *before* `beforeSend`, so the consent/privacy logic there is
+      // unaffected — this only restores the pre-`beforeSend` drop of the four
+      // benign `ResizeObserver loop` / network-noise patterns.
+      Sentry.inboundFiltersIntegration(),
       Sentry.functionToStringIntegration(),
       Sentry.linkedErrorsIntegration(),
       Sentry.dedupeIntegration(),
@@ -64,7 +179,19 @@ export function initSentry(): void {
     ],
     sendDefaultPii: false,
 
-    beforeSend(event) {
+    beforeSend(event, hint) {
+      // Drop noisy local-AbortController RPC timeouts at the source so a
+      // missed `.catch()` at a future call site cannot regress the
+      // OPENHUMAN-REACT-15/11/10/12/Z/Y family. Sister to the Rust-side
+      // `is_session_expired_event` filter / loopback classifier in PR #2063.
+      // Cross-realm-safe: also accept a non-instanceof match on the
+      // class name + kind (test harness can construct CoreRpcError in a
+      // different module scope).
+      const original = hint?.originalException as unknown;
+      if (isCoreRpcTimeoutError(original)) {
+        return null;
+      }
+
       // Always allow the smoke-test event through so pipeline validation works
       // even when the user hasn't opted into analytics yet on first boot.
       const isSmokeTest = event.message === 'react-sentry-smoke-test';
@@ -98,7 +225,23 @@ export function initSentry(): void {
       // Tag with surface so events filter cleanly inside `openhuman-react`.
       event.tags = { ...(event.tags ?? {}), surface: 'react' };
 
-      // Strip PII; keep a stable anonymous user id only.
+      // Seed a support deep link keyed on this event's own id so the crash
+      // report links back to the support channel (#3980). Set as a TAG, not
+      // an `extra` — the privacy scrub above deletes `event.extra`, but the
+      // event id is known here and tags survive. The URL carries only the
+      // event's own id + a static base (no PII). Mirrors the id the user
+      // sees + copies on `ErrorFallbackScreen`.
+      // Only a configured support endpoint can consume the ref. The default
+      // destination is a Discord invite that ignores the query, and this tag
+      // exists to carry the correlation — without one it degrades to the same
+      // constant string on every event, which is noise rather than a deep
+      // link, so it is omitted instead (#5953).
+      if (event.event_id && SUPPORT_URL_ACCEPTS_REF) {
+        const sep = SUPPORT_URL.includes('?') ? '&' : '?';
+        event.tags.support_url = `${SUPPORT_URL}${sep}ref=${event.event_id}`;
+      }
+
+      // Strip PII; keep a stable account id only.
       const userId = getCoreStateSnapshot().snapshot.currentUser?._id;
       event.user = userId ? { id: userId } : undefined;
 
@@ -123,11 +266,6 @@ export function initSentry(): void {
       return event;
     },
 
-    beforeSendTransaction() {
-      // Block all transactions (performance traces).
-      return null;
-    },
-
     // Ignore common non-actionable errors.
     ignoreErrors: ['ResizeObserver loop', 'Network request failed', 'Load failed', 'AbortError'],
   });
@@ -150,13 +288,255 @@ export function initSentry(): void {
  * `beforeSend` reads `isAnalyticsEnabled()` on every event, so toggling
  * consent takes effect immediately for new errors. Flush pending events
  * on opt-out so anything already in flight respects the previous state.
+ *
+ * Also updates the module-level `gaEnabled` flag so `trackPageView` and
+ * `trackEvent` respect the new consent state without reinitializing GA.
  */
 export function syncAnalyticsConsent(enabled: boolean): void {
   const client = Sentry.getClient();
-  if (!client) return;
-  if (!enabled) {
+  if (client && !enabled) {
     void Sentry.flush(2000);
   }
+
+  analyticsEnabled = enabled;
+  analyticsConsentSynced = true;
+  if (gaInitialized || opInitialized) {
+    console.debug(`[analytics] consent updated: enabled=${enabled}`);
+  }
+  if (enabled) {
+    initializeAnalyticsProviders();
+    flushPendingAnalyticsEvents();
+  } else {
+    pendingAnalyticsEvents.length = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Analytics — public API (GA4 + OpenPanel, both fire on every call)
+// ---------------------------------------------------------------------------
+
+function initGoogleAnalytics(): void {
+  if (gaInitialized || !GA_MEASUREMENT_ID) return;
+  try {
+    window.dataLayer = window.dataLayer || [];
+    window.gtag = function gtag(...args: [GtagCommand, ...unknown[]]) {
+      window.dataLayer.push(args);
+    };
+    window.gtag('js', new Date());
+    window.gtag('config', GA_MEASUREMENT_ID, {
+      send_page_view: false,
+      allow_ad_personalization_signals: false,
+    });
+
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`;
+    document.head.appendChild(script);
+
+    gaInitialized = true;
+    console.debug('[analytics] GA initialized (gtag.js)', { measurementId: GA_MEASUREMENT_ID });
+  } catch (err) {
+    console.warn('[analytics] GA initialization failed:', err);
+  }
+}
+
+function initOpenPanel(): void {
+  if (opInitialized || !OPENPANEL_CLIENT_ID || !OPENPANEL_API_URL) return;
+  opInitialized = true;
+  console.debug('[analytics] OpenPanel initialized (direct ingestion)', {
+    clientId: OPENPANEL_CLIENT_ID,
+    apiUrl: OPENPANEL_API_URL,
+  });
+}
+
+function initializeAnalyticsProviders(): void {
+  initGoogleAnalytics();
+  initOpenPanel();
+}
+
+/**
+ * Initialize all analytics providers (GA4 + OpenPanel).
+ * Idempotent — each provider initializes at most once.
+ */
+export function initGA(): void {
+  analyticsEnabled = isAnalyticsEnabled();
+  if (analyticsEnabled) {
+    initializeAnalyticsProviders();
+    flushPendingAnalyticsEvents();
+  }
+}
+
+/**
+ * Send a privacy-limited page view to all initialized providers.
+ */
+export function trackPageView(path: string): void {
+  const pagePath = normalizeAnalyticsPagePath(path);
+  if (!analyticsEnabled) {
+    queuePendingAnalyticsEvent({
+      type: 'page_view',
+      name: 'screen_view',
+      params: { page: pagePath },
+    });
+    return;
+  }
+  if (!gaInitialized && !opInitialized) return;
+  console.debug('[analytics] trackPageView', { path: pagePath });
+  const properties = { page: pagePath, __path: pagePath, ...analyticsPageContextProperties() };
+  if (gaInitialized) {
+    window.gtag('event', 'page_view', {
+      page_path: pagePath,
+      page_location: analyticsPageLocation(),
+      ...properties,
+    });
+  }
+  if (opInitialized) {
+    void sendOpenPanelTrack('screen_view', { ...properties, __title: currentDocumentTitle() });
+  }
+}
+
+/**
+ * Send a privacy-limited feature-engagement event to all initialized providers.
+ *
+ * Event names must appear in `ALLOWED_EVENTS`. Calls with unlisted names
+ * are dropped and a console warning is emitted.
+ */
+export function trackEvent(eventName: string, params?: AnalyticsParams): void {
+  try {
+    trackEventUnsafe(eventName, params);
+  } catch (error) {
+    console.warn('[analytics] trackEvent failed', {
+      eventName,
+      error: error instanceof Error ? error.name : typeof error,
+    });
+  }
+}
+
+/** Typed, best-effort facade for successful domain outcomes. */
+export function trackAnalyticsEvent(eventName: AnalyticsEventName, params?: AnalyticsParams): void {
+  trackEvent(eventName, params);
+}
+
+function trackEventUnsafe(eventName: string, params?: AnalyticsParams): void {
+  if (!ALLOWED_EVENTS.has(eventName)) {
+    console.warn(
+      `[analytics] trackEvent dropped — '${eventName}' is not in ALLOWED_EVENTS allowlist`
+    );
+    return;
+  }
+
+  if (!analyticsEnabled) {
+    queuePendingAnalyticsEvent({ type: 'event', name: eventName, params });
+    return;
+  }
+  if (!gaInitialized && !opInitialized) return;
+
+  const properties = { ...(params ?? {}), ...analyticsContextProperties() };
+  const loggableProperties = { ...properties };
+  delete loggableProperties.user_id;
+  console.debug('[analytics] trackEvent', { eventName, params: loggableProperties });
+  if (gaInitialized) window.gtag('event', eventName, properties);
+  if (opInitialized) {
+    void sendOpenPanelTrack(eventName, properties);
+  }
+}
+
+export function startUiInteractionTracking(): () => void {
+  return startInteractionTracking(trackEvent);
+}
+
+function queuePendingAnalyticsEvent(event: PendingAnalyticsEvent): void {
+  if (analyticsConsentSynced) return;
+  pendingAnalyticsEvents.push(event);
+  if (pendingAnalyticsEvents.length > MAX_PENDING_ANALYTICS_EVENTS) {
+    pendingAnalyticsEvents.splice(0, pendingAnalyticsEvents.length - MAX_PENDING_ANALYTICS_EVENTS);
+  }
+}
+
+function flushPendingAnalyticsEvents(): void {
+  if (!analyticsEnabled || pendingAnalyticsEvents.length === 0) return;
+  const events = pendingAnalyticsEvents.splice(0, pendingAnalyticsEvents.length);
+  for (const event of events) {
+    if (event.type === 'page_view') {
+      trackPageView(String(event.params?.page ?? event.name));
+    } else {
+      trackEvent(event.name, event.params);
+    }
+  }
+}
+
+async function sendOpenPanelTrack(eventName: string, params?: AnalyticsParams): Promise<void> {
+  const profileId = currentAnalyticsUserId();
+  const properties = {
+    __path: currentOpenPanelPath(),
+    __referrer: currentDocumentReferrer(),
+    __timestamp: new Date().toISOString(),
+    ...(params ?? {}),
+  };
+
+  try {
+    const response = await fetch(OPENPANEL_TRACK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'openpanel-client-id': OPENPANEL_CLIENT_ID,
+        'openpanel-sdk-name': 'openhuman-react',
+        'openpanel-sdk-version': '0.1.0',
+      },
+      body: JSON.stringify({
+        type: 'track',
+        payload: { name: eventName, ...(profileId ? { profileId } : {}), properties },
+      }),
+      keepalive: true,
+    });
+
+    if (!response.ok) {
+      console.warn('[analytics] OpenPanel track failed:', response.status, await response.text());
+    }
+  } catch (err) {
+    console.warn('[analytics] OpenPanel track failed:', err);
+  }
+}
+
+function analyticsContextProperties(): AnalyticsParams {
+  const userId = currentAnalyticsUserId();
+  return {
+    user_id: userId ?? '',
+    app_version: APP_VERSION,
+    binary_version: APP_BINARY_VERSION,
+    core_cargo_version: CORE_CARGO_VERSION,
+    tauri_cargo_version: TAURI_CARGO_VERSION,
+    release: SENTRY_RELEASE,
+    build_sha: BUILD_SHA,
+    app_environment: APP_ENVIRONMENT,
+  };
+}
+
+function analyticsPageContextProperties(): AnalyticsParams {
+  return { ...analyticsContextProperties(), page_hash: currentPageHash() };
+}
+
+function currentAnalyticsUserId(): string | undefined {
+  return getCoreStateSnapshot().snapshot.currentUser?._id;
+}
+
+function currentOpenPanelPath(): string {
+  return currentAppPath();
+}
+
+function analyticsPageLocation(): string {
+  if (typeof window === 'undefined') return '';
+  const pagePath = currentAppPath();
+  return `${window.location.origin}${pagePath}`;
+}
+
+function currentDocumentTitle(): string {
+  if (typeof document === 'undefined') return '';
+  return document.title;
+}
+
+function currentDocumentReferrer(): string {
+  if (typeof document === 'undefined') return '';
+  return document.referrer;
 }
 
 /**

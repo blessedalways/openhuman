@@ -135,7 +135,78 @@ describe('useDaemonLifecycle', () => {
     });
   });
 
+  describe('retry scheduling', () => {
+    it('runs a scheduled retry using the latest daemon action', async () => {
+      const { useDaemonLifecycle } = await import('../useDaemonLifecycle');
+      const uid = freshUser('retry');
+      resetUser(uid);
+      setAutoStartEnabled(uid, true);
+      setDaemonStatus(uid, 'error');
+      incrementConnectionAttempts(uid);
+      mockStartDaemon.mockResolvedValue({ result: { state: 'Running' }, logs: [] });
+
+      const { result } = renderHook(() => useDaemonLifecycle(uid));
+
+      expect(result.current.connectionAttempts).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+
+      expect(mockStartDaemon).toHaveBeenCalledTimes(1);
+      expect(result.current.connectionAttempts).toBe(0);
+    });
+  });
+
   describe('background / foreground pause-resume', () => {
+    it('keeps lifecycle setup stable across daemon state updates', async () => {
+      const { useDaemonLifecycle } = await import('../useDaemonLifecycle');
+      const uid = freshUser('stable-effect');
+      resetUser(uid);
+      setAutoStartEnabled(uid, true);
+      // Observe the visibilitychange listener registration directly — it is
+      // the real proxy for "the lifecycle effect ran exactly once and cleaned
+      // up exactly once". (Previously this also pinned exact console.log
+      // strings as an effect-rerun proxy; those are brittle to copy edits and
+      // the listener counts already carry the signal — plan.md §3.)
+      const addEventListenerSpy = vi.spyOn(document, 'addEventListener');
+      const removeEventListenerSpy = vi.spyOn(document, 'removeEventListener');
+
+      try {
+        const { unmount } = renderHook(() => useDaemonLifecycle(uid));
+
+        const visibilityAddCount = () =>
+          addEventListenerSpy.mock.calls.filter(([event]) => event === 'visibilitychange').length;
+        const visibilityRemoveCount = () =>
+          removeEventListenerSpy.mock.calls.filter(([event]) => event === 'visibilitychange')
+            .length;
+
+        // Effect ran once: one listener added, none removed yet.
+        expect(visibilityAddCount()).toBe(1);
+        expect(visibilityRemoveCount()).toBe(0);
+
+        act(() => {
+          setDaemonStatus(uid, 'starting');
+          setIsRecovering(uid, true);
+          incrementConnectionAttempts(uid);
+          setDaemonStatus(uid, 'running');
+          setIsRecovering(uid, false);
+        });
+
+        // Daemon-state churn must NOT re-run the effect: still one add, no
+        // teardown.
+        expect(visibilityAddCount()).toBe(1);
+        expect(visibilityRemoveCount()).toBe(0);
+
+        unmount();
+
+        // Unmount tears the single listener down exactly once.
+        expect(visibilityRemoveCount()).toBe(1);
+      } finally {
+        addEventListenerSpy.mockRestore();
+        removeEventListenerSpy.mockRestore();
+      }
+    });
+
     it('does not invoke startDaemon while hidden, resumes auto-start on visible', async () => {
       const { useDaemonLifecycle } = await import('../useDaemonLifecycle');
       const uid = freshUser('vis');

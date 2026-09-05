@@ -1,5 +1,9 @@
-//! Formatting helpers, default constants, path validators, and the active
-//! memory-client lookup. Shared internals for the memory RPC handlers.
+//! Formatting helpers, default constants, path validators, and the shared
+//! workspace lookup. Shared internals for the memory RPC handlers.
+//!
+//! This module used to own `active_memory_client`, the unguarded lookup of the
+//! in-process engine's process-global handle. That handle is gone (#5560) — see
+//! the note where the function stood, further down.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -9,11 +13,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::openhuman::config::Config;
-use crate::openhuman::memory::store::GraphRelationRecord;
 use crate::openhuman::memory::{
-    MemoryClient, MemoryClientRef, MemoryDocumentSummary, MemoryItemKind, MemoryRetrievalChunk,
-    MemoryRetrievalContext, MemoryRetrievalEntity, MemoryRetrievalRelation, NamespaceMemoryHit,
-    QueryNamespaceRequest,
+    MemoryDocumentSummary, MemoryRetrievalChunk, MemoryRetrievalContext, MemoryRetrievalEntity,
+    MemoryRetrievalRelation, QueryNamespaceRequest,
+};
+// Contract vocabulary, named at the contract. Every value type here resolves
+// to the same item either way (tinycortex-api re-exports tinymemory-api), but a
+// `tinymemory_core::` path is a compile-time link this host has shed (#5560),
+// and this module no longer holds an engine handle at all — see the note where
+// `active_memory_client` used to be.
+use crate::openhuman::memory::api::types::{
+    GraphRelationRecord, MemoryItemKind, NamespaceMemoryHit,
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +235,10 @@ pub(crate) fn format_llm_context_message(
     Some(parts.join("\n\n"))
 }
 
+#[cfg(test)]
+#[path = "helpers_tests.rs"]
+mod tests;
+
 /// Filters memory hits to only include those matching specific document IDs.
 pub(crate) fn filter_hits_by_document_ids(
     hits: Vec<NamespaceMemoryHit>,
@@ -292,22 +306,22 @@ pub(crate) async fn current_workspace_dir() -> Result<PathBuf, String> {
         .map_err(|e| format!("load config: {e}"))
 }
 
-/// Returns the active memory client from the process-global singleton,
-/// auto-initialising from the configured workspace if startup wiring hasn't
-/// done so yet.
-///
-/// The auto-init resolves the workspace via [`current_workspace_dir`], which
-/// goes through `Config::load_or_init` — the same path startup wiring uses.
-/// It does **not** fall back to `~/.openhuman/workspace`; that hazard is the
-/// one [`crate::openhuman::memory::global::client`] guards against, and it
-/// remains guarded for any caller that bypasses this helper.
-pub(crate) async fn active_memory_client() -> Result<MemoryClientRef, String> {
-    if let Some(client) = super::super::global::client_if_ready() {
-        return Ok(client);
-    }
-    let workspace_dir = current_workspace_dir().await?;
-    super::super::global::init(workspace_dir)
-}
+// ── `active_memory_client` is gone (#5560) ──────────────────────────────────
+//
+// It resolved the in-process engine's process-global `MemoryClient`, booting it
+// from the configured workspace when startup wiring had not. Every caller has
+// been routed onto the bound driver instead, and this host no longer boots a
+// second engine for one to be resolved from, so the function was left with no
+// callers at all — a helper whose whole body was `global::client_if_ready()`
+// then `global::init(…)`.
+//
+// The replacement is not a narrower helper here: it is
+// `super::guard::active_memory_guard` for a handler with a typed contract twin,
+// and `memory::binding::for_config(&config)` for one that needs the binding
+// itself (driver id, capabilities, a specific family). Both key on the
+// workspace dir and the `[subsystems.memory]` block, which is why the login /
+// logout / revalidation sites need no explicit re-point the way `global::init`
+// did.
 
 // ---------------------------------------------------------------------------
 // Path validators (used by file-based memory handlers)
@@ -457,16 +471,30 @@ pub(crate) fn parse_memory_document_summaries(
         .collect()
 }
 
+/// Resolve the retrieval limit, over-fetching when the caller filtered on
+/// document ids so the filter has enough candidates to work with.
+///
+/// Takes the **guard**, not a `MemoryClient`: `MemoryDocuments::list_documents`
+/// is the contract twin of the call this used to make, returns the same
+/// `serde_json::Value`, and runs the read through the policy steps the raw
+/// client skipped.
 pub(crate) async fn query_limit_for_request(
-    client: &MemoryClient,
+    guard: &crate::openhuman::memory::guard::MemoryGuard,
     request: &QueryNamespaceRequest,
 ) -> Result<u32, String> {
+    use tinymemory_api::provider::MemoryProvider;
+
     let requested = request.resolved_limit();
     if request.document_ids.is_none() {
         return Ok(requested);
     }
 
-    let raw = client.list_documents(Some(&request.namespace)).await?;
+    let raw = guard
+        .as_documents()
+        .ok_or_else(|| "memory driver does not support the documents family".to_string())?
+        .list_documents(Some(&request.namespace))
+        .await
+        .map_err(|error| error.to_string())?;
     let documents = parse_memory_document_summaries(raw)?;
     let total_documents = u32::try_from(documents.len()).unwrap_or(u32::MAX);
     Ok(requested.max(total_documents))

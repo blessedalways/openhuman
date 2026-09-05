@@ -14,11 +14,15 @@ use std::time::Duration;
 use serde_json::json;
 use tempfile::tempdir;
 
-use openhuman_core::openhuman::embeddings::NoopEmbedding;
-use openhuman_core::openhuman::memory::{
-    MemoryClient, MemoryIngestionConfig, MemoryIngestionRequest, NamespaceDocumentInput,
-    UnifiedMemory,
-};
+use openhuman_core::openhuman::inference::embeddings::NoopEmbedding;
+use openhuman_core::openhuman::memory::NamespaceDocumentInput;
+// Engine handles and the engine's own ingest request/config named on the
+// crates that define them — `memory::MemoryIngestion{Request,Config}` are the
+// host's WIRE shapes now (`rpc_models`), a different type from what
+// `UnifiedMemory::ingest_document` takes (#5560). See the note in
+// `personality_e2e.rs`.
+use tinycortex::memory::ingest::{MemoryIngestionConfig, MemoryIngestionRequest};
+use tinymemory_core::store::{MemoryClient, UnifiedMemory};
 
 /// Test config for the heuristic-only pipeline.
 fn ci_safe_config() -> MemoryIngestionConfig {
@@ -74,6 +78,7 @@ async fn ingest_document_populates_namespace_graph() {
                 category: "core".to_string(),
                 session_id: None,
                 document_id: None,
+                taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
             },
             config: ci_safe_config(),
         })
@@ -198,6 +203,7 @@ async fn put_doc_background_extraction_then_graph_query() {
             category: "core".to_string(),
             session_id: None,
             document_id: None,
+            taint: openhuman_core::openhuman::memory::MemoryTaint::Internal,
         })
         .await
         .expect("put_doc");

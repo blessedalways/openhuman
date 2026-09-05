@@ -40,7 +40,10 @@ vi.mock('../../../services/chatService', () => ({
   chatSend: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../../../utils/toolDefinitions', () => ({ getDefaultEnabledTools: vi.fn(() => []) }));
+vi.mock('../../../utils/toolDefinitions', () => ({
+  getDefaultEnabledTools: vi.fn(() => []),
+  getEnabledRustToolNames: vi.fn((ids: string[]) => ids),
+}));
 
 vi.mock('../components/BetaBanner', () => ({ default: () => <div data-testid="beta-banner" /> }));
 
@@ -97,7 +100,7 @@ function buildStore() {
   });
 }
 
-async function setupLayout() {
+async function setupLayout(onboardingTasks: unknown = null) {
   const { useCoreState } = await import('../../../providers/CoreStateProvider');
 
   const mockSetOnboardingCompletedFlag = vi.fn().mockResolvedValue(undefined);
@@ -111,8 +114,14 @@ async function setupLayout() {
       onboardingCompleted: false,
       chatOnboardingCompleted: false,
       analyticsEnabled: false,
-      localState: { encryptionKey: null, onboardingTasks: null },
-      runtime: { screenIntelligence: null, localAi: null, autocomplete: null, service: null },
+      localState: { encryptionKey: null, onboardingTasks, keyringConsent: null },
+      keyringStatus: {
+        available: true,
+        failureReason: null,
+        activeMode: 'os_keyring',
+        backendName: 'os',
+      },
+      runtime: { localAi: null, service: null },
     },
     isBootstrapping: false,
     isReady: true,
@@ -134,7 +143,7 @@ async function setupLayout() {
           <Route path="/onboarding" element={<OnboardingLayout />}>
             <Route index element={<TriggerComplete />} />
           </Route>
-          <Route path="/home" element={<div data-testid="home-page" />} />
+          <Route path="/chat" element={<div data-testid="chat-page" />} />
         </Routes>
       </MemoryRouter>
     </Provider>
@@ -212,9 +221,9 @@ describe('OnboardingLayout — Joyride walkthrough integration (#1123)', () => {
     expect(chatSend).not.toHaveBeenCalled();
   });
 
-  // Covers the catch branch in completeAndExit (OnboardingLayout.tsx:138):
-  // when setWalkthroughPending throws, navigation still proceeds to /home.
-  it('still navigates to /home when setWalkthroughPending throws', async () => {
+  // Covers the catch branch in completeAndExit:
+  // when setWalkthroughPending throws, navigation still proceeds to /chat.
+  it('still navigates to /chat when setWalkthroughPending throws', async () => {
     // Override default impl to throw for this one test invocation
     mockSetWalkthroughPending.mockImplementationOnce(() => {
       throw new Error('storage unavailable');
@@ -226,6 +235,59 @@ describe('OnboardingLayout — Joyride walkthrough integration (#1123)', () => {
     });
 
     // Navigation should still proceed even when the flag cannot be written.
-    expect(screen.getByTestId('home-page')).toBeInTheDocument();
+    expect(screen.getByTestId('chat-page')).toBeInTheDocument();
+  });
+
+  it('still completes onboarding when persisting onboarding tasks fails', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { mockSetOnboardingCompletedFlag, mockSetOnboardingTasks } = await setupLayout();
+    mockSetOnboardingTasks.mockRejectedValueOnce(
+      new Error('Core RPC openhuman.app_state_snapshot timed out after 30000ms')
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('complete-btn'));
+    });
+
+    expect(mockSetOnboardingCompletedFlag).toHaveBeenCalledWith(true);
+    expect(screen.getByTestId('chat-page')).toBeInTheDocument();
+
+    warnSpy.mockRestore();
+  });
+
+  // [#3096] Tool preference persistence on completion.
+  it('seeds default enabledTools when no preference was persisted', async () => {
+    const { mockSetOnboardingTasks } = await setupLayout(null);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('complete-btn'));
+    });
+
+    // Mocks: getDefaultEnabledTools() → [], getEnabledRustToolNames(x) → x.
+    expect(mockSetOnboardingTasks).toHaveBeenCalledWith(
+      expect.objectContaining({ enabledTools: [] })
+    );
+  });
+
+  it('preserves an existing customized enabledTools list instead of resetting to defaults', async () => {
+    const existing = ['shell', 'cron_add', 'cron_list'];
+    const { mockSetOnboardingTasks } = await setupLayout({
+      accessibilityPermissionGranted: false,
+      localModelConsentGiven: false,
+      localModelDownloadStarted: false,
+      enabledTools: existing,
+      connectedSources: [],
+      updatedAtMs: 1,
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('complete-btn'));
+    });
+
+    // The user's prior selection must be carried through verbatim — completing
+    // onboarding must never silently narrow an already-customized tool list.
+    expect(mockSetOnboardingTasks).toHaveBeenCalledWith(
+      expect.objectContaining({ enabledTools: existing })
+    );
   });
 });

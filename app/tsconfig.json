@@ -14,9 +14,19 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
+    /* Incremental type-checking: cache the type graph so warm `tsc` runs only
+       re-check files that changed. With noEmit there is no outDir to hold the
+       cache, so point tsBuildInfoFile at the gitignored node_modules cache. */
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsc/app.tsbuildinfo",
+
     /* Path aliases */
     "baseUrl": ".",
-    "paths": { "@openhuman/skill-types": ["src/lib/skills/types.ts"] },
+    "paths": {
+      "@/*": ["src/*"],
+      "@openhuman/skill-types": ["src/lib/skills/types.ts"],
+      "tauri-plugin-ptt-api": ["../packages/tauri-plugin-ptt/guest-js/index.ts"]
+    },
 
     /* Linting */
     "strict": true,
@@ -24,7 +34,12 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "test/*.test.ts", "test/*.test.tsx"],
+  "include": [
+    "src",
+    "test/*.test.ts",
+    "test/*.test.tsx",
+    "../packages/tauri-plugin-ptt/guest-js/index.ts"
+  ],
   "exclude": ["skills"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

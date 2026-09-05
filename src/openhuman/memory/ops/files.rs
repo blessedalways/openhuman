@@ -48,6 +48,13 @@ pub async fn ai_list_memory_files(
         }
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
+        // Hide SQLite engine files from user-facing memory file listings.
+        if matches!(
+            file_name.as_ref(),
+            "memory.db" | "memory.db-shm" | "memory.db-wal"
+        ) {
+            continue;
+        }
         if !file_name.is_empty() {
             files.push(file_name.to_string());
         }
@@ -102,3 +109,7 @@ pub async fn ai_write_memory_file(
         None,
     ))
 }
+
+#[cfg(test)]
+#[path = "files_tests.rs"]
+mod tests;

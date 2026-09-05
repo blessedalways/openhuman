@@ -1,9 +1,10 @@
 //! Tool: read_diff — structured git diff output for the Critic archetype.
 
-use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
+use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use tinytools::ToolRunContext;
 
 /// Returns `git diff` output in a structured format.
 pub struct ReadDiffTool {
@@ -13,6 +14,18 @@ pub struct ReadDiffTool {
 impl ReadDiffTool {
     pub fn new(workspace_dir: PathBuf) -> Self {
         Self { workspace_dir }
+    }
+
+    fn workspace_dir_for_context(&self, context: Option<&dyn ToolRunContext>) -> PathBuf {
+        if let Some(workspace) = context.and_then(|ctx| ctx.workspace()) {
+            tracing::debug!(
+                workspace_root = %workspace.root.display(),
+                policy_id = %workspace.policy_id,
+                "[read_diff] using TinyAgents workspace descriptor as workspace dir"
+            );
+            return workspace.root.clone();
+        }
+        self.workspace_dir.clone()
     }
 }
 
@@ -52,6 +65,17 @@ impl Tool for ReadDiffTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, ToolCallOptions::default(), None)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: ToolCallOptions,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        let workspace_dir = self.workspace_dir_for_context(context);
         let base = args.get("base").and_then(|v| v.as_str());
         let staged = args
             .get("staged")
@@ -76,14 +100,14 @@ impl Tool for ReadDiffTool {
         }
 
         tracing::debug!(
-            workspace = %self.workspace_dir.display(),
+            workspace = %workspace_dir.display(),
             ?git_args,
             "[read_diff] running git diff"
         );
 
         let output = tokio::process::Command::new("git")
             .args(&git_args)
-            .current_dir(&self.workspace_dir)
+            .current_dir(&workspace_dir)
             .output()
             .await?;
 
@@ -104,69 +128,5 @@ impl Tool for ReadDiffTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use tempfile::TempDir;
-
-    fn make_tool(dir: &TempDir) -> ReadDiffTool {
-        ReadDiffTool::new(dir.path().to_path_buf())
-    }
-
-    #[test]
-    fn name_is_correct() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(make_tool(&tmp).name(), "read_diff");
-    }
-
-    #[test]
-    fn description_is_non_empty() {
-        let tmp = TempDir::new().unwrap();
-        assert!(!make_tool(&tmp).description().is_empty());
-    }
-
-    #[test]
-    fn schema_is_object_type() {
-        let tmp = TempDir::new().unwrap();
-        let schema = make_tool(&tmp).parameters_schema();
-        assert_eq!(schema["type"], "object");
-    }
-
-    #[test]
-    fn permission_level_is_read_only() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(
-            make_tool(&tmp).permission_level(),
-            PermissionLevel::ReadOnly
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_returns_error_for_non_git_dir() {
-        let tmp = TempDir::new().unwrap();
-        let result = make_tool(&tmp).execute(json!({})).await.unwrap();
-        // Non-git dir: git will fail, tool returns error
-        assert!(result.is_error);
-    }
-
-    #[tokio::test]
-    async fn execute_no_changes_in_clean_git_repo() {
-        let tmp = TempDir::new().unwrap();
-        // Init a git repo and make an initial commit so there's nothing to diff
-        let _ = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(tmp.path())
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "t@t.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "t@t.com")
-            .output();
-        let result = make_tool(&tmp).execute(json!({})).await.unwrap();
-        assert!(!result.is_error);
-        assert!(result.output().contains("No changes found."));
-    }
-}
+#[path = "read_diff_tests.rs"]
+mod tests;

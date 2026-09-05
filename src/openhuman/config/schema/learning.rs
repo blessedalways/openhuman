@@ -18,6 +18,7 @@ pub enum ReflectionSource {
 
 /// Configuration for the agent self-learning subsystem.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct LearningConfig {
     /// Master switch. Default: false.
     #[serde(default)]
@@ -34,6 +35,18 @@ pub struct LearningConfig {
     /// Enable tool effectiveness tracking. Default: true when learning is enabled.
     #[serde(default = "default_true")]
     pub tool_tracking_enabled: bool,
+
+    /// Enable the tool-scoped memory capture hook (see
+    /// [`crate::openhuman::memory::tool_memory::ToolMemoryCaptureHook`]).
+    ///
+    /// When enabled, the hook records user edicts ("never email Sarah")
+    /// as `Critical`-priority rules in the `tool-{name}` memory
+    /// namespace, and tallies repeated tool failures into
+    /// `Normal`-priority observations. Defaults to true when learning
+    /// is enabled — set to false to disable durable rule capture
+    /// without turning off learning entirely.
+    #[serde(default = "default_true")]
+    pub tool_memory_capture_enabled: bool,
 
     /// Which LLM to use for reflection. Default: local (Ollama).
     #[serde(default)]
@@ -63,9 +76,63 @@ pub struct LearningConfig {
     #[serde(default = "default_true")]
     pub stability_detector_enabled: bool,
 
+    /// Enable episodic capture (ArchivistHook) regardless of the master
+    /// `learning.enabled` toggle.
+    ///
+    /// Episodic capture is the system-of-record for chat turns
+    /// (`episodic_log` FTS5 table, conversation segmentation, segment
+    /// summaries with LLM recap, and segment embeddings). It must remain
+    /// active even when the inference stack
+    /// (reflection / stability-detector) is off.
+    ///
+    /// Default: `true`. Set to `false` to fully disable the Archivist.
+    ///
+    /// Override via `OPENHUMAN_LEARNING_EPISODIC_CAPTURE_ENABLED=0|1`.
+    #[serde(default = "default_true")]
+    pub episodic_capture_enabled: bool,
+
+    /// Enable preemptive STM recall injection at session start and on-demand
+    /// `stm_recall_search` tool exposure.
+    ///
+    /// When enabled, a bounded cross-thread context block is assembled from
+    /// recent episodic entries (FTS5 keyword arm) and segment recaps (cosine
+    /// similarity arm) from OTHER sessions and injected into the first turn's
+    /// user message. The `stm_recall_search` tool is also registered in the
+    /// agent's tool list.
+    ///
+    /// Default: `true`. Set to `false` to fully disable STM recall.
+    ///
+    /// Override via `OPENHUMAN_LEARNING_STM_RECALL_ENABLED=0|1`.
+    #[serde(default = "default_true")]
+    pub stm_recall_enabled: bool,
+
     /// How often the periodic rebuild loop runs in seconds. Default: 1800 (30 minutes).
     #[serde(default = "default_rebuild_interval_secs")]
     pub rebuild_interval_secs: u64,
+
+    /// Enable explicit user-preference injection into the system prompt.
+    ///
+    /// When `true` (the default), preferences saved via the `remember_preference`
+    /// tool are injected into every session prompt regardless of whether the full
+    /// inference-based learning subsystem (`enabled`) is on.  This is the
+    /// narrow, always-on path for user-authoritative pinned preferences —
+    /// no reflection, no heuristics, no stability engine.
+    ///
+    /// Explicitly set to `false` (or `OPENHUMAN_LEARNING_EXPLICIT_PREFERENCES_ENABLED=0`)
+    /// to suppress all preference injection even for explicitly pinned entries.
+    #[serde(default = "default_true")]
+    pub explicit_preferences_enabled: bool,
+
+    /// Enable automatic enrichment of the long-term goals list
+    /// (`MEMORY_GOALS.md`) when the conversation context is summarized.
+    ///
+    /// When `true` (the default), a best-effort background `goals_agent`
+    /// run is fired after a segment recap so the user's durable goals stay
+    /// fresh. Set to `false` (or
+    /// `OPENHUMAN_LEARNING_GOALS_ENRICHMENT_ENABLED=0`) to only update the
+    /// goals list via explicit RPC/tools.
+    #[serde(default = "default_true")]
+    pub goals_enrichment_enabled: bool,
 }
 
 fn default_rebuild_interval_secs() -> u64 {
@@ -91,12 +158,17 @@ impl Default for LearningConfig {
             reflection_enabled: default_true(),
             user_profile_enabled: default_true(),
             tool_tracking_enabled: default_true(),
+            tool_memory_capture_enabled: default_true(),
             reflection_source: ReflectionSource::default(),
             max_reflections_per_session: default_max_reflections(),
             min_turn_complexity: default_min_turn_complexity(),
             chat_to_tree_enabled: default_true(),
             stability_detector_enabled: default_true(),
             rebuild_interval_secs: default_rebuild_interval_secs(),
+            episodic_capture_enabled: default_true(),
+            stm_recall_enabled: default_true(),
+            explicit_preferences_enabled: default_true(),
+            goals_enrichment_enabled: default_true(),
         }
     }
 }

@@ -3,8 +3,8 @@
  * ---------------------------
  *
  * Small centered confirm modal for destructive uninstall of a user-scope
- * SKILL.md skill. Wraps `skillsApi.uninstallSkill` which calls
- * `openhuman.skills_uninstall` on the Rust side — that RPC only accepts
+ * SKILL.md skill. Wraps `skillsApi.uninstallWorkflow` which calls
+ * `openhuman.skill_registry_uninstall` on the Rust side — that RPC only accepts
  * user-scope installs (`~/.openhuman/skills/<name>/`) and refuses project
  * and legacy scopes. The card that opens this dialog is responsible for
  * not surfacing the Uninstall action for non-user-scope entries.
@@ -23,53 +23,36 @@
  * Design mirrors `InstallSkillDialog` — see
  * `.claude/rules/15-settings-modal-system.md`.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import debug from 'debug';
+import { useCallback, useState } from 'react';
 
+import { useT } from '../../lib/i18n/I18nContext';
+import { trackEvent } from '../../services/analytics';
 import {
+  type UninstallWorkflowResult,
   skillsApi,
-  type SkillSummary,
-  type UninstallSkillResult,
+  type WorkflowSummary,
 } from '../../services/api/skillsApi';
+import { ModalShell } from '../ui';
+import Button from '../ui/Button';
 
 const log = debug('skills:uninstall-dialog');
 
 interface Props {
-  skill: SkillSummary;
+  skill: WorkflowSummary;
   onClose: () => void;
   /**
    * Fires when the backend reports the uninstall succeeded. Parent is
    * responsible for refetching the skills list and closing any detail
    * panels that were showing this skill.
    */
-  onUninstalled: (result: UninstallSkillResult) => void;
+  onUninstalled: (result: UninstallWorkflowResult) => void;
 }
 
 export default function UninstallSkillConfirmDialog({ skill, onClose, onUninstalled }: Props) {
+  const { t } = useT();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const cancelBtnRef = useRef<HTMLButtonElement | null>(null);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    previousFocusRef.current = document.activeElement as HTMLElement | null;
-    cancelBtnRef.current?.focus();
-    return () => {
-      previousFocusRef.current?.focus();
-    };
-  }, []);
-
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !submitting) {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
-  }, [onClose, submitting]);
 
   const handleConfirm = useCallback(async () => {
     log('confirm: id=%s name=%s', skill.id, skill.name);
@@ -79,66 +62,61 @@ export default function UninstallSkillConfirmDialog({ skill, onClose, onUninstal
       // `skill.id` is the on-disk slug (directory under ~/.openhuman/skills/).
       // `skill.name` is the frontmatter display name and may diverge from the
       // slug — the backend resolves by slug, so pass `id`.
-      const result = await skillsApi.uninstallSkill(skill.id);
+      const result = await skillsApi.uninstallWorkflow(skill.id);
       log('confirm: done removedPath=%s', result.removedPath);
+      trackEvent('skill_uninstall', { skill_id: skill.id });
       onUninstalled(result);
       onClose();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log('confirm: error=%s', msg);
-      setError(`Couldn't uninstall skill: ${msg}`);
+      setError(msg);
       setSubmitting(false);
     }
-  }, [skill.id, skill.name, onUninstalled, onClose]);
+  }, [skill.id, skill.name, onUninstalled, onClose, t]);
 
-  return createPortal(
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="uninstall-skill-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-      onMouseDown={e => {
-        if (e.target === e.currentTarget && !submitting) onClose();
-      }}>
-      <div className="w-[420px] max-w-[90vw] rounded-2xl bg-white p-5 shadow-2xl">
-        <h2 id="uninstall-skill-title" className="text-base font-semibold text-stone-900">
-          Uninstall {skill.name}?
-        </h2>
-        <p className="mt-2 text-sm text-stone-600">
-          This permanently deletes the skill directory and all its bundled resources. The agent
-          will stop seeing it at the next turn.
-        </p>
-        {skill.location && (
-          <p className="mt-3 break-all rounded-lg bg-stone-50 px-3 py-2 font-mono text-[11px] text-stone-600">
-            {skill.location.replace(/\/SKILL\.md$/i, '')}
-          </p>
-        )}
-        {error && (
-          <div className="mt-3 rounded-lg border border-coral-200 bg-coral-50 px-3 py-2 text-xs text-coral-700">
-            <div className="font-medium">Could not uninstall</div>
-            <div className="mt-1 break-words font-mono text-[11px] text-coral-700/90">{error}</div>
-          </div>
-        )}
-        <div className="mt-5 flex items-center justify-end gap-2">
-          <button
-            ref={cancelBtnRef}
-            type="button"
-            disabled={submitting}
-            onClick={onClose}
-            className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50">
-            Cancel
-          </button>
-          <button
-            type="button"
+  return (
+    <ModalShell
+      onClose={() => {
+        if (!submitting) onClose();
+      }}
+      title={
+        <>
+          {t('common.delete')} {skill.name}?
+        </>
+      }
+      titleId="uninstall-skill-title"
+      maxWidthClassName="max-w-[420px]"
+      contentClassName="px-5 pb-1 pt-4"
+      closePolicy={submitting ? { escape: false, backdrop: false, button: false } : undefined}
+      footer={
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="secondary" size="sm" disabled={submitting} onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="secondary"
+            tone="danger"
+            size="sm"
             disabled={submitting}
             onClick={handleConfirm}
-            data-testid="uninstall-skill-confirm"
-            className="rounded-lg border border-coral-300 bg-coral-50 px-3 py-1.5 text-xs font-medium text-coral-700 hover:bg-coral-100 disabled:cursor-not-allowed disabled:opacity-50">
-            {submitting ? 'Uninstalling…' : 'Uninstall'}
-          </button>
+            data-testid="uninstall-skill-confirm">
+            {submitting ? t('team.deleting') : t('common.delete')}
+          </Button>
         </div>
-      </div>
-    </div>,
-    document.body
+      }>
+      <p className="text-sm text-content-secondary">{t('skills.uninstall.description')}</p>
+      {skill.location && (
+        <p className="mt-3 break-all rounded-lg bg-surface-muted px-3 py-2 font-mono text-[11px] text-content-secondary">
+          {skill.location.replace(/\/(WORKFLOW|SKILL)\.md$/i, '')}
+        </p>
+      )}
+      {error && (
+        <div className="mt-3 rounded-lg border border-coral-200 bg-coral-50 px-3 py-2 text-xs text-coral-700">
+          <div className="font-medium">{t('workflows.deleteError')}</div>
+          <div className="mt-1 wrap-break-word font-mono text-[11px] text-coral-700/90">{error}</div>
+        </div>
+      )}
+    </ModalShell>
   );
 }

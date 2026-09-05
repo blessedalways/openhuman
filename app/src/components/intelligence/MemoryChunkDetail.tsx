@@ -9,6 +9,7 @@
  */
 import { useEffect, useState } from 'react';
 
+import { useT } from '../../lib/i18n/I18nContext';
 import {
   type Chunk,
   type EntityRef,
@@ -16,6 +17,7 @@ import {
   memoryTreeEntityIndexFor,
   type ScoreBreakdown,
 } from '../../utils/tauriCommands';
+import Button from '../ui/Button';
 import { MemoryChunkLetterhead } from './MemoryChunkLetterhead';
 import { MemoryChunkMentioned } from './MemoryChunkMentioned';
 import { MemoryChunkScoreBars } from './MemoryChunkScoreBars';
@@ -52,6 +54,7 @@ function shortChunkId(id: string): string {
 }
 
 export function MemoryChunkDetail({ chunk, onSelectEntity }: MemoryChunkDetailProps) {
+  const { t } = useT();
   const [entities, setEntities] = useState<EntityRef[]>([]);
   const [breakdown, setBreakdown] = useState<ScoreBreakdown | null>(null);
   const [copied, setCopied] = useState(false);
@@ -120,12 +123,25 @@ export function MemoryChunkDetail({ chunk, onSelectEntity }: MemoryChunkDetailPr
           <footer className="mw-letter-footer">
             {chunk.source_ref && <span>{chunk.source_ref}</span>}
             <span>·</span>
-            <button type="button" onClick={() => void handleCopyId()} title="Copy chunk id">
-              chunk {shortChunkId(chunk.id)}
-              {copied && <span style={{ marginLeft: 6, color: 'var(--sage)' }}>copied</span>}
-            </button>
+            <Button
+              variant="tertiary"
+              size="xs"
+              className="h-auto rounded-none px-0"
+              onClick={() => void handleCopyId()}
+              title={t('intelligence.memoryChunk.detail.copyChunkId')}>
+              {t('intelligence.memoryChunk.detail.chunk')} {shortChunkId(chunk.id)}
+              {copied && (
+                <span className="ml-1.5 text-sage-600 dark:text-sage-400">
+                  {t('intelligence.memoryChunk.detail.copiedHint')}
+                </span>
+              )}
+            </Button>
             <span>·</span>
-            <span>{chunk.has_embedding ? 'bge-m3 1024dim' : 'no embedding'}</span>
+            <span>
+              {chunk.has_embedding
+                ? t('intelligence.memoryChunk.detail.embeddingInfo')
+                : t('intelligence.memoryChunk.detail.noEmbedding')}
+            </span>
           </footer>
         </div>
       </div>

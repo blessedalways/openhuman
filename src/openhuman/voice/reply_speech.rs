@@ -7,19 +7,71 @@
 //! Lives in the voice domain because the response is consumed by the
 //! mascot's lipsync pipeline (`useHumanMascot` → `findActiveFrame` →
 //! `oculusVisemeToShape`).
+//!
+//! Approval gate (#1339) classification: **internal**. Reply-speech is
+//! the user's own assistant speaking through the user's own speakers
+//! — there is no outbound side effect visible to a third party.
+//! Coordinate with #1206 voice work: if `reply_speech` is ever wrapped
+//! in a `Tool` impl, the `external_effect()` method MUST stay `false`
+//! (the trait's default) so the approval gate never prompts on TTS.
 
-use log::debug;
+use log::{debug, warn};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::api::config::effective_api_url;
+use crate::api::config::effective_backend_api_url;
 use crate::api::jwt::get_session_token;
 use crate::api::BackendOAuthClient;
 use crate::openhuman::config::Config;
 use crate::rpc::RpcOutcome;
 
 const LOG_PREFIX: &str = "[voice_reply]";
+
+/// Env var that activates the [`test_seam`] short-circuit at runtime. When
+/// set to `1` / `true`, [`synthesize_reply`] records the requested text
+/// into [`test_seam::OBSERVED_CALLS`] and returns a stub
+/// [`ReplySpeechResult`] *without* contacting the hosted backend. Anything
+/// else (unset, `0`, `false`, …) leaves the production code path
+/// untouched.
+///
+/// The env-var gate (rather than a `#[cfg(test)]` gate) is deliberate:
+/// integration tests in `tests/` are compiled against the production
+/// `openhuman_core` crate, so a unit-only `cfg(test)` block would not be
+/// visible from there. The observer module itself is always compiled,
+/// but its only producer is this env-gated branch and its only consumer
+/// is the test harness, so production callers never touch it.
+pub const TEST_SEAM_ENV: &str = "OPENHUMAN_TEST_REPLY_SPEECH_SEAM";
+
+fn test_seam_enabled() -> bool {
+    matches!(
+        std::env::var(TEST_SEAM_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Test seam observation log. See [`TEST_SEAM_ENV`] for the activation
+/// gate. Always compiled (the visibility lets `tests/json_rpc_e2e.rs`
+/// inspect calls), but only written to when the env gate is on.
+pub mod test_seam {
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    /// FIFO log of every `text` argument that flowed through the test-seam
+    /// short-circuit in [`super::synthesize_reply`]. Cleared between tests
+    /// with [`clear`].
+    pub static OBSERVED_CALLS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+    /// Clear the observation log.
+    pub fn clear() {
+        OBSERVED_CALLS.lock().unwrap().clear();
+    }
+
+    /// Snapshot of the observation log.
+    pub fn observed() -> Vec<String> {
+        OBSERVED_CALLS.lock().unwrap().clone()
+    }
+}
 
 /// One frame on the viseme timeline. `viseme` is an Oculus / Microsoft
 /// 15-set code (`sil, PP, FF, TH, DD, kk, CH, SS, nn, RR, aa, E, I, O, U`).
@@ -80,6 +132,31 @@ pub async fn synthesize_reply(
         return Err("text is required".to_string());
     }
 
+    // Test seam: when OPENHUMAN_TEST_REPLY_SPEECH_SEAM is set (and only in
+    // debug builds — the seam is structurally dead in release), record the
+    // call and short-circuit before hitting the backend.
+    // See `test_seam` module docs and `TEST_SEAM_ENV` for the activation gate.
+    if cfg!(debug_assertions) && test_seam_enabled() {
+        warn!(
+            "[voice_reply] TEST SEAM ACTIVE — synthesize_reply short-circuited ({} is set); skipping backend call",
+            TEST_SEAM_ENV
+        );
+        let _ = (config, opts);
+        test_seam::OBSERVED_CALLS
+            .lock()
+            .unwrap()
+            .push(trimmed.to_string());
+        return Ok(RpcOutcome::single_log(
+            ReplySpeechResult {
+                audio_base64: String::new(),
+                audio_mime: "audio/mpeg".to_string(),
+                visemes: Vec::new(),
+                alignment: None,
+            },
+            "voice reply synthesized (test seam short-circuit)",
+        ));
+    }
+
     let token = get_session_token(config)
         .map_err(|e| e.to_string())?
         .and_then(|t| {
@@ -92,7 +169,7 @@ pub async fn synthesize_reply(
         })
         .ok_or_else(|| "no backend session token; sign in first".to_string())?;
 
-    let api_url = effective_api_url(&config.api_url);
+    let api_url = effective_backend_api_url(&config.api_url);
     let client = BackendOAuthClient::new(&api_url).map_err(|e| e.to_string())?;
 
     let mut body = serde_json::Map::new();
@@ -134,6 +211,15 @@ pub async fn synthesize_reply(
         opts.voice_id.as_deref().unwrap_or("default")
     );
 
+    // `flatten_authed_error` maps the typed `BackendApiError::Unauthorized`
+    // (expected session-lapse 401 from `authed_json`) onto the `SESSION_EXPIRED`
+    // sentinel so the JSON-RPC layer (`core/jsonrpc.rs::is_session_expired_error`)
+    // classifies it as session expiry and skips Sentry, matching the #3384
+    // team/billing pattern. The previous `e.to_string()` produced the raw
+    // "backend rejected session token on POST /openai/v1/audio/speech" Display
+    // string, which matched none of the session-expiry classifiers and leaked
+    // every lapsed-session TTS 401 to Sentry (TAURI-RUST-8X1). Every other error
+    // keeps its full `{e:#}` anyhow chain so genuine TTS failures still report.
     let raw = client
         .authed_json(
             &token,
@@ -142,7 +228,7 @@ pub async fn synthesize_reply(
             Some(Value::Object(body)),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(crate::api::flatten_authed_error)?;
 
     let result = normalize_response(&raw);
     debug!(
@@ -208,11 +294,28 @@ fn parse_cue(v: &Value) -> Option<VisemeFrame> {
     if viseme.is_empty() {
         return None;
     }
-    let start = read_u64(v, &["start_ms", "time_ms", "t"]).unwrap_or(0);
-    let end = read_u64(v, &["end_ms"])
+    // Accept millisecond keys, or seconds keys (`startSeconds`/`endSeconds`, the
+    // shape the cloud backend actually ships) converted to ms. Without the
+    // seconds keys every frame collapsed to start=0/end=80 — the mascot mouth
+    // then froze on the first viseme because the whole track had no real timing.
+    let start = read_ms(
+        v,
+        &["start_ms", "time_ms", "t"],
+        &["startSeconds", "start_seconds", "startSec"],
+    )
+    .unwrap_or(0);
+    let end = read_ms(v, &["end_ms"], &["endSeconds", "end_seconds", "endSec"])
         .or_else(|| {
-            let t = read_u64(v, &["time_ms", "t"])?;
-            let d = read_u64(v, &["duration_ms", "d"])?;
+            let t = read_ms(
+                v,
+                &["time_ms", "t"],
+                &["startSeconds", "start_seconds", "startSec"],
+            )?;
+            let d = read_ms(
+                v,
+                &["duration_ms", "d"],
+                &["durationSeconds", "duration_seconds", "durationSec"],
+            )?;
             Some(t + d)
         })
         .unwrap_or(start + 80);
@@ -228,8 +331,8 @@ fn parse_cue(v: &Value) -> Option<VisemeFrame> {
 
 fn parse_alignment(v: &Value) -> Option<AlignmentFrame> {
     let ch = v.get("char").and_then(Value::as_str)?.to_string();
-    let start = read_u64(v, &["start_ms"])?;
-    let end = read_u64(v, &["end_ms"])?;
+    let start = read_ms(v, &["start_ms"], &["startSeconds", "start_seconds"])?;
+    let end = read_ms(v, &["end_ms"], &["endSeconds", "end_seconds"])?;
     if end <= start {
         return None;
     }
@@ -254,71 +357,27 @@ fn read_u64(v: &Value, keys: &[&str]) -> Option<u64> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn normalize_canonical_shape() {
-        let raw = json!({
-            "audio_base64": "AAA=",
-            "audio_mime": "audio/mpeg",
-            "visemes": [
-                { "viseme": "sil", "start_ms": 0, "end_ms": 100 },
-                { "viseme": "aa", "start_ms": 100, "end_ms": 250 },
-            ],
-        });
-        let r = normalize_response(&raw);
-        assert_eq!(r.audio_base64, "AAA=");
-        assert_eq!(r.audio_mime, "audio/mpeg");
-        assert_eq!(r.visemes.len(), 2);
-        assert_eq!(r.visemes[1].viseme, "aa");
-        assert_eq!(r.visemes[1].end_ms, 250);
+/// Read a time value in milliseconds. Tries `ms_keys` first (integer or float
+/// ms), then `sec_keys` interpreted as seconds and converted to ms. This lets
+/// the parser tolerate both the `*_ms` contract and the backend's
+/// `*Seconds` shape without the caller caring which arrived.
+fn read_ms(v: &Value, ms_keys: &[&str], sec_keys: &[&str]) -> Option<u64> {
+    if let Some(ms) = read_u64(v, ms_keys) {
+        return Some(ms);
     }
-
-    #[test]
-    fn normalize_accepts_cues_and_short_keys() {
-        let raw = json!({
-            "audio": "BBB=",
-            "mime": "audio/wav",
-            "cues": [{ "v": "PP", "t": 0, "d": 80 }],
-        });
-        let r = normalize_response(&raw);
-        assert_eq!(r.audio_base64, "BBB=");
-        assert_eq!(r.audio_mime, "audio/wav");
-        assert_eq!(
-            r.visemes,
-            vec![VisemeFrame {
-                viseme: "PP".into(),
-                start_ms: 0,
-                end_ms: 80
-            }]
-        );
+    for k in sec_keys {
+        if let Some(f) = v.get(*k).and_then(Value::as_f64) {
+            if f.is_finite() && f >= 0.0 {
+                return Some((f * 1000.0).round() as u64);
+            }
+        }
+        if let Some(n) = v.get(*k).and_then(Value::as_u64) {
+            return Some(n.saturating_mul(1000));
+        }
     }
-
-    #[test]
-    fn normalize_drops_malformed_cues() {
-        let raw = json!({
-            "audio_base64": "CCC=",
-            "visemes": [
-                { "viseme": "aa", "start_ms": 0, "end_ms": 100 },
-                { "viseme": "",   "start_ms": 100, "end_ms": 200 },
-                { "viseme": "PP", "start_ms": 200, "end_ms": 200 },
-            ],
-        });
-        let r = normalize_response(&raw);
-        assert_eq!(r.visemes.len(), 1);
-        assert_eq!(r.visemes[0].viseme, "aa");
-    }
-
-    #[test]
-    fn normalize_passes_through_alignment() {
-        let raw = json!({
-            "audio_base64": "DDD=",
-            "alignment": [{ "char": "h", "start_ms": 0, "end_ms": 50 }],
-        });
-        let r = normalize_response(&raw);
-        assert_eq!(r.alignment.as_deref().unwrap()[0].char, "h");
-    }
+    None
 }
+
+#[cfg(test)]
+#[path = "reply_speech_tests.rs"]
+mod tests;

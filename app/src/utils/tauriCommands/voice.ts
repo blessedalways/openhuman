@@ -10,7 +10,7 @@ import { ConfigSnapshot } from './config';
 export interface VoiceSpeechResult {
   /** Final text — cleaned by LLM post-processing when available. */
   text: string;
-  /** Raw whisper output before LLM cleanup. */
+  /** Raw STT engine output before LLM cleanup. */
   raw_text: string;
   model_id: string;
 }
@@ -25,14 +25,17 @@ export interface VoiceStatus {
   tts_available: boolean;
   stt_model_id: string;
   tts_voice_id: string;
-  whisper_binary: string | null;
   piper_binary: string | null;
-  stt_model_path: string | null;
   tts_voice_path: string | null;
-  /** Whether the whisper model is loaded in-process (low-latency mode). */
-  whisper_in_process: boolean;
   /** Whether LLM post-processing is enabled for transcription cleanup. */
   llm_cleanup_enabled: boolean;
+  /** Resolved STT routing string — 'cloud' for the backend proxy, or the
+   *  third-party slug selected by `voice_server.stt_engine`. */
+  stt_engine: string;
+  /** Why `stt_available` is false, when it is. Null when STT is usable. */
+  stt_error: string | null;
+  /** Currently selected TTS provider ('cloud' or 'piper'). */
+  tts_provider: string;
 }
 
 export interface VoiceServerStatus {
@@ -50,11 +53,19 @@ export interface VoiceServerSettings {
   skip_cleanup: boolean;
   min_duration_secs: number;
   /** RMS energy threshold for silence detection. Recordings below this are
-   *  treated as silence and skipped to prevent whisper hallucinations. */
+   *  treated as silence and skipped to prevent STT hallucinations. */
   silence_threshold: number;
-  /** Custom vocabulary words to bias whisper toward (names, technical terms). */
+  /** Custom vocabulary words to bias the STT engine toward (names, technical terms). */
   custom_dictionary: string[];
+  /** Phase 2: continuous always-on listening (no hotkey). Opt-in. */
+  always_on_enabled: boolean;
+  /** Hosted speech-to-text engine. There is no local option — the bundled
+   *  whisper.cpp engine was removed. */
+  stt_engine: SttEngine;
 }
+
+/** Hosted speech-to-text engines, mirroring `config::schema::SttEngine`. */
+export type SttEngine = 'backend' | 'elevenlabs' | 'openai';
 
 export async function openhumanVoiceStatus(): Promise<VoiceStatus> {
   return await callCoreRpc<VoiceStatus>({ method: 'openhuman.voice_status', params: {} });
@@ -102,9 +113,41 @@ export async function openhumanUpdateVoiceServerSettings(update: {
   min_duration_secs?: number;
   silence_threshold?: number;
   custom_dictionary?: string[];
+  always_on_enabled?: boolean;
+  stt_engine?: SttEngine;
 }): Promise<CommandResponse<ConfigSnapshot>> {
   return await callCoreRpc<CommandResponse<ConfigSnapshot>>({
     method: 'openhuman.config_update_voice_server_settings',
+    params: update,
+  });
+}
+
+export interface VoiceProvidersUpdate {
+  /** STT provider string: 'cloud' or '<slug>:<model>'. */
+  stt_provider?: string;
+  /** TTS provider string: 'cloud', 'piper', or '<slug>:<voice>'. */
+  tts_provider?: string;
+  stt_model?: string;
+  tts_voice?: string;
+}
+
+export interface VoiceProvidersSnapshot {
+  stt_provider: string;
+  tts_provider: string;
+  stt_model_id: string;
+  tts_voice_id: string;
+}
+
+/**
+ * Persist the STT / TTS provider selection. Maps to the
+ * `openhuman.voice_set_providers` RPC, which validates each value against
+ * the supported provider list and rejects unknown ids server-side.
+ */
+export async function openhumanVoiceSetProviders(
+  update: VoiceProvidersUpdate
+): Promise<VoiceProvidersSnapshot> {
+  return await callCoreRpc<VoiceProvidersSnapshot>({
+    method: 'openhuman.voice_set_providers',
     params: update,
   });
 }

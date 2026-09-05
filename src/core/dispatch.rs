@@ -3,6 +3,7 @@
 //! This module coordinates the routing of incoming requests to either the
 //! core subsystem or the OpenHuman domain-specific handlers.
 
+use crate::core::legacy_aliases::resolve_legacy;
 use crate::core::rpc_log;
 use crate::core::types::{AppState, InvocationResult};
 use serde_json::{json, Map, Value};
@@ -36,6 +37,25 @@ pub async fn dispatch(
         rpc_log::redact_params_for_log(&params)
     );
 
+    // Tier 0: Rewrite legacy method names to their canonical form before
+    // any subsystem lookup. Symmetric with the frontend's
+    // `normalizeRpcMethod` (`app/src/services/rpcMethods.ts`): the
+    // frontend rewrites outgoing names for clients that just updated, the
+    // core rewrites incoming names for clients that haven't yet. See
+    // `crate::core::legacy_aliases` for the shared table.
+    let resolved = resolve_legacy(method);
+    if resolved != method {
+        // Per-rewrite log at debug to keep the dispatcher hot path quiet
+        // at scale (per graycyrus review on PR #1544). Aggregate
+        // visibility belongs in the observability layer, not here.
+        log::debug!(
+            "[rpc-legacy-alias] rewrite method={} -> canonical={}",
+            method,
+            resolved
+        );
+    }
+    let method = resolved;
+
     // Tier 1: Internal core methods.
     // These are handled directly within the core module and don't require
     // a separate controller registration.
@@ -45,7 +65,7 @@ pub async fn dispatch(
     }
 
     // Tier 2: Registered domain controllers.
-    if let Some(result) = try_registry_dispatch(method, params.clone()).await {
+    if let Some(result) = try_registry_dispatch(method, params).await {
         log::debug!(
             "[rpc:dispatch] routed method={} subsystem=controller_registry",
             method
@@ -53,17 +73,82 @@ pub async fn dispatch(
         return result;
     }
 
-    // Tier 3: Legacy domain-specific dispatcher.
-    if let Some(result) = crate::rpc::try_dispatch(method, params).await {
+    // Tier 3: unrecognised method. The JSON-RPC response is unchanged — the
+    // caller still receives a method-not-found error. Only the *severity* of
+    // how the transport layer records it differs by class (see
+    // `jsonrpc::rpc_handler`): known non-actionable misses
+    // (`is_known_probe_method`) are debug-only and never reach Sentry
+    // (#3567, #3565), while any other unknown method is downgraded to a
+    // warn-level capture (recorded for triage, no page) instead of an error
+    // event. Log here at debug with the method name so the path stays
+    // diagnosable without re-creating the Sentry noise.
+    if is_known_probe_method(method) {
         log::debug!(
-            "[rpc:dispatch] routed method={} subsystem=openhuman",
+            "[rpc] unknown_method method={} class=debug_only_known_miss (not reported to Sentry)",
             method
         );
-        return result;
+    } else {
+        log::debug!(
+            "[rpc] unknown_method method={} class=unrecognized (reported to Sentry at warn for triage)",
+            method
+        );
     }
+    Err(format!("{UNKNOWN_METHOD_PREFIX}{method}"))
+}
 
-    log::warn!("[rpc:dispatch] unknown_method method={}", method);
-    Err(format!("unknown method: {method}"))
+/// Prefix of the error string returned for an unrecognised RPC method. Kept as
+/// a shared constant so the emit site (above) and the transport-layer
+/// classifier ([`unknown_method_name`]) cannot drift apart.
+pub const UNKNOWN_METHOD_PREFIX: &str = "unknown method: ";
+
+/// Known non-actionable unknown method names that are debug-only.
+///
+/// Most entries are generic external probes that are never real RPC methods
+/// and never will be (issue #3567): `rpc.discover` (JSON-RPC service
+/// discovery), `list_methods`, liveness `status`, `auth.status`, `config/get`.
+/// This also covers retired feature calls from older clients when no safe
+/// canonical handler exists (#3565: `openhuman.memory_tree_create_namespace`).
+///
+/// `openhuman.harness_init_status` (#5157) is in the list for a *different*
+/// reason and must not be read as retired — it is a **live, registered**
+/// method (`harness_init::all_harness_init_registered_controllers`, tagged
+/// `DomainGroup::Platform`). It only misses when the caller and the running
+/// core disagree about the surface: an older core behind a newer UI bundle, a
+/// runtime `DomainSet` without `Platform` (e.g. `DomainSet::harness()`), or a
+/// slim feature build. Those are legitimate configurations, not core defects,
+/// so the miss stays debug-only — but do **not** delete the controller on the
+/// strength of this entry. `harness_init_status_is_registered_in_a_full_build`
+/// below pins that the method really is served, so a genuine regression fails
+/// a test instead of being silently swallowed by this allow-list.
+///
+/// Each miss previously produced recurring Sentry events with zero user
+/// impact. The transport layer keeps these debug-only (never captured). The
+/// matching health-method *aliases* land separately in `legacy_aliases`
+/// (#3566), which depends on this severity change.
+const KNOWN_PROBE_METHODS: &[&str] = &[
+    "rpc.discover",
+    "list_methods",
+    "status",
+    "auth.status",
+    "config/get",
+    "openhuman.memory_tree_create_namespace",
+    "openhuman.harness_init_status",
+];
+
+/// Returns `true` when `method` is a known non-actionable unknown method name
+/// from [`KNOWN_PROBE_METHODS`]. Matched against the *resolved* method name
+/// (after legacy-alias rewrite), i.e. the name embedded in the
+/// [`UNKNOWN_METHOD_PREFIX`] error string.
+pub fn is_known_probe_method(method: &str) -> bool {
+    KNOWN_PROBE_METHODS.contains(&method)
+}
+
+/// Extracts the offending method name from an unknown-method error string, or
+/// `None` if `message` is not an unknown-method error. The transport layer uses
+/// this to classify the failure for Sentry severity without re-deriving the
+/// method from the request (which may differ post legacy-alias rewrite).
+pub fn unknown_method_name(message: &str) -> Option<&str> {
+    message.strip_prefix(UNKNOWN_METHOD_PREFIX)
 }
 
 /// Handles internal core-level RPC methods.
@@ -76,15 +161,72 @@ pub async fn dispatch(
 fn try_core_dispatch(
     state: &AppState,
     method: &str,
-    _params: serde_json::Value,
+    params: serde_json::Value,
 ) -> Option<Result<InvocationResult, String>> {
     match method {
         "core.ping" => Some(InvocationResult::ok(json!({ "ok": true }))),
         "core.version" => Some(InvocationResult::ok(
             json!({ "version": state.core_version }),
         )),
+        "core.events_subscribe_token" => Some(handle_events_subscribe_token(params)),
         _ => None,
     }
+}
+
+/// Mint a single-shot bind token for the SSE `/events` stream.
+///
+/// Browser `EventSource` cannot attach an `Authorization` header, so an
+/// authenticated holder of the per-process RPC bearer first asks for a
+/// short-lived token here (this RPC is gated by the same bearer-token
+/// middleware as the rest of `/rpc`) and then opens
+/// `/events?client_id=<id>&token=<bind>`. The `/events` handler removes
+/// the token from the store on first use, so a leaked URL cannot be
+/// replayed by a second subscriber.
+fn handle_events_subscribe_token(params: serde_json::Value) -> Result<InvocationResult, String> {
+    let obj = params.as_object();
+    let client_id = obj
+        .and_then(|m| m.get("client_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            log::warn!(
+                "[events-bind] reject mint: missing or empty client_id (param_keys={:?})",
+                obj.map(|m| m.keys().collect::<Vec<_>>())
+            );
+            "missing or empty 'client_id' parameter".to_string()
+        })?;
+    let ttl = obj
+        .and_then(|m| m.get("ttl_secs"))
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_secs);
+
+    let issued =
+        crate::core::event_bind_tokens::issue(client_id.to_string(), ttl).ok_or_else(|| {
+            log::warn!(
+                "[events-bind] reject mint: store at capacity (client_id_len={} ttl_secs={:?})",
+                client_id.len(),
+                ttl.map(|d| d.as_secs())
+            );
+            "events bind-token store at capacity; try again shortly".to_string()
+        })?;
+
+    let ttl_remaining_secs = issued
+        .valid_until
+        .checked_duration_since(std::time::Instant::now())
+        .unwrap_or_default()
+        .as_secs();
+
+    log::debug!(
+        "[events-bind] minted token for client_id_len={} ttl_secs={}",
+        client_id.len(),
+        ttl_remaining_secs
+    );
+
+    InvocationResult::ok(json!({
+        "token": issued.token,
+        "ttl_secs": ttl_remaining_secs,
+    }))
 }
 
 async fn try_registry_dispatch(
@@ -128,6 +270,38 @@ fn type_name(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+
+    /// Holds the shared config-env lock while an RPC handler reads the active
+    /// workspace. The controller path loads and may initialize config, so it
+    /// cannot safely share another test's transient workspace.
+    struct WorkspaceEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl WorkspaceEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let lock = crate::openhuman::config::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("OPENHUMAN_WORKSPACE");
+            std::env::set_var("OPENHUMAN_WORKSPACE", path);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for WorkspaceEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("OPENHUMAN_WORKSPACE", value),
+                None => std::env::remove_var("OPENHUMAN_WORKSPACE"),
+            }
+        }
+    }
 
     fn test_state() -> AppState {
         AppState {
@@ -161,6 +335,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_rewrites_legacy_alias_before_lookup() {
+        // `openhuman.ping` is a legacy alias for `core.ping` in the shared
+        // alias table. Going through the dispatcher must rewrite it and
+        // route successfully to Tier 1 instead of falling through to the
+        // unknown-method error path.
+        let out = dispatch(test_state(), "openhuman.ping", json!({}))
+            .await
+            .expect("legacy alias openhuman.ping must resolve to core.ping");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
     async fn dispatch_unknown_method_returns_error() {
         let err = dispatch(test_state(), "does.not.exist", json!({}))
             .await
@@ -181,6 +367,8 @@ mod tests {
     async fn dispatch_delegates_to_tier2_for_domain_method() {
         // Tier 2 dispatcher handles `openhuman.security_policy_info`, so
         // it must succeed and return a policy object.
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let _workspace_env = WorkspaceEnvGuard::set(workspace.path());
         let out = dispatch(test_state(), "openhuman.security_policy_info", json!({}))
             .await
             .expect("security_policy_info should route via tier 2");
@@ -215,5 +403,112 @@ mod tests {
             .expect("core.version must produce InvocationResult");
         assert_eq!(result.value, json!({ "version": "0.0.0-abc" }));
         assert!(result.logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_legacy_ping_rewrites_and_succeeds() {
+        let out = dispatch(test_state(), "openhuman.ping", json!({}))
+            .await
+            .expect("openhuman.ping should be rewritten to core.ping and succeed");
+        assert_eq!(out, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn is_known_probe_method_matches_allow_list_exactly() {
+        // Every allow-listed probe / legacy health name is recognised.
+        for m in [
+            "rpc.discover",
+            "list_methods",
+            "status",
+            "auth.status",
+            "config/get",
+            "openhuman.memory_tree_create_namespace",
+            "openhuman.harness_init_status",
+        ] {
+            assert!(
+                is_known_probe_method(m),
+                "{m} should be a debug-only known miss"
+            );
+        }
+        // Genuinely-unknown methods and near-misses are NOT allow-listed, so
+        // they stay on the warn-for-triage path rather than being silenced.
+        assert!(!is_known_probe_method("does.not.exist"));
+        assert!(!is_known_probe_method("core.not_a_real_method"));
+        assert!(!is_known_probe_method("Status")); // case-sensitive
+        assert!(!is_known_probe_method("rpc.discover.extra")); // exact match only
+        assert!(!is_known_probe_method("memory_tree_create_namespace"));
+        assert!(!is_known_probe_method(""));
+    }
+
+    /// `openhuman.harness_init_status` is allow-listed as a debug-only miss so
+    /// client/core surface skew stops paging Sentry (#5157) — but it is a
+    /// **live** method, not a retired one. That allow-list entry means a
+    /// genuine regression (controller dropped from the registry) would go
+    /// completely silent: no error, no warn, no Sentry event. This test is the
+    /// replacement signal — if the method stops being served in a full build,
+    /// this fails instead of the regression shipping unnoticed.
+    #[test]
+    fn harness_init_status_is_registered_in_a_full_build() {
+        let served: Vec<String> = crate::core::all::all_controller_schemas()
+            .iter()
+            .map(crate::core::all::rpc_method_name)
+            .collect();
+        assert!(
+            served.iter().any(|m| m == "openhuman.harness_init_status"),
+            "harness_init_status must remain a registered controller — it is \
+             allow-listed in KNOWN_PROBE_METHODS for client/core skew only, so \
+             losing the real handler would be silently swallowed"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channels")]
+    async fn dispatch_dotted_channel_list_aliases_route_to_registry() {
+        for method in ["channels.list", "openhuman.channels.list"] {
+            let out = dispatch(test_state(), method, json!({}))
+                .await
+                .unwrap_or_else(|err| panic!("{method} should route via channels_list: {err}"));
+            assert!(
+                out.is_array() || out.get("result").is_some(),
+                "expected {method} to return the channels_list payload, got {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_method_name_extracts_from_error_string_only() {
+        // The classifier round-trips the exact string `dispatch` emits.
+        let err = format!("{UNKNOWN_METHOD_PREFIX}rpc.discover");
+        assert_eq!(unknown_method_name(&err), Some("rpc.discover"));
+        // Unrelated error strings are not misclassified as unknown-method.
+        assert_eq!(unknown_method_name("unknown param 'x' for ns.fn"), None);
+        assert_eq!(unknown_method_name("Session expired"), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_probe_method_still_returns_unknown_method_error() {
+        // Allow-listed probe names must not be silently "handled" — the caller
+        // still gets a method-not-found error. Only the Sentry severity (in the
+        // transport layer) changes; the dispatch contract is unchanged.
+        let err = dispatch(test_state(), "rpc.discover", json!({}))
+            .await
+            .expect_err("probe methods are still unknown to the dispatcher");
+        assert_eq!(unknown_method_name(&err), Some("rpc.discover"));
+        assert!(is_known_probe_method(
+            unknown_method_name(&err).expect("unknown-method error")
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_legacy_alias_routes_to_registry() {
+        // This alias targets a controller registered in the domain registry.
+        // Do not invoke it here: its implementation can persist default config,
+        // which makes this routing test depend on a filesystem workspace.
+        let method =
+            crate::core::legacy_aliases::resolve_legacy("openhuman.get_analytics_settings");
+        assert!(
+            crate::core::all::schema_for_rpc_method(method).is_some(),
+            "legacy alias must resolve to a registered controller: {method}"
+        );
     }
 }

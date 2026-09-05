@@ -1,5 +1,53 @@
+import type { ReactNode } from 'react';
+import { LuLightbulb } from 'react-icons/lu';
+
+import { cn } from '../../lib/cn';
+import { useT } from '../../lib/i18n/I18nContext';
 import type { ActionableItem, ActionableItemSource, TimeGroup } from '../../types/intelligence';
+import Button from '../ui/Button';
+import NativeSelect from '../ui/NativeSelect';
+import TextField from '../ui/TextField';
 import { ActionableCard } from './ActionableCard';
+
+/**
+ * Frosted state panel used for this tab's loading / analyzing / empty states.
+ *
+ * Replaces the former `.glass` CSS class, which was deleted along with the rest
+ * of the bespoke component layer in `index.css`. The values here are a faithful
+ * port of it — `blur(12px)` (`backdrop-blur-lg`), `rgb(var(--surface) / 0.8)`,
+ * a `rgb(var(--line) / 0.6)` hairline, and the light/dark shadow pair. The two
+ * shadow alphas were hardcoded in the original rule too; they are not a new
+ * themeability hole, but they are the one part of this that will not follow a
+ * custom theme.
+ *
+ * It exists as a component rather than a shared class string because all three
+ * call sites also share the medallion + heading + hint structure. `Card` and
+ * `EmptyState` from `components/ui` were both considered and neither fits:
+ * `Card` has no translucency and imposes its own heading/divider structure,
+ * `EmptyState` is bare text with no icon slot.
+ */
+function GlassStatePanel({ icon, children }: { icon: ReactNode; children: ReactNode }) {
+  return (
+    <div
+      className={cn(
+        'backdrop-blur-lg bg-surface/80 border border-line/60',
+        'shadow-[0_2px_8px_rgba(0,0,0,0.06)] dark:shadow-[0_2px_8px_rgba(0,0,0,0.4)]',
+        'rounded-2xl p-8 text-center animate-fade-up'
+      )}>
+      <div className="w-16 h-16 mx-auto mb-4 flex items-center justify-center rounded-full bg-primary-500/10">
+        {icon}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Indeterminate ring used by the loading and analyzing states. */
+function PanelSpinner() {
+  return (
+    <div className="w-8 h-8 border-2 border-primary-400 border-t-transparent rounded-full animate-spin" />
+  );
+}
 
 interface IntelligenceMemoryTabProps {
   handleAnalyzeNow: () => Promise<void>;
@@ -32,106 +80,83 @@ export default function IntelligenceMemoryTab({
   timeGroups,
   usingMemoryData,
 }: IntelligenceMemoryTabProps) {
+  const { t } = useT();
   return (
     <>
       <div className="flex items-center gap-3 mb-6 animate-fade-up">
         <div className="flex-1">
           <label htmlFor="actionable-search" className="sr-only">
-            Search actionable items
+            {t('memory.searchAria')}
           </label>
-          <input
+          <TextField
             id="actionable-search"
             type="text"
-            placeholder="Search actionable items..."
+            placeholder={t('memory.search')}
             value={searchFilter}
             onChange={e => setSearchFilter(e.target.value)}
-            className="w-full px-3 py-2 text-sm bg-white border border-stone-200 rounded-lg text-stone-900 placeholder-stone-400 focus:outline-none focus:border-primary-500/50 transition-colors"
+            className="w-full"
           />
         </div>
         <label htmlFor="actionable-source" className="sr-only">
-          Filter by source
+          {t('memory.sourceFilterAria')}
         </label>
-        <select
+        <NativeSelect
           id="actionable-source"
           value={sourceFilter}
-          onChange={e => setSourceFilter(e.target.value as ActionableItemSource | 'all')}
-          className="px-3 py-2 text-sm bg-white border border-stone-200 rounded-lg text-stone-900 focus:outline-none focus:border-primary-500/50 transition-colors">
-          <option value="all">All Sources</option>
-          <option value="email">Email</option>
-          <option value="calendar">Calendar</option>
-          <option value="telegram">Telegram</option>
-          <option value="ai_insight">AI Insights</option>
-          <option value="system">System</option>
-          <option value="trading">Trading</option>
-          <option value="security">Security</option>
-        </select>
+          onChange={e => setSourceFilter(e.target.value as ActionableItemSource | 'all')}>
+          <option value="all">{t('memory.sourceFilter.all')}</option>
+          <option value="email">{t('memory.sourceFilter.email')}</option>
+          <option value="calendar">{t('memory.sourceFilter.calendar')}</option>
+          <option value="telegram">{t('memory.sourceFilter.telegram')}</option>
+          <option value="ai_insight">{t('memory.sourceFilter.aiInsight')}</option>
+          <option value="system">{t('memory.sourceFilter.system')}</option>
+          <option value="trading">{t('memory.sourceFilter.trading')}</option>
+          <option value="security">{t('memory.sourceFilter.security')}</option>
+        </NativeSelect>
       </div>
 
       {itemsLoading && !usingMemoryData ? (
-        <div className="glass rounded-2xl p-8 text-center animate-fade-up">
-          <div className="w-16 h-16 mx-auto mb-4 flex items-center justify-center rounded-full bg-primary-500/10">
-            <div className="w-8 h-8 border-2 border-primary-400 border-t-transparent rounded-full animate-spin" />
-          </div>
-          <h2 className="text-lg font-semibold text-stone-900 mb-2">Loading Intelligence...</h2>
-          <p className="text-stone-400 text-sm">Fetching your actionable items</p>
-        </div>
+        <GlassStatePanel icon={<PanelSpinner />}>
+          <h2 className="text-lg font-semibold text-content mb-2">{t('memory.loading')}</h2>
+          <p className="text-content-faint text-sm">{t('memory.fetching')}</p>
+        </GlassStatePanel>
       ) : isRunning && items.length === 0 ? (
-        <div className="glass rounded-2xl p-8 text-center animate-fade-up">
-          <div className="w-16 h-16 mx-auto mb-4 flex items-center justify-center rounded-full bg-primary-500/10">
-            <div className="w-8 h-8 border-2 border-primary-400 border-t-transparent rounded-full animate-spin" />
-          </div>
-          <h2 className="text-lg font-semibold text-stone-900 mb-2">Analyzing your data…</h2>
-          <p className="text-stone-400 text-sm">
-            The conscious loop is reviewing your connected skills
-          </p>
-        </div>
+        <GlassStatePanel icon={<PanelSpinner />}>
+          <h2 className="text-lg font-semibold text-content mb-2">{t('memory.analyzing')}</h2>
+          <p className="text-content-faint text-sm">{t('memory.analyzingHint')}</p>
+        </GlassStatePanel>
       ) : timeGroups.length === 0 ? (
-        <div className="glass rounded-2xl p-8 text-center animate-fade-up">
-          <div className="w-16 h-16 mx-auto mb-4 flex items-center justify-center rounded-full bg-primary-500/10">
-            <svg
-              className="w-8 h-8 text-primary-400"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"
-              />
-            </svg>
-          </div>
+        <GlassStatePanel icon={<LuLightbulb className="w-8 h-8 text-primary-400" />}>
           {searchFilter || sourceFilter !== 'all' ? (
             <>
-              <h2 className="text-lg font-semibold text-stone-900 mb-2">No matches</h2>
-              <p className="text-stone-400 text-sm">No items match your current filters.</p>
+              <h2 className="text-lg font-semibold text-content mb-2">{t('memory.noMatches')}</h2>
+              <p className="text-content-faint text-sm">{t('memory.noMatchesHint')}</p>
             </>
           ) : usingMemoryData ? (
             <>
-              <h2 className="text-lg font-semibold text-stone-900 mb-2">All caught up!</h2>
-              <p className="text-stone-400 text-sm">No actionable items at the moment.</p>
+              <h2 className="text-lg font-semibold text-content mb-2">{t('memory.allCaughtUp')}</h2>
+              <p className="text-content-faint text-sm">{t('memory.allCaughtUpHint')}</p>
             </>
           ) : (
             <>
-              <h2 className="text-lg font-semibold text-stone-900 mb-2">No analysis yet</h2>
-              <p className="text-stone-400 text-sm mb-4">
-                Run an analysis to extract actionable items from your connected skills.
-              </p>
-              <button
+              <h2 className="text-lg font-semibold text-content mb-2">{t('memory.noAnalysis')}</h2>
+              <p className="text-content-faint text-sm mb-4">{t('memory.noAnalysisHint')}</p>
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => void handleAnalyzeNow()}
-                disabled={isRunning}
-                className="px-4 py-2 bg-primary-500 hover:bg-primary-600 disabled:opacity-40 text-white text-sm rounded-lg transition-colors">
-                Analyze Now
-              </button>
+                disabled={isRunning}>
+                {t('memory.analyzeNow')}
+              </Button>
             </>
           )}
-        </div>
+        </GlassStatePanel>
       ) : (
         <div className="space-y-6">
           {isRunning && (
-            <div className="flex items-center gap-2 text-xs text-stone-400 animate-fade-up">
-              <div className="w-3 h-3 border border-stone-400 border-t-transparent rounded-full animate-spin" />
-              Analyzing your data…
+            <div className="flex items-center gap-2 text-xs text-content-faint animate-fade-up">
+              <div className="w-3 h-3 border border-line-strong border-t-transparent rounded-full animate-spin" />
+              {t('memory.analyzing')}
             </div>
           )}
           {timeGroups.map((group, groupIndex) => (
@@ -140,8 +165,8 @@ export default function IntelligenceMemoryTab({
               className="animate-fade-up"
               style={{ animationDelay: `${groupIndex * 50}ms` }}>
               <div className="flex items-center justify-between mb-3">
-                <h2 className="text-sm font-semibold text-stone-900 opacity-80">{group.label}</h2>
-                <div className="text-xs bg-stone-100 text-stone-900 px-2 py-1 rounded-full">
+                <h2 className="text-sm font-semibold text-content opacity-80">{group.label}</h2>
+                <div className="text-xs bg-surface-subtle text-content px-2 py-1 rounded-full">
                   {group.count}
                 </div>
               </div>

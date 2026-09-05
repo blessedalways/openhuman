@@ -126,3 +126,7 @@ fn handle_write_file(params: Map<String, Value>) -> ControllerFuture {
         to_json(rpc::ai_write_memory_file(payload).await?)
     })
 }
+
+#[cfg(test)]
+#[path = "files_tests.rs"]
+mod tests;

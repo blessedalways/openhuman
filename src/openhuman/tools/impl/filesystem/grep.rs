@@ -6,12 +6,13 @@
 //! same path-sandboxing + rate-limiting as `file_read`.
 
 use crate::openhuman::security::SecurityPolicy;
-use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
+use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
+use tinytools::ToolRunContext;
 use walkdir::WalkDir;
 
 const DEFAULT_MAX_MATCHES: usize = 200;
@@ -77,6 +78,25 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: ToolCallOptions,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, context).await
+    }
+}
+
+impl GrepTool {
+    async fn execute_in_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -97,11 +117,6 @@ impl Tool for GrepTool {
                 "Rate limit exceeded: too many actions in the last hour",
             ));
         }
-        if !self.security.is_path_allowed(sub_path) {
-            return Ok(ToolResult::error(format!(
-                "Path not allowed by security policy: {sub_path}"
-            )));
-        }
         if !self.security.record_action() {
             return Ok(ToolResult::error(
                 "Rate limit exceeded: action budget exhausted",
@@ -113,19 +128,15 @@ impl Tool for GrepTool {
             Err(e) => return Ok(ToolResult::error(format!("Invalid regex: {e}"))),
         };
 
-        let root = self.security.workspace_dir.join(sub_path);
-        let resolved_root = match tokio::fs::canonicalize(&root).await {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Failed to resolve path: {e}"))),
-        };
-        if !self.security.is_resolved_path_allowed(&resolved_root) {
-            return Ok(ToolResult::error(format!(
-                "Resolved path escapes workspace: {}",
-                resolved_root.display()
-            )));
-        }
+        let path_policy = super::security_for_tool_context(&self.security, context, "grep");
 
-        let workspace = self.security.workspace_dir.clone();
+        // Security check: validate path string, resolve symlinks, confirm workspace containment.
+        let resolved_root = match path_policy.validate_path(sub_path).await {
+            Ok(p) => p,
+            Err(msg) => return Ok(ToolResult::error(msg)),
+        };
+
+        let workspace = path_policy.action_dir.clone();
         let result = tokio::task::spawn_blocking(move || {
             scan_for_matches(&resolved_root, &workspace, &regex, max_matches)
         })
@@ -193,17 +204,14 @@ fn scan_for_matches(
         let rel = path.strip_prefix(workspace).unwrap_or(path);
         for (lineno, line) in contents.lines().enumerate() {
             if regex.is_match(line) {
-                let display_line = if line.len() > MAX_LINE_BYTES {
-                    // Walk back to a UTF-8 char boundary; slicing `&str` at a
-                    // non-boundary byte panics at runtime.
-                    let mut cut = MAX_LINE_BYTES;
-                    while cut > 0 && !line.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    format!("{}…", &line[..cut])
-                } else {
-                    line.to_string()
-                };
+                // `MAX_LINE_BYTES` is a BYTE budget — use the byte-aware
+                // helper. The earlier migration to `truncate_with_suffix`
+                // mis-typed this as a char budget; for multi-byte text
+                // (CJK / emoji) the rendered line could balloon to ~3×
+                // the intended cap. Per CodeRabbit critical review on
+                // PR #1549.
+                let display_line =
+                    crate::openhuman::util::truncate_at_byte_boundary(line, MAX_LINE_BYTES);
                 matches.push(format!("{}:{}:{}", rel.display(), lineno + 1, display_line));
                 if matches.len() >= max_matches {
                     truncated = true;
@@ -223,147 +231,5 @@ fn is_skipped(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
-
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace,
-            ..SecurityPolicy::default()
-        })
-    }
-
-    #[test]
-    fn grep_name_and_schema() {
-        let tool = GrepTool::new(test_security(std::env::temp_dir()));
-        assert_eq!(tool.name(), "grep");
-        let schema = tool.parameters_schema();
-        assert!(schema["properties"]["pattern"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("pattern")));
-    }
-
-    #[tokio::test]
-    async fn grep_finds_matches() {
-        let dir = std::env::temp_dir().join("openhuman_test_grep_finds");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("a.txt"), "alpha\nbravo\ncharlie")
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("b.txt"), "alpha2").await.unwrap();
-
-        let tool = GrepTool::new(test_security(dir.clone()));
-        let result = tool.execute(json!({"pattern": "^alpha"})).await.unwrap();
-        assert!(!result.is_error);
-        let output = result.output();
-        assert!(output.contains("a.txt:1:alpha"));
-        assert!(output.contains("b.txt:1:alpha2"));
-        assert!(!output.contains("bravo"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn grep_invalid_regex() {
-        let dir = std::env::temp_dir().join("openhuman_test_grep_invalid");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let tool = GrepTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"pattern": "([unclosed"}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("Invalid regex"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn grep_case_insensitive() {
-        let dir = std::env::temp_dir().join("openhuman_test_grep_ci");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("c.txt"), "Hello World")
-            .await
-            .unwrap();
-
-        let tool = GrepTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"pattern": "hello", "case_insensitive": true}))
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert!(result.output().contains("c.txt:1:Hello World"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn grep_blocks_path_traversal() {
-        let tool = GrepTool::new(test_security(std::env::temp_dir()));
-        let result = tool
-            .execute(json!({"pattern": ".", "path": "../.."}))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("not allowed"));
-    }
-
-    #[tokio::test]
-    async fn grep_skips_node_modules_and_git() {
-        let dir = std::env::temp_dir().join("openhuman_test_grep_skip");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("node_modules"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(dir.join(".git")).await.unwrap();
-        tokio::fs::write(dir.join("node_modules/x.txt"), "needle")
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join(".git/x.txt"), "needle")
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("real.txt"), "needle")
-            .await
-            .unwrap();
-
-        let tool = GrepTool::new(test_security(dir.clone()));
-        let result = tool.execute(json!({"pattern": "needle"})).await.unwrap();
-        assert!(!result.is_error);
-        let output = result.output();
-        assert!(output.contains("real.txt"));
-        assert!(!output.contains("node_modules"));
-        assert!(!output.contains(".git"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn grep_respects_max_matches() {
-        let dir = std::env::temp_dir().join("openhuman_test_grep_max");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let mut text = String::new();
-        for _ in 0..50 {
-            text.push_str("hit\n");
-        }
-        tokio::fs::write(dir.join("many.txt"), text).await.unwrap();
-
-        let tool = GrepTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"pattern": "hit", "max_matches": 5}))
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert!(result.output().contains("truncated"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-}
+#[path = "grep_tests.rs"]
+mod tests;

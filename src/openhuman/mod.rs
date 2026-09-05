@@ -14,64 +14,62 @@
 // Many types/functions are intended for future use or integration with the frontend.
 #![allow(dead_code)]
 
-pub mod about_app;
-pub mod accessibility;
 pub mod agent;
-pub mod app_state;
-pub mod approval;
-pub mod autocomplete;
-pub mod billing;
 pub mod channels;
-pub mod composio;
 pub mod config;
-pub mod context;
-pub mod cost;
-pub mod credentials;
 pub mod cron;
-pub mod dev_paths;
-pub mod doctor;
-pub mod embeddings;
-pub mod encryption;
-pub mod health;
-pub mod heartbeat;
+pub mod desktop;
+#[cfg(feature = "flows")]
+pub mod flows;
+/// User-authored hooks — `hooks.json` scripts that observe and gate the agent.
+/// Kernel surface, never gated: the whole point is a policy seam a slim build
+/// still honours, and it costs nothing when nothing is configured.
+pub mod hooks;
+pub mod hosted;
+// Hosting: the `hosting_*` tools that put a workspace on a real hosting
+// provider, over the `tinyhosts` unified model. Leaf gate — when `hosting` is
+// off the domain is not compiled and the tools are absent from the registry
+// rather than degraded to an error (see `tools::ops`).
+#[cfg(feature = "hosting")]
+pub mod hosting;
+// The whole http_host domain is an axum static-directory server, so it is
+// exclusive to the `http-server` feature (#5048). Its only outside reference is
+// the controller-registration push in `core::all`, itself gated in lockstep, so
+// no stub facade is needed — a slim build simply omits the `http_host.*` RPC
+// surface (unknown-method over `/rpc`, absent from `/schema`).
+#[cfg(feature = "http-server")]
+pub mod http_host;
+pub mod inference;
 pub mod integrations;
-pub mod learning;
-pub mod local_ai;
-pub mod meet;
-pub mod meet_agent;
+// Vendor-neutral JSON Schema / JSON value walking, shared by the Composio
+// catalog and the tinyflows capability adapters. Deliberately owned by neither:
+// if it lived in either, the other would need a dependency edge into it, and
+// one of those directions is the back-edge the kernelization work removes.
+// Ungated — `composio` is always compiled, `tinyflows` is behind `flows`.
+pub mod json_schema;
+// Ungated family root: `mcp/http_client` is always compiled, and the
+// `server`/`registry`/`audit` facades each need their `stub` to resolve in an
+// `mcp`-less build. The gate is pushed onto each member inside `mcp/mod.rs`.
+pub mod mcp;
+// Both children (`generation`, `image`) are wholly gated, so the parent is a
+// leaf gate — a slim build omits the family outright.
+#[cfg(feature = "media")]
+pub mod media;
+pub mod medulla;
 pub mod memory;
-pub mod migration;
-pub mod node_runtime;
-pub mod notifications;
-pub mod overlay;
-pub mod people;
-pub mod prompt_injection;
-pub mod provider_surfaces;
-pub mod providers;
-pub mod redirect_links;
-pub mod referral;
-pub mod routing;
-pub mod scheduler_gate;
-pub mod screen_intelligence;
+#[cfg(feature = "modules")]
+pub mod modules;
+pub mod platform;
+pub mod runtime;
+pub mod sandbox;
+pub mod search;
 pub mod security;
-pub mod service;
 pub mod skills;
-pub mod socket;
-pub mod subconscious;
-pub mod team;
-pub mod text_input;
+#[cfg(feature = "e2e-test-support")]
+pub mod test_support;
 pub mod threads;
-pub mod tokenjuice;
-pub mod tool_timeout;
 pub mod tools;
-pub mod tree_summarizer;
-pub mod update;
 pub mod util;
 pub mod voice;
-pub mod wallet;
-pub mod webhooks;
-pub mod webview_accounts;
-pub mod webview_apis;
-pub mod webview_notifications;
-pub mod whatsapp_data;
-pub mod workspace;
+pub mod web3;
+pub mod web_chat;

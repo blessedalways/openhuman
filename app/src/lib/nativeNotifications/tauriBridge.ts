@@ -1,18 +1,23 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
 import debug from 'debug';
+
+// `safeInvoke` (aliased to `invoke`) replaces bare
+// `@tauri-apps/api/core::invoke` so the CEF `window.ipc.postMessage`
+// synchronous throw (Sentry TAURI-REACT-7 / TAURI-REACT-6) is converted into
+// a rejected Promise that the existing try/catch chains already handle.
+import { safeInvoke as invoke, isTauri } from '../../utils/tauriCommands/common';
 
 const log = debug('native-notifications:bridge');
 const errLog = debug('native-notifications:bridge:error');
 
 export type NotificationPermissionState = 'not_tauri' | 'granted' | 'denied' | 'prompt' | 'unknown';
 
-export interface ShowNativeNotificationArgs {
+interface ShowNativeNotificationArgs {
   title: string;
   body: string;
   tag?: string;
 }
 
-export interface ShowNativeNotificationResult {
+interface ShowNativeNotificationResult {
   delivered: boolean;
   reason?: 'not_tauri' | 'send_failed';
   error?: string;

@@ -1,23 +1,45 @@
 //! Event-bus subscriber that mirrors inbound channel messages into the
 //! workspace-backed conversation store, so non-web channels (Slack, Telegram,
 //! etc.) persist alongside UI-driven threads.
+//!
+//! # The engine's `bus.rs` is not this file, and did not replace it (#5560)
+//!
+//! When the conversation store lived in the memory engine it carried a second
+//! subscriber of its own. That one existed only because the engine could not
+//! name the host's channel layer: it declared a `ConversationEventBus` trait
+//! for a host to implement, a self-contained `ChannelEvent` enum standing in
+//! for `DomainEvent::ChannelMessage*`, and an inlined copy of
+//! `conversation_history_key`'s thread-id derivation — with a comment
+//! promising the copy stayed byte-identical to this one.
+//!
+//! No host ever implemented that trait. This file has always been the live
+//! subscriber, wired to `crate::core::bus::BUS` and calling the real
+//! [`conversation_history_key`], and moving the store home means the
+//! abstraction has nothing left to abstract. So the engine's version stayed
+//! where it was and only the store import below changed. Two things follow:
+//! there is exactly one thread-id derivation again rather than a copy and a
+//! promise, and this file's behaviour is untouched by the move — which matters,
+//! because it decides the id under which channel turns are persisted.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
-use crate::core::event_bus::{DomainEvent, EventHandler, SubscriptionHandle};
-use crate::openhuman::channels::context::conversation_history_key;
-use crate::openhuman::channels::traits::ChannelMessage;
+use crate::core::events::DomainEvent;
+use tinybus::EventHandler;
+use tinybus::SubscriptionHandle;
+use tinychannels_bus::context::conversation_history_key;
+use tinychannels_bus::ChannelMessage;
 
 use super::{
     append_message, ensure_thread, get_messages, ConversationMessage, CreateConversationThread,
 };
 
 static CONVERSATION_PERSISTENCE_HANDLE: OnceLock<SubscriptionHandle> = OnceLock::new();
+static CONVERSATION_PERSISTENCE_WORKSPACE: OnceLock<Arc<RwLock<PathBuf>>> = OnceLock::new();
 
 const LOG_PREFIX: &str = "[memory:conversations:bus]";
 
@@ -26,13 +48,24 @@ const LOG_PREFIX: &str = "[memory:conversations:bus]";
 /// This bridges typed channel events onto the workspace-backed JSONL
 /// conversation store so non-web channels persist alongside UI threads.
 pub fn register_conversation_persistence_subscriber(workspace_dir: PathBuf) {
+    let workspace = CONVERSATION_PERSISTENCE_WORKSPACE
+        .get_or_init(|| Arc::new(RwLock::new(workspace_dir.clone())));
+    match workspace.write() {
+        Ok(mut guard) => {
+            *guard = workspace_dir;
+        }
+        Err(error) => {
+            log::warn!("{LOG_PREFIX} failed to update workspace binding: {error}");
+        }
+    }
+
     if CONVERSATION_PERSISTENCE_HANDLE.get().is_some() {
         return;
     }
 
-    match crate::core::event_bus::subscribe_global(Arc::new(
-        ConversationPersistenceSubscriber::new(workspace_dir),
-    )) {
+    match crate::core::bus::BUS.subscribe(Arc::new(ConversationPersistenceSubscriber::new_shared(
+        Arc::clone(workspace),
+    ))) {
         Some(handle) => {
             let _ = CONVERSATION_PERSISTENCE_HANDLE.set(handle);
         }
@@ -45,17 +78,30 @@ pub fn register_conversation_persistence_subscriber(workspace_dir: PathBuf) {
 }
 
 pub struct ConversationPersistenceSubscriber {
-    workspace_dir: PathBuf,
+    workspace_dir: Arc<RwLock<PathBuf>>,
 }
 
 impl ConversationPersistenceSubscriber {
     pub fn new(workspace_dir: PathBuf) -> Self {
+        Self {
+            workspace_dir: Arc::new(RwLock::new(workspace_dir)),
+        }
+    }
+
+    fn new_shared(workspace_dir: Arc<RwLock<PathBuf>>) -> Self {
         Self { workspace_dir }
+    }
+
+    fn workspace_dir_snapshot(&self) -> Result<PathBuf, String> {
+        self.workspace_dir
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|error| format!("workspace binding poisoned: {error}"))
     }
 }
 
 #[async_trait]
-impl EventHandler for ConversationPersistenceSubscriber {
+impl EventHandler<DomainEvent> for ConversationPersistenceSubscriber {
     fn name(&self) -> &str {
         "memory::conversations::persistence"
     }
@@ -73,19 +119,42 @@ impl EventHandler for ConversationPersistenceSubscriber {
                 reply_target,
                 content,
                 thread_ts,
+                inbound_envelope,
+                workspace_dir,
             } => {
+                let my_workspace = match self.workspace_dir_snapshot() {
+                    Ok(d) => d,
+                    Err(error) => {
+                        log::warn!("{LOG_PREFIX} failed to resolve workspace: {error}");
+                        return;
+                    }
+                };
+                if *workspace_dir != my_workspace {
+                    log::debug!(
+                        "{LOG_PREFIX} dropping stale-workspace event \
+                         event_ws={} self_ws={}",
+                        workspace_dir.display(),
+                        my_workspace.display()
+                    );
+                    return;
+                }
                 if let Err(error) = persist_channel_turn(
-                    &self.workspace_dir,
+                    &my_workspace,
                     ChannelTurnDescriptor {
                         channel,
                         message_id,
                         sender,
                         reply_target,
                         thread_ts: thread_ts.as_deref(),
+                        tinychannels_session_key: inbound_envelope
+                            .as_ref()
+                            .map(tinychannels_session_key),
                         content,
                         role: "user",
                         success: None,
                         elapsed_ms: None,
+                        model_provider: None,
+                        model: None,
                         source: "channel_received",
                     },
                 ) {
@@ -104,22 +173,44 @@ impl EventHandler for ConversationPersistenceSubscriber {
                 reply_target,
                 thread_ts,
                 response,
+                provider,
+                model,
                 elapsed_ms,
                 success,
+                workspace_dir,
                 ..
             } => {
+                let my_workspace = match self.workspace_dir_snapshot() {
+                    Ok(d) => d,
+                    Err(error) => {
+                        log::warn!("{LOG_PREFIX} failed to resolve workspace: {error}");
+                        return;
+                    }
+                };
+                if *workspace_dir != my_workspace {
+                    log::debug!(
+                        "{LOG_PREFIX} dropping stale-workspace event \
+                         event_ws={} self_ws={}",
+                        workspace_dir.display(),
+                        my_workspace.display()
+                    );
+                    return;
+                }
                 if let Err(error) = persist_channel_turn(
-                    &self.workspace_dir,
+                    &my_workspace,
                     ChannelTurnDescriptor {
                         channel,
                         message_id,
                         sender,
                         reply_target,
                         thread_ts: thread_ts.as_deref(),
+                        tinychannels_session_key: None,
                         content: response,
                         role: "assistant",
                         success: Some(*success),
                         elapsed_ms: Some(*elapsed_ms),
+                        model_provider: Some(provider),
+                        model: Some(model),
                         source: "channel_processed",
                     },
                 ) {
@@ -142,10 +233,13 @@ struct ChannelTurnDescriptor<'a> {
     sender: &'a str,
     reply_target: &'a str,
     thread_ts: Option<&'a str>,
+    tinychannels_session_key: Option<String>,
     content: &'a str,
     role: &'a str,
     success: Option<bool>,
     elapsed_ms: Option<u64>,
+    model_provider: Option<&'a str>,
+    model: Option<&'a str>,
     source: &'a str,
 }
 
@@ -174,7 +268,8 @@ fn persist_channel_turn(
             title,
             created_at: created_at.clone(),
             parent_thread_id: None,
-            labels: Some(vec!["work".to_string()]),
+            labels: Some(vec!["general".to_string()]),
+            personality_id: None,
         },
     )?;
 
@@ -204,9 +299,12 @@ fn persist_channel_turn(
                 "channelSender": descriptor.sender,
                 "replyTarget": descriptor.reply_target,
                 "threadTs": descriptor.thread_ts,
+                "tinychannelsSessionKey": descriptor.tinychannels_session_key,
                 "sourceEvent": descriptor.source,
                 "success": descriptor.success,
                 "elapsedMs": descriptor.elapsed_ms,
+                "modelProvider": descriptor.model_provider,
+                "model": descriptor.model,
                 "sourceMessageId": descriptor.message_id,
             }),
             sender: descriptor.role.to_string(),
@@ -221,6 +319,14 @@ fn persist_channel_turn(
         descriptor.role
     );
     Ok(())
+}
+
+fn tinychannels_session_key(envelope: &tinychannels_bus::ChannelInboundEnvelope) -> String {
+    tinychannels_bus::build_session_key_for_inbound_envelope(
+        "main",
+        envelope,
+        tinychannels_bus::channel::SessionKeyPolicy::default(),
+    )
 }
 
 fn persisted_channel_thread_id(
@@ -265,107 +371,5 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use tempfile::TempDir;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn persists_inbound_and_processed_turns_into_workspace_thread() {
-        let temp = TempDir::new().expect("tempdir");
-        let subscriber = ConversationPersistenceSubscriber::new(temp.path().to_path_buf());
-
-        subscriber
-            .handle(&DomainEvent::ChannelMessageReceived {
-                channel: "slack".into(),
-                message_id: "m1".into(),
-                sender: "alice".into(),
-                reply_target: "general".into(),
-                content: "hello".into(),
-                thread_ts: Some("thread-1".into()),
-            })
-            .await;
-        subscriber
-            .handle(&DomainEvent::ChannelMessageProcessed {
-                channel: "slack".into(),
-                message_id: "m1".into(),
-                sender: "alice".into(),
-                reply_target: "general".into(),
-                content: "hello".into(),
-                thread_ts: Some("thread-1".into()),
-                response: "hi there".into(),
-                elapsed_ms: 42,
-                success: true,
-            })
-            .await;
-
-        let threads = super::super::list_threads(temp.path().to_path_buf()).expect("threads");
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "channel:slack_alice_general_thread:thread-1");
-
-        let messages = super::super::get_messages(temp.path().to_path_buf(), &threads[0].id)
-            .expect("messages");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].id, "user:m1");
-        assert_eq!(messages[0].sender, "user");
-        assert_eq!(messages[1].id, "assistant:m1");
-        assert_eq!(messages[1].sender, "assistant");
-        assert_eq!(messages[1].extra_metadata["elapsedMs"], 42);
-        assert_eq!(messages[1].extra_metadata["success"], true);
-    }
-
-    #[tokio::test]
-    async fn telegram_thread_ts_does_not_split_persisted_thread() {
-        let temp = TempDir::new().expect("tempdir");
-        let subscriber = ConversationPersistenceSubscriber::new(temp.path().to_path_buf());
-
-        subscriber
-            .handle(&DomainEvent::ChannelMessageReceived {
-                channel: "telegram".into(),
-                message_id: "m1".into(),
-                sender: "alice".into(),
-                reply_target: "chat-1".into(),
-                content: "hello".into(),
-                thread_ts: Some("100".into()),
-            })
-            .await;
-        subscriber
-            .handle(&DomainEvent::ChannelMessageReceived {
-                channel: "telegram".into(),
-                message_id: "m2".into(),
-                sender: "alice".into(),
-                reply_target: "chat-1".into(),
-                content: "follow-up".into(),
-                thread_ts: Some("200".into()),
-            })
-            .await;
-
-        let threads = super::super::list_threads(temp.path().to_path_buf()).expect("threads");
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "channel:telegram_alice_chat-1");
-    }
-
-    #[tokio::test]
-    async fn duplicate_events_do_not_append_duplicate_messages() {
-        let temp = TempDir::new().expect("tempdir");
-        let subscriber = ConversationPersistenceSubscriber::new(temp.path().to_path_buf());
-
-        let event = DomainEvent::ChannelMessageReceived {
-            channel: "discord".into(),
-            message_id: "m1".into(),
-            sender: "alice".into(),
-            reply_target: "room-1".into(),
-            content: "hello".into(),
-            thread_ts: None,
-        };
-
-        subscriber.handle(&event).await;
-        subscriber.handle(&event).await;
-
-        let messages =
-            super::super::get_messages(temp.path().to_path_buf(), "channel:discord_alice_room-1")
-                .expect("messages");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].id, "user:m1");
-    }
-}
+#[path = "bus_tests.rs"]
+mod tests;

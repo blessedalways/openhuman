@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 
-const REQUIRED_FILES = ['AGENTS.md', 'docs/src/README.md', 'Cargo.toml', 'app/package.json'];
+const REQUIRED_FILES = ['AGENTS.md', 'gitbooks/developing/README.md', 'Cargo.toml', 'app/package.json'];
 const APP_PATTERNS = [/^app\//, /^docs\//];
 const ROOT_RUST_PATTERNS = [/^src\//, /^tests\//, /^Cargo\.toml$/, /^Cargo\.lock$/];
 const TAURI_PATTERNS = [/^app\/src-tauri\//];
@@ -16,6 +16,36 @@ function runGit(command, repoRoot) {
   return execSync(command, { cwd: repoRoot, encoding: 'utf8' }).trim();
 }
 
+function currentRepoRoot() {
+  const physical = process.cwd();
+  const logical = process.env.PWD;
+  if (logical && path.resolve(logical) !== path.resolve(physical)) {
+    try {
+      if (fs.realpathSync(logical) === physical) return logical;
+    } catch {
+      // Fall back to Node's physical cwd below.
+    }
+  }
+  return physical;
+}
+
+function usage() {
+  return [
+    'Usage: node scripts/codex-pr-preflight.mjs [--lightweight] [--strict-path]',
+    '',
+    'Checks the current checkout for Codex PR preflight requirements and prints',
+    'recommended validation commands for the changed files.',
+    '',
+    'Options:',
+    '  --lightweight   Skip the heavier "pnpm debug rust" recommendation for Rust changes.',
+    '  --strict-path   Assert the checkout lives at the expected repo path.',
+    '  -h, --help      Show this help and exit.',
+    '',
+    'Environment:',
+    '  CODEX_EXPECT_REPO_PATH   Expected repo path for --strict-path (default /workspace/openhuman).',
+  ].join('\n');
+}
+
 function parseArgs(argv) {
   return {
     lightweight: argv.includes('--lightweight'),
@@ -26,6 +56,22 @@ function parseArgs(argv) {
 
 function runCheck(label, ok, details = '') {
   return { label, ok, details };
+}
+
+function sameFilesystemPath(left, right) {
+  let resolvedLeft;
+  let resolvedRight;
+  try {
+    resolvedLeft = fs.realpathSync(left);
+  } catch {
+    resolvedLeft = path.resolve(left);
+  }
+  try {
+    resolvedRight = fs.realpathSync(right);
+  } catch {
+    resolvedRight = path.resolve(right);
+  }
+  return resolvedLeft === resolvedRight;
 }
 
 function summarize(checks) {
@@ -56,13 +102,18 @@ function recommendations(changedFiles, lightweight) {
 }
 
 function main() {
-  const options = parseArgs(process.argv.slice(2));
-  const repoRoot = process.cwd();
+  const argv = process.argv.slice(2);
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(usage());
+    process.exit(0);
+  }
+  const options = parseArgs(argv);
+  const repoRoot = currentRepoRoot();
   const checks = [];
 
   checks.push(runCheck('working directory exists', fs.existsSync(repoRoot), repoRoot));
   if (options.strictPath) {
-    checks.push(runCheck('expected repo path', path.resolve(repoRoot) === path.resolve(options.expectedPath), `expected ${options.expectedPath}, got ${repoRoot}`));
+    checks.push(runCheck('expected repo path', sameFilesystemPath(repoRoot, options.expectedPath), `expected ${options.expectedPath}, got ${repoRoot}`));
   }
 
   for (const file of REQUIRED_FILES) {

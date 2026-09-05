@@ -11,13 +11,15 @@
 //! rather than a full copy.
 
 use crate::openhuman::agent::progress::AgentProgress;
+use crate::openhuman::agent::tinyagents::TurnModelSource;
 use crate::openhuman::config::AgentConfig;
 use crate::openhuman::memory::Memory;
-use crate::openhuman::providers::Provider;
-use crate::openhuman::skills::Skill;
+use crate::openhuman::skills::Workflow;
 use crate::openhuman::tools::{Tool, ToolSpec};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tinyagents_harness::workspace::WorkspaceDescriptor;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Parent execution context
@@ -31,9 +33,17 @@ use std::sync::Arc;
 /// is essentially free.
 #[derive(Clone)]
 pub struct ParentExecutionContext {
-    /// Parent's provider — sub-agents call into the same instance so
-    /// connection pools, retry budgets, and credentials are shared.
-    pub provider: Arc<dyn Provider>,
+    /// Canonical registry id of the parent agent definition.
+    pub agent_definition_id: String,
+
+    /// Subagent ids this parent is allowed to spawn directly through the
+    /// generic `spawn_subagent` tool. Empty means no generic subagent spawns.
+    pub allowed_subagent_ids: HashSet<String>,
+
+    /// Parent's model source — sub-agents build off the same source so
+    /// connection pools, retry budgets, and credentials are shared (issue #4249,
+    /// Phase 3 / Motion A; replaces the raw `Arc<dyn Provider>`).
+    pub turn_model_source: TurnModelSource,
 
     /// Parent's full tool registry. The sub-agent runner re-filters this
     /// per-archetype before handing it to the sub-agent's tool loop.
@@ -44,6 +54,17 @@ pub struct ParentExecutionContext {
     /// provider for prefix-cache reuse.
     pub all_tool_specs: Arc<Vec<ToolSpec>>,
 
+    /// Names of the tools the parent actually advertises and will execute this
+    /// turn. Consumers that recommend or directly invoke parent tools consult
+    /// this role-specific surface.
+    pub visible_tool_names: std::collections::HashSet<String>,
+
+    /// Explicit profile/channel ceiling inherited by child agents. This is not
+    /// the parent's role-specific visible surface: an orchestrator may delegate
+    /// file writes to a code specialist without advertising `file_write`
+    /// itself. Empty means no inherited restriction.
+    pub subagent_tool_ceiling_names: std::collections::HashSet<String>,
+
     /// Model name the parent is currently using (after classification).
     pub model_name: String,
 
@@ -52,6 +73,13 @@ pub struct ParentExecutionContext {
 
     /// Working directory of the parent agent.
     pub workspace_dir: PathBuf,
+
+    /// TinyAgents workspace descriptor currently active for this parent turn.
+    /// Tool-boundary spawns pass descriptors explicitly through
+    /// `SubagentRunOptions`; this ambient field is only a fallback for
+    /// internal/background fanout paths that already inherit the parent runtime
+    /// through this task-local.
+    pub workspace_descriptor: Option<WorkspaceDescriptor>,
 
     /// Parent's memory backing store. Sub-agents share it for read access
     /// but skip the per-turn context injection to save tokens — the
@@ -62,9 +90,9 @@ pub struct ParentExecutionContext {
     /// dispatcher choice, …).
     pub agent_config: AgentConfig,
 
-    /// Skills loaded into the parent. Sub-agents that don't strip the
-    /// skills catalog inherit this list.
-    pub skills: Arc<Vec<Skill>>,
+    /// Workflows loaded into the parent. Sub-agents that don't strip the
+    /// workflows catalog inherit this list.
+    pub workflows: Arc<Vec<Workflow>>,
 
     /// Memory context loaded for the current turn. Auto-injected into
     /// subagent prompts so they have access to conversation history and
@@ -80,16 +108,7 @@ pub struct ParentExecutionContext {
     pub channel: String,
 
     /// Active Composio integrations the parent has fetched.
-    pub connected_integrations: Vec<crate::openhuman::context::prompt::ConnectedIntegration>,
-
-    /// Composio client — populated alongside `connected_integrations`
-    /// when the parent agent fetches its integration list. Used by the
-    /// sub-agent runner to dynamically construct per-action
-    /// [`ComposioActionTool`](crate::openhuman::composio::ComposioActionTool)
-    /// entries at spawn time when `integrations_agent` is scoped to a
-    /// specific toolkit. `None` when the user isn't signed in to
-    /// Composio or the backend was unreachable.
-    pub composio_client: Option<crate::openhuman::composio::ComposioClient>,
+    pub connected_integrations: Vec<crate::openhuman::agent::context::prompt::ConnectedIntegration>,
 
     /// The parent's active tool-call format (Native / PFormat / Json).
     /// Sub-agents render their system prompts with this format so the
@@ -98,7 +117,7 @@ pub struct ParentExecutionContext {
     /// this, sub-agents inherit a hardcoded PFormat default while the
     /// runtime uses native function-calling, and the model emits
     /// uncallable P-Format tool_call blocks.
-    pub tool_call_format: crate::openhuman::context::prompt::ToolCallFormat,
+    pub tool_call_format: crate::openhuman::agent::context::prompt::ToolCallFormat,
 
     /// Parent's own session-transcript key, formatted as
     /// `"{unix_ts}_{agent_id}"`. Sub-agents chain this (plus any
@@ -123,6 +142,18 @@ pub struct ParentExecutionContext {
     /// progress (e.g. CLI direct calls); the runner becomes a no-op for
     /// child progress in that case.
     pub on_progress: Option<tokio::sync::mpsc::Sender<AgentProgress>>,
+
+    /// Parent's active run queue. Tools that create background event sources
+    /// use this to inject concise collect-context at the same safe iteration
+    /// boundary as web-channel queue messages.
+    pub run_queue: Option<Arc<crate::openhuman::agent::harness::run_queue::RunQueue>>,
+}
+
+/// A context-preparation source that already ran for the current parent turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextPreparedSource {
+    pub source: String,
+    pub has_enough_context: Option<bool>,
 }
 
 tokio::task_local! {
@@ -130,6 +161,12 @@ tokio::task_local! {
     /// tool invocation that happens outside an agent turn (e.g. CLI/RPC
     /// direct tool calls); `spawn_subagent` rejects in that case.
     pub static PARENT_CONTEXT: ParentExecutionContext;
+
+    /// Context-preparation sources that already ran for this parent turn.
+    /// Tools such as `agent_prepare_context` use this to avoid spawning a
+    /// second context scout after the harness has already prepared context.
+    ///
+    pub static AGENT_CONTEXT_PREPARED_SOURCES: Arc<Vec<AgentContextPreparedSource>>;
 }
 
 /// Returns a clone of the current parent execution context, if one is set.
@@ -145,5 +182,33 @@ pub async fn with_parent_context<F, R>(ctx: ParentExecutionContext, future: F) -
 where
     F: std::future::Future<Output = R>,
 {
-    PARENT_CONTEXT.scope(ctx, future).await
+    // Box before `scope` so only a pointer moves into the task-local frame
+    // rather than the whole nested turn generator — see the measurements on
+    // `with_turn_collector` in `turn_subagent_usage.rs`.
+    PARENT_CONTEXT.scope(ctx, Box::pin(future)).await
+}
+
+/// Returns the one-shot context-preparation sources that have already run for
+/// the current parent turn (a snapshot of the live list).
+pub fn current_agent_context_prepared_sources() -> Vec<AgentContextPreparedSource> {
+    AGENT_CONTEXT_PREPARED_SOURCES
+        .try_with(|sources| sources.as_ref().clone())
+        .unwrap_or_default()
+}
+
+/// Run `future` with the current turn's already-prepared context sources
+/// installed.
+pub async fn with_agent_context_prepared_sources<F, R>(
+    sources: Vec<AgentContextPreparedSource>,
+    future: F,
+) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    // Box before `scope` so only a pointer moves into the task-local frame
+    // rather than the whole nested turn generator — see the measurements on
+    // `with_turn_collector` in `turn_subagent_usage.rs`.
+    AGENT_CONTEXT_PREPARED_SOURCES
+        .scope(Arc::new(sources), Box::pin(future))
+        .await
 }

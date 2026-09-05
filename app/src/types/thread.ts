@@ -8,6 +8,7 @@ export interface Thread {
   createdAt: string;
   parentThreadId?: string;
   labels: string[];
+  personalityId?: string | null;
 }
 
 export interface ThreadMessage {
@@ -29,26 +30,8 @@ export interface ThreadMessagesData {
   count: number;
 }
 
-export interface ThreadCreateData {
-  id: string;
-}
-
 export interface ThreadDeleteData {
   deleted: boolean;
-}
-
-/** Response from POST /chat/sendMessage — send user message and get agent reply */
-export interface SendMessageResponseData {
-  // Optional: backend can return empty {} or e.g. { messageId: string }
-  [key: string]: unknown;
-}
-
-export interface PurgeRequestBody {
-  messages: boolean;
-  agentThreads: boolean;
-  deleteEverything: boolean;
-  deleteFrom?: string;
-  deleteTo?: string;
 }
 
 export interface PurgeResultData {

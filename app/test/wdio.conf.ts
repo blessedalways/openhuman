@@ -5,110 +5,150 @@ import { fileURLToPath } from 'url';
 
 import { captureFailureArtifacts } from './e2e/helpers/artifacts';
 
+/**
+ * WDIO config — a single `tauri-driver` (WebDriver) session against the
+ * app's native Wry/WebKit webview.
+ *
+ * The Appium Chromium-driver backend that attached over CEF's remote-debugging
+ * port was removed in #5478: CDP only exists under a Chromium engine, and the
+ * app moved to Wry in #5456.
+ *
+ * The runner script (`scripts/e2e-run-session.sh`) is responsible for:
+ *   1. Starting `tauri-driver` and waiting for its `/status` endpoint.
+ *   2. Invoking `wdio` against this config.
+ *
+ * WDIO creates ONE session per worker. With `maxInstances: 1` and no
+ * cross-spec teardown, all specs run sequentially in the same session,
+ * against the same app process — no restart cost between spec files.
+ * Tests are intentionally order-dependent: state from spec N flows into
+ * spec N+1. Each spec is responsible for any reset it requires.
+ */
+
 const configDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(configDir, '..');
-const repoRoot = path.resolve(projectRoot, '..');
 const tsconfigE2ePath = path.join(projectRoot, 'test', 'tsconfig.e2e.json');
 const testSpecsPath = path.join(projectRoot, 'test', 'e2e', 'specs', '**', '*.spec.ts');
 
-/**
- * Resolve the path to the built Tauri application.
- *
- * - macOS: .app bundle for Appium Mac2
- * - Linux: debug binary for tauri-driver
- * - Windows: .exe for tauri-driver
- */
-function getAppPath(): string {
-  const bundleBases = [
-    path.join(projectRoot, 'src-tauri', 'target', 'debug', 'bundle'),
-    path.join(repoRoot, 'target', 'debug', 'bundle'),
-  ];
-
-  switch (process.platform) {
-    case 'darwin': {
-      for (const base of bundleBases) {
-        const appPath = path.join(base, 'macos', 'OpenHuman.app');
-        if (fs.existsSync(appPath)) {
-          return appPath;
-        }
-      }
-      return path.join(bundleBases[0], 'macos', 'OpenHuman.app');
-    }
-    case 'win32':
-      return path.join(projectRoot, 'src-tauri', 'target', 'debug', 'OpenHuman.exe');
-    case 'linux': {
-      // tauri-driver launches the binary directly (not a bundle).
-      // Prefer the Tauri build output (src-tauri/target) over the repo-root
-      // target/ which may contain a stale core-only binary.
-      const candidates = [
-        path.join(projectRoot, 'src-tauri', 'target', 'debug', 'OpenHuman'),
-        path.join(repoRoot, 'target', 'debug', 'OpenHuman'),
-      ];
-      for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) return candidate;
-      }
-      return candidates[0];
-    }
-    default:
-      throw new Error(`Unsupported platform: ${process.platform}`);
-  }
+function linuxAppPath(): string {
+  const candidate = path.join(projectRoot, 'src-tauri', 'target', 'debug', 'OpenHuman');
+  if (fs.existsSync(candidate)) return candidate;
+  return candidate;
 }
 
-/**
- * Build capabilities for the current platform.
- *
- * - Linux: tauri-driver (W3C WebDriver, port 4444)
- * - macOS: Appium Mac2 (XCUITest, port 4723)
- */
-function getPlatformCapabilities(): Record<string, unknown>[] {
-  if (process.platform === 'linux') {
-    return [{ 'tauri:options': { application: getAppPath() } }];
+// Admin base for the shared mock backend. The runner exports BACKEND_URL to
+// the mock; fall back to the E2E_MOCK_PORT default the runner scripts use.
+const MOCK_ADMIN_BASE =
+  process.env.BACKEND_URL || `http://127.0.0.1:${process.env.E2E_MOCK_PORT || 18473}`;
+
+// The mock backend carries module-level mutable state (conversations, cron
+// jobs, webhook triggers, request log, socket sessions). Specs run in ONE
+// ordered session and historically only reset it when a spec *remembered* to
+// call `/__admin/reset` in its own hook — so a spec that failed before its
+// reset poisoned the next spec file. Reset once at the start of every spec
+// file, unconditionally, so no spec can leak mock state into the next one.
+// Guarded by file path so nested `describe` blocks inside a file don't wipe
+// state mid-file (specs still build up state across their own `it`s).
+let lastResetSpecFile: string | null = null;
+
+async function resetMockBackendOncePerSpecFile(specFile: string | undefined): Promise<void> {
+  if (!specFile || specFile === lastResetSpecFile) return;
+  lastResetSpecFile = specFile;
+  try {
+    const res = await fetch(`${MOCK_ADMIN_BASE}/__admin/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!res.ok) {
+      console.warn(`[wdio] mock /__admin/reset returned ${res.status} for ${specFile}`);
+    }
+  } catch (err) {
+    // Best-effort: some lanes run specs that don't stand up the mock backend.
+    // Never fail the run on an unreachable mock — just record it.
+    console.warn(`[wdio] mock /__admin/reset skipped for ${specFile}: ${(err as Error).message}`);
   }
-
-  // macOS: Appium Mac2
-  return [
-    {
-      platformName: 'mac',
-      'appium:automationName': 'Mac2',
-      'appium:app': getAppPath(),
-      'appium:showServerLogs': true,
-    },
-  ];
 }
-
-/** Port for the automation driver: tauri-driver (4444) or Appium (4723). */
-const isLinuxDriver = process.platform === 'linux';
-const driverPort = isLinuxDriver
-  ? parseInt(process.env.TAURI_DRIVER_PORT || '4444', 10)
-  : parseInt(process.env.APPIUM_PORT || '4723', 10);
 
 export const config: Options.Testrunner & Record<string, unknown> = {
   runner: 'local',
   hostname: '127.0.0.1',
-  port: driverPort,
+  port: parseInt(process.env.TAURI_DRIVER_PORT || '4444', 10),
+  path: '/',
   specs: [testSpecsPath],
   rootDir: projectRoot,
-  maxInstances: 1, // Tauri apps are single-instance
-  capabilities: getPlatformCapabilities(),
+  // Single session — the app is one instance.
+  maxInstances: 1,
+  capabilities: [
+    {
+      'tauri:options': { application: linuxAppPath() },
+      // WDIO's per-capability ceiling is required by the Tauri driver.
+      // Without it, the runner can schedule one WebKit session per spec
+      // despite the global maxInstances: 1, causing simultaneous app
+      // resets and cascading startup timeouts.
+      'wdio:maxInstances': 1,
+    },
+  ],
   logLevel: 'warn',
-  bail: 0,
+  // `bail` is the number of failing specs to tolerate before WDIO stops the
+  // run. `--bail` on e2e-run-all-flows.sh sets E2E_BAIL_ON_FAILURE=1 so we
+  // flip this to 1 (= stop after the first failed spec).
+  bail: process.env.E2E_BAIL_ON_FAILURE === '1' ? 1 : 0,
+  // Linux shards retry failed specs in e2e-run-all-flows.sh after restarting
+  // tauri-driver and the app. Retrying here would reuse the same driver and
+  // turn a stuck POST /session into another two-minute timeout.
+  specFileRetries: 0,
+  specFileRetriesDeferred: true,
   waitforTimeout: 10_000,
-  // Linux tauri-driver can take longer to establish the initial session on
-  // loaded CI runners; keep macOS defaults while giving Linux more headroom.
-  connectionRetryTimeout: isLinuxDriver ? 240_000 : 120_000,
-  connectionRetryCount: isLinuxDriver ? 5 : 3,
-  // No appium/tauri-driver service — driver is started externally via scripts.
+  connectionRetryTimeout: 120_000,
+  connectionRetryCount: 3,
   framework: 'mocha',
   reporters: ['spec'],
   mochaOpts: {
     ui: 'bdd',
-    timeout: 120_000, // Billing/settings tests need extra time for API polling
+    // Under the native Linux driver, a reset after a tool-heavy spec can wait
+    // behind WebKit and core cleanup long enough to exceed one minute. Keep
+    // the historical two-minute suite budget; individual polling helpers
+    // still keep their own short, diagnostic timeouts.
+    timeout: 120_000,
   },
   autoCompileOpts: { tsNodeOpts: { project: tsconfigE2ePath } },
   /**
-   * Always capture screenshot + page source on failure so agents can
-   * inspect what the app looked like the moment the assertion failed.
+   * Switch the active window to the main OpenHuman app webview.
+   *
+   * The driver may hand back a handle for a non-app window, so pick the
+   * first whose URL contains `tauri.localhost`, falling back to the first
+   * non-`about:` one.
    */
+  before: async function () {
+    const handles = await browser.getWindowHandles();
+    let target: string | null = null;
+    for (const handle of handles) {
+      await browser.switchToWindow(handle);
+      const url = await browser.getUrl();
+      if (url.includes('tauri.localhost')) {
+        target = handle;
+        break;
+      }
+    }
+    if (!target) {
+      for (const handle of handles) {
+        await browser.switchToWindow(handle);
+        const url = await browser.getUrl();
+        if (!url.startsWith('about:')) {
+          target = handle;
+          break;
+        }
+      }
+    }
+    if (target) {
+      await browser.switchToWindow(target);
+    }
+  },
+  beforeSuite: async function (suite: { file?: string }) {
+    // Fires once per Mocha suite. The per-file guard makes the reset run only
+    // for the first suite encountered in each spec file.
+    await resetMockBackendOncePerSpecFile(suite?.file);
+  },
   afterTest: async function (
     test: { title: string; parent?: string },
     _context: unknown,

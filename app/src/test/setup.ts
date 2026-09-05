@@ -8,7 +8,7 @@
  * - Resets rate limiter module-level state between tests
  */
 import '@testing-library/jest-dom/vitest';
-import { cleanup } from '@testing-library/react';
+import { cleanup, configure } from '@testing-library/react';
 import type React from 'react';
 import { afterAll, afterEach, beforeEach, vi } from 'vitest';
 
@@ -19,6 +19,18 @@ import {
   startMockServer,
   stopMockServer,
 } from '../../../scripts/mock-api-core.mjs';
+
+// The full Vitest run is executed under v8 coverage instrumentation with a
+// single worker (see test/vitest.config.ts), which makes individual renders
+// markedly slower than an isolated, un-instrumented file run. Testing Library's
+// default 1000ms async-utility timeout is too tight in that environment, so
+// `findBy*`/`waitFor` assertions in render-heavy suites (e.g. the workflow
+// orchestration tab) flake intermittently — and which test trips first is
+// non-deterministic. Raising the global async-util budget removes that whole
+// class of false timeouts without masking real failures: `waitFor`/`findBy`
+// still resolve the instant their condition is met, this only widens the
+// ceiling before they give up (well within the 30s testTimeout).
+configure({ asyncUtilTimeout: 5000 });
 
 const DEFAULT_TEST_MOCK_API_PORT = 5005;
 
@@ -84,6 +96,24 @@ function ensureStorage(name: 'localStorage' | 'sessionStorage') {
 ensureStorage('localStorage');
 ensureStorage('sessionStorage');
 
+// Polyfill window.matchMedia — used by Rive (@rive-app/react-webgl2) and
+// some media-query hooks; not implemented in jsdom.
+if (typeof window.matchMedia === 'undefined') {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: vi.fn((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+}
+
 // Polyfill ResizeObserver for cmdk/Radix components in jsdom
 if (typeof globalThis.ResizeObserver === 'undefined') {
   globalThis.ResizeObserver = class ResizeObserver {
@@ -98,10 +128,82 @@ if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = function () {};
 }
 
+// assistant-ui's thread viewport scrolls after a send. jsdom exposes scroll
+// metrics but not the imperative `scrollTo` method used by that primitive.
+if (typeof HTMLElement !== 'undefined' && !HTMLElement.prototype.scrollTo) {
+  HTMLElement.prototype.scrollTo = function () {};
+}
+
+// Lexical measures the DOM selection after controlled composer updates. jsdom
+// implements Range but omits its layout methods.
+if (typeof Range !== 'undefined' && !Range.prototype.getBoundingClientRect) {
+  Range.prototype.getBoundingClientRect = () => new DOMRect();
+}
+if (typeof Range !== 'undefined' && !Range.prototype.getClientRects) {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+}
+
+// Polyfill the Pointer Capture API for Radix primitives in jsdom.
+// Radix's Select, Slider, Toggle and DropdownMenu call these unconditionally
+// on pointerdown; jsdom implements none of them, so without this the very
+// first pointer interaction throws instead of opening the control.
+if (typeof Element !== 'undefined' && !Element.prototype.hasPointerCapture) {
+  Element.prototype.hasPointerCapture = () => false;
+  Element.prototype.setPointerCapture = () => {};
+  Element.prototype.releasePointerCapture = () => {};
+}
+
+// Polyfill IntersectionObserver for Radix lazy-mount internals in jsdom.
+if (typeof globalThis.IntersectionObserver === 'undefined') {
+  globalThis.IntersectionObserver = class IntersectionObserver {
+    readonly root = null;
+    readonly rootMargin = '';
+    readonly thresholds: readonly number[] = [];
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+    takeRecords(): IntersectionObserverEntry[] {
+      return [];
+    }
+  } as unknown as typeof IntersectionObserver;
+}
+
+// Polyfill PointerEvent for @testing-library/user-event's pointer sequences
+// against Radix triggers. jsdom 28 still ships no PointerEvent constructor, so
+// user-event falls back to MouseEvent and Radix's pointer handlers never fire.
+if (typeof globalThis.PointerEvent === 'undefined') {
+  globalThis.PointerEvent = class PointerEvent extends MouseEvent {
+    readonly pointerId: number;
+    readonly pointerType: string;
+    readonly isPrimary: boolean;
+
+    constructor(type: string, params: PointerEventInit = {}) {
+      super(type, params);
+      this.pointerId = params.pointerId ?? 1;
+      this.pointerType = params.pointerType ?? 'mouse';
+      this.isPrimary = params.isPrimary ?? true;
+    }
+  } as unknown as typeof PointerEvent;
+}
+
+// The hardened `isTauri()` (in `utils/tauriCommands/common.ts`) checks both
+// `coreIsTauri()` and `window.__TAURI_INTERNALS__.invoke`. Many existing test
+// files mock `@tauri-apps/api/core::isTauri` to `true` to exercise the
+// Tauri branch; without a matching IPC handle on `window` they would now
+// regress to the non-Tauri path. Seed a no-op handle once globally so the
+// IPC-readiness check passes by default. Tests that *want* the CEF gap
+// behaviour can `delete window.__TAURI_INTERNALS__` in a `beforeEach`.
+(
+  window as unknown as { __TAURI_INTERNALS__: { invoke: () => Promise<unknown> } }
+).__TAURI_INTERNALS__ = { invoke: vi.fn(() => Promise.resolve()) };
+
 // Mock Tauri APIs (not available in test env)
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn(() => false) }));
 
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(), emit: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(vi.fn()),
+  emit: vi.fn(),
+}));
 
 vi.mock('@tauri-apps/plugin-deep-link', () => ({ onOpenUrl: vi.fn(), getCurrent: vi.fn() }));
 
@@ -133,7 +235,16 @@ vi.mock('../utils/tauriCommands', () => ({
     }),
   openhumanGetMeetSettings: vi
     .fn()
-    .mockResolvedValue({ result: { auto_orchestrator_handoff: false }, logs: [] }),
+    .mockResolvedValue({
+      result: {
+        auto_orchestrator_handoff: false,
+        auto_join_policy: 'ask_each_time',
+        auto_summarize_policy: 'ask',
+        listen_only_default: true,
+        ingest_backend_transcripts: false,
+      },
+      logs: [],
+    }),
   exchangeToken: vi.fn(),
   invoke: vi.fn(),
 }));
@@ -143,16 +254,40 @@ vi.mock('../utils/config', () => ({
   CORE_RPC_URL: 'http://127.0.0.1:7788/rpc',
   CORE_RPC_TIMEOUT_MS: 30_000,
   IS_DEV: true,
+  IS_DEV_LIKE: true,
   IS_PROD: false,
+  E2E_DEFAULT_CORE_MODE: '',
+  E2E_RESTART_APP_AS_RELOAD: false,
   DEV_FORCE_ONBOARDING: false,
+  CHAT_ATTACHMENTS_ENABLED: true,
+  DERIVED_TRANSCRIPT_ENABLED: true,
   SKILLS_GITHUB_REPO: 'test/skills',
+  GA_MEASUREMENT_ID: undefined,
+  OPENPANEL_API_URL: 'https://panel.tinyhumans.ai/api',
+  OPENPANEL_CLIENT_ID: undefined,
   SENTRY_DSN: undefined,
+  SENTRY_RELEASE: 'openhuman@test',
+  SENTRY_SMOKE_TEST: false,
   BACKEND_URL: mockApiUrl,
   TELEGRAM_BOT_USERNAME: 'openhuman_bot',
   LATEST_APP_DOWNLOAD_URL: 'https://github.com/tinyhumansai/openhuman/releases/latest',
+  OPENHUMAN_GITHUB_REPO_URL: 'https://github.com/tinyhumansai/openhuman',
   APP_VERSION: '0.0.0-test',
+  APP_BINARY_VERSION: '0.0.0-test',
+  APP_ENVIRONMENT: 'test',
+  BUILD_SHA: 'test',
+  CORE_CARGO_VERSION: '0.0.0-test',
+  TAURI_CARGO_VERSION: '0.0.0-test',
   DEV_JWT_TOKEN: undefined,
-  MASCOT_VOICE_ID: 'ljX1ZrXuDIIRVcmiVSyR',
+  MASCOT_VOICE_ID: 'JBFqnCBsd6RMkjVDRZzb',
+  MASCOT_VOICE_MODEL_ID: 'eleven_multilingual_v2',
+  MASCOT_MANIFEST_URL:
+    'https://raw.githubusercontent.com/tinyhumansai/mascots/main/dist/mascots.json',
+  VOICE_MODE_FLAG_ENABLED: false,
+  // Production defaults, so a test that does not care about the voice entry
+  // point sees what a shipped build sees.
+  HUMAN_VOICE_REALTIME_ENABLED: true,
+  HUMAN_VOICE_SHOW_BOTH: false,
 }));
 
 vi.mock('../services/backendUrl', () => ({
@@ -212,9 +347,14 @@ vi.mock('@sentry/react', () => ({
   setUser: vi.fn(),
 }));
 
-// Silence console during tests to keep output clean
+// Silence console during tests to keep output clean. `debug`/`info` are
+// included because error-path diagnostics across the app (e.g. VoicePanel
+// "voice settings load failed", threadSlice "title refresh failed") use
+// `console.debug`, which otherwise floods the test output with expected noise.
 if (!process.env.DEBUG_TESTS) {
   vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'info').mockImplementation(() => {});
+  vi.spyOn(console, 'debug').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 }
@@ -223,6 +363,13 @@ if (!process.env.DEBUG_TESTS) {
 afterEach(() => {
   clearRequestLog();
   cleanup();
+  // Re-seed the IPC handle after any test that may have deleted it
+  // (e.g. tests exercising the CEF-gap branch of `isTauri()`). Without
+  // this, sibling tests in the same jsdom worker would silently regress
+  // to the non-Tauri path. Per graycyrus review on PR #1556.
+  (
+    window as unknown as { __TAURI_INTERNALS__: { invoke: () => Promise<unknown> } }
+  ).__TAURI_INTERNALS__ = { invoke: vi.fn(() => Promise.resolve()) };
 });
 afterAll(async () => {
   await stopMockServer();

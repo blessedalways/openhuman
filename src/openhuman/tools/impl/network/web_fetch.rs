@@ -6,16 +6,14 @@
 //! the agent reaches for when researching: returns the response body
 //! as text, capped, with a tiny preamble (status + final URL).
 
-use super::url_guard::{normalize_allowed_domains, validate_url};
+use super::url_guard::{normalize_allowed_domains, validate_url_with_dns_check};
+use crate::openhuman::config::HttpRequestConfig;
 use crate::openhuman::security::SecurityPolicy;
 use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-
-const DEFAULT_MAX_BYTES: usize = 1_000_000;
-const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
@@ -31,11 +29,45 @@ impl WebFetchTool {
         max_bytes: Option<usize>,
         timeout_secs: Option<u64>,
     ) -> Self {
+        // Treat both `None` and `Some(0)` as "use default": callers wire these
+        // from `[http_request]`, and a 0-byte cap truncates every body to
+        // nothing while a 0-second timeout fails every request instantly.
+        // Stale-zero configs are repaired on load (migration 5→6); this clamp
+        // is the always-on guard at the point of use. Pull the fallbacks from
+        // `HttpRequestConfig::default()` so the tool shares one source with the
+        // schema + migration (no cross-layer drift). `Some(0)` is a genuine
+        // misconfiguration, so log it (grep-friendly, no payload); a bare
+        // `None` is a normal "use default" call and stays quiet.
+        let defaults = HttpRequestConfig::default();
+        let max_bytes = match max_bytes {
+            Some(0) => {
+                log::warn!(
+                    "[tool.web_fetch] coercing invalid limit field=max_bytes \
+                     from=0 to={} (stale/invalid config — see migration 5→6)",
+                    defaults.max_response_size
+                );
+                defaults.max_response_size
+            }
+            Some(n) => n,
+            None => defaults.max_response_size,
+        };
+        let timeout_secs = match timeout_secs {
+            Some(0) => {
+                log::warn!(
+                    "[tool.web_fetch] coercing invalid limit field=timeout_secs \
+                     from=0 to={} (stale/invalid config — see migration 5→6)",
+                    defaults.timeout_secs
+                );
+                defaults.timeout_secs
+            }
+            Some(n) => n,
+            None => defaults.timeout_secs,
+        };
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
-            max_bytes: max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
-            timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            max_bytes,
+            timeout_secs,
         }
     }
 }
@@ -109,10 +141,37 @@ impl Tool for WebFetchTool {
             ));
         }
 
-        let url = match validate_url(raw_url, &self.allowed_domains) {
+        // Local-only enforcement (privacy epic S7, #4441): refuse the fetch under
+        // LocalOnly before URL validation / DNS. The post-validation
+        // `emit_external_transfer` below stays the S2 disclosure point.
+        {
+            let host = reqwest::Url::parse(raw_url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Some(msg) = crate::openhuman::security::egress::local_only_tool_block(
+                &crate::openhuman::security::egress::EgressDescriptor::network_fetch(host),
+            ) {
+                return Ok(ToolResult::error(msg));
+            }
+        }
+
+        let url = match validate_url_with_dns_check(raw_url, &self.allowed_domains).await {
             Ok(u) => u,
             Err(e) => return Ok(ToolResult::error(format!("URL rejected: {e}"))),
         };
+
+        // Egress spine (privacy epic S2, #4436): disclose the fetch destination
+        // before contacting the host.
+        {
+            let host = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            crate::openhuman::security::egress::emit_external_transfer(
+                crate::openhuman::security::egress::EgressDescriptor::network_fetch(host),
+            );
+        }
 
         // Disable automatic redirect following: reqwest follows up to 10
         // redirects by default, and a redirect target may be on a host
@@ -154,10 +213,7 @@ impl Tool for WebFetchTool {
         }
 
         let (snippet, truncated) = if body.len() > max_bytes {
-            let mut cut = max_bytes;
-            while cut > 0 && !body.is_char_boundary(cut) {
-                cut -= 1;
-            }
+            let cut = crate::openhuman::util::floor_char_boundary(&body, max_bytes);
             (&body[..cut], true)
         } else {
             (body.as_str(), false)
@@ -174,45 +230,5 @@ impl Tool for WebFetchTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
-
-    fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
-    }
-
-    #[test]
-    fn web_fetch_name_and_schema() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], None, None);
-        assert_eq!(tool.name(), "web_fetch");
-        let schema = tool.parameters_schema();
-        assert!(schema["properties"]["url"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("url")));
-    }
-
-    #[tokio::test]
-    async fn web_fetch_rejects_disallowed_domain() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], None, None);
-        let result = tool
-            .execute(json!({ "url": "https://evil.test/path" }))
-            .await
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("URL rejected"));
-    }
-
-    #[tokio::test]
-    async fn web_fetch_rejects_invalid_url() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], None, None);
-        let result = tool.execute(json!({ "url": "not-a-url" })).await.unwrap();
-        assert!(result.is_error);
-    }
-}
+#[path = "web_fetch_tests.rs"]
+mod tests;

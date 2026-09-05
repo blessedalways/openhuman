@@ -13,7 +13,12 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::openhuman::config::Config;
-use crate::openhuman::voice::hotkey::{self, ActivationMode, HotkeyEvent};
+// The rdev-based listener (non-macOS) resolves the hotkey combo + activation mode
+// against the cross-platform `hotkey` module. macOS uses a separate path and
+// never compiles `start_rdev_listener`, so gate the import to avoid an unused
+// import warning there.
+#[cfg(not(target_os = "macos"))]
+use super::hotkey::{self, ActivationMode, HotkeyEvent};
 
 const LOG_PREFIX: &str = "[dictation_listener]";
 
@@ -92,6 +97,14 @@ pub fn publish_transcription(text: String) -> usize {
 /// Reads the `dictation` config section and registers the global hotkey.
 /// When the hotkey fires, publishes a `DictationEvent` to the broadcast
 /// channel that the Socket.IO bridge forwards to all connected clients.
+///
+/// **macOS note**: this function is a no-op on macOS. Starting with macOS 26,
+/// `TSMGetInputSourceProperty` is enforced to run on the main dispatch queue;
+/// rdev's CGEventTap callback fires on a background thread and crashes with
+/// `EXC_BREAKPOINT` (`dispatch_assert_queue_fail`) on the first key press. The
+/// Tauri host already registers the shortcut via `tauri-plugin-global-shortcut`
+/// (main-thread-safe) and emits `dictation://toggle` to the frontend, making
+/// the core-side rdev listener redundant on macOS. (#2677)
 pub async fn start_if_enabled(config: &Config) {
     if !config.dictation.enabled {
         log::info!("{LOG_PREFIX} dictation disabled in config, skipping hotkey listener");
@@ -104,13 +117,32 @@ pub async fn start_if_enabled(config: &Config) {
         return;
     }
 
+    // On macOS the rdev listener must not start: rdev's CGEventTap callback
+    // calls TSMGetInputSourceProperty off the main thread, crashing with
+    // EXC_BREAKPOINT on macOS 26 (dispatch_assert_queue_fail). The Tauri host
+    // handles this shortcut via tauri-plugin-global-shortcut instead. (#2677)
+    #[cfg(target_os = "macos")]
+    {
+        log::info!(
+            "{LOG_PREFIX} macOS: skipping rdev hotkey listener — \
+             handled by Tauri host via tauri-plugin-global-shortcut (issue #2677)"
+        );
+    }
+
+    // Non-macOS: start the rdev-based listener.
+    #[cfg(not(target_os = "macos"))]
+    start_rdev_listener(hotkey_str, config).await;
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn start_rdev_listener(hotkey_str: String, config: &Config) {
     // Map DictationActivationMode to our hotkey ActivationMode.
     let mode = match config.dictation.activation_mode {
         crate::openhuman::config::DictationActivationMode::Push => ActivationMode::Push,
         crate::openhuman::config::DictationActivationMode::Toggle => ActivationMode::Tap,
     };
 
-    // Normalize the hotkey string for rdev (CmdOrCtrl → cmd on macOS, ctrl on others).
+    // Normalize the hotkey string for rdev (CmdOrCtrl → ctrl on non-macOS).
     let normalized = normalize_hotkey_for_rdev(&hotkey_str);
 
     log::info!(
@@ -120,7 +152,7 @@ pub async fn start_if_enabled(config: &Config) {
     let combo = match hotkey::parse_hotkey(&normalized) {
         Ok(c) => c,
         Err(e) => {
-            log::error!("{LOG_PREFIX} failed to parse hotkey '{normalized}': {e}");
+            log::warn!("{LOG_PREFIX} failed to parse hotkey '{normalized}': {e}");
             return;
         }
     };
@@ -128,7 +160,7 @@ pub async fn start_if_enabled(config: &Config) {
     let (listener_handle, mut hotkey_rx) = match hotkey::start_listener(combo, mode) {
         Ok(pair) => pair,
         Err(e) => {
-            log::error!("{LOG_PREFIX} failed to start hotkey listener: {e}");
+            log::warn!("{LOG_PREFIX} failed to start hotkey listener: {e}");
             return;
         }
     };
@@ -211,123 +243,5 @@ fn normalize_hotkey_for_rdev(hotkey: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_cmdorctrl_macos() {
-        let result = normalize_hotkey_for_rdev("CmdOrCtrl+Shift+D");
-        if cfg!(target_os = "macos") {
-            assert_eq!(result, "cmd+shift+d");
-        } else {
-            assert_eq!(result, "ctrl+shift+d");
-        }
-    }
-
-    #[test]
-    fn normalize_plain_keys() {
-        assert_eq!(normalize_hotkey_for_rdev("Ctrl+Space"), "ctrl+space");
-    }
-
-    #[test]
-    fn normalize_preserves_structure() {
-        assert_eq!(normalize_hotkey_for_rdev("Alt+Shift+F5"), "alt+shift+f5");
-    }
-
-    #[test]
-    fn subscribe_returns_receiver() {
-        let _rx = subscribe_dictation_events();
-    }
-
-    #[test]
-    fn publish_dictation_event_reaches_subscriber() {
-        let mut rx = subscribe_dictation_events();
-        publish_dictation_event(DictationEvent {
-            event_type: "pressed".to_string(),
-            hotkey: "chat_button".to_string(),
-            activation_mode: "toggle".to_string(),
-        });
-        let evt = rx.try_recv().expect("should receive dictation event");
-        assert_eq!(evt.event_type, "pressed");
-        assert_eq!(evt.hotkey, "chat_button");
-    }
-
-    #[test]
-    fn publish_transcription_reaches_subscriber() {
-        let mut rx = subscribe_transcription_results();
-        publish_transcription("hello world".to_string());
-        let text = rx.try_recv().expect("should receive transcription");
-        assert_eq!(text, "hello world");
-    }
-
-    #[test]
-    fn normalize_commandorcontrol_alias() {
-        let result = normalize_hotkey_for_rdev("CommandOrControl+Alt+K");
-        if cfg!(target_os = "macos") {
-            assert_eq!(result, "cmd+alt+k");
-        } else {
-            assert_eq!(result, "ctrl+alt+k");
-        }
-    }
-
-    #[test]
-    fn dictation_event_serializes_wire_type_field() {
-        let evt = DictationEvent {
-            event_type: "released".to_string(),
-            hotkey: "fn".to_string(),
-            activation_mode: "push".to_string(),
-        };
-        let json = serde_json::to_value(evt).expect("serialize dictation event");
-        assert_eq!(json["type"], "released");
-        assert_eq!(json["hotkey"], "fn");
-        assert_eq!(json["activation_mode"], "push");
-    }
-
-    #[tokio::test]
-    async fn start_if_enabled_returns_early_when_config_disabled() {
-        // Fast path — `enabled=false` → the fn returns without spawning.
-        let mut config = Config::default();
-        config.dictation.enabled = false;
-        start_if_enabled(&config).await;
-        // No panic = pass. The absence of a spawned hotkey task is what
-        // we're verifying; hard to assert directly without internals.
-    }
-
-    #[tokio::test]
-    async fn start_if_enabled_returns_early_when_hotkey_empty() {
-        let mut config = Config::default();
-        config.dictation.enabled = true;
-        config.dictation.hotkey = String::new();
-        start_if_enabled(&config).await;
-    }
-
-    #[tokio::test]
-    async fn start_if_enabled_returns_early_when_hotkey_unparseable() {
-        let mut config = Config::default();
-        config.dictation.enabled = true;
-        config.dictation.hotkey = "not a real hotkey".into();
-        start_if_enabled(&config).await;
-    }
-
-    #[test]
-    fn normalize_maps_shift_and_alt_verbatim() {
-        let result = normalize_hotkey_for_rdev("Shift+Alt+D");
-        assert_eq!(result, "shift+alt+d");
-    }
-
-    #[test]
-    fn normalize_handles_lowercase_input() {
-        assert_eq!(normalize_hotkey_for_rdev("cmd+d"), "cmd+d");
-    }
-
-    #[test]
-    fn normalize_preserves_function_keys() {
-        assert_eq!(normalize_hotkey_for_rdev("F12"), "f12");
-    }
-
-    #[test]
-    fn normalize_trims_whitespace_between_segments() {
-        let result = normalize_hotkey_for_rdev("  cmd  + shift  +  d  ");
-        assert_eq!(result, "cmd+shift+d");
-    }
-}
+#[path = "dictation_listener_tests.rs"]
+mod tests;

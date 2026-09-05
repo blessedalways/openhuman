@@ -5,10 +5,11 @@
 //! directories, and symlinks. Path sandboxing matches `file_read`.
 
 use crate::openhuman::security::SecurityPolicy;
-use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
+use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use tinytools::ToolRunContext;
 
 const MAX_ENTRIES: usize = 1_000;
 
@@ -51,6 +52,25 @@ impl Tool for ListFilesTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        _options: ToolCallOptions,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_in_context(args, context).await
+    }
+}
+
+impl ListFilesTool {
+    async fn execute_in_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<&dyn ToolRunContext>,
+    ) -> anyhow::Result<ToolResult> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         if self.security.is_rate_limited() {
@@ -58,28 +78,18 @@ impl Tool for ListFilesTool {
                 "Rate limit exceeded: too many actions in the last hour",
             ));
         }
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult::error(format!(
-                "Path not allowed by security policy: {path}"
-            )));
-        }
         if !self.security.record_action() {
             return Ok(ToolResult::error(
                 "Rate limit exceeded: action budget exhausted",
             ));
         }
 
-        let full = self.security.workspace_dir.join(path);
-        let resolved = match tokio::fs::canonicalize(&full).await {
+        // Security check: validate path string, resolve symlinks, confirm workspace containment.
+        let path_policy = super::security_for_tool_context(&self.security, context, "list");
+        let resolved = match path_policy.validate_path(path).await {
             Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(format!("Failed to resolve path: {e}"))),
+            Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        if !self.security.is_resolved_path_allowed(&resolved) {
-            return Ok(ToolResult::error(format!(
-                "Resolved path escapes workspace: {}",
-                resolved.display()
-            )));
-        }
 
         let mut read = match tokio::fs::read_dir(&resolved).await {
             Ok(r) => r,
@@ -106,7 +116,7 @@ impl Tool for ListFilesTool {
                 Err(e) => {
                     return Ok(ToolResult::error(format!(
                         "Failed to enumerate directory: {e}"
-                    )))
+                    )));
                 }
             }
         }
@@ -125,58 +135,5 @@ impl Tool for ListFilesTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
-
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace,
-            ..SecurityPolicy::default()
-        })
-    }
-
-    #[test]
-    fn list_name() {
-        let tool = ListFilesTool::new(test_security(std::env::temp_dir()));
-        assert_eq!(tool.name(), "list");
-    }
-
-    #[tokio::test]
-    async fn list_lists_files_and_dirs() {
-        let dir = std::env::temp_dir().join("openhuman_test_list");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("sub")).await.unwrap();
-        tokio::fs::write(dir.join("a.txt"), "x").await.unwrap();
-
-        let tool = ListFilesTool::new(test_security(dir.clone()));
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.is_error);
-        let output = result.output();
-        assert!(output.contains("file\ta.txt"));
-        assert!(output.contains("dir\tsub"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn list_blocks_path_traversal() {
-        let tool = ListFilesTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "../../etc"})).await.unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("not allowed"));
-    }
-
-    #[tokio::test]
-    async fn list_missing_dir() {
-        let dir = std::env::temp_dir().join("openhuman_test_list_missing");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let tool = ListFilesTool::new(test_security(dir.clone()));
-        let result = tool.execute(json!({"path": "nope"})).await.unwrap();
-        assert!(result.is_error);
-        assert!(result.output().contains("Failed to resolve"));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-}
+#[path = "list_files_tests.rs"]
+mod tests;

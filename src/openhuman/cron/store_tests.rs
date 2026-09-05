@@ -7,6 +7,7 @@ use tempfile::TempDir;
 fn test_config(tmp: &TempDir) -> Config {
     let config = Config {
         workspace_dir: tmp.path().join("workspace"),
+        action_dir: tmp.path().join("workspace"),
         config_path: tmp.path().join("config.toml"),
         ..Config::default()
     };
@@ -79,12 +80,15 @@ fn due_jobs_filters_by_timestamp_and_enabled() {
 
     let job = add_job(&config, "* * * * *", "echo due").unwrap();
 
-    let due_now = due_jobs(&config, Utc::now()).unwrap();
-    assert!(due_now.is_empty(), "new job should not be due immediately");
+    let before_next_run = job.next_run - ChronoDuration::seconds(1);
+    let due_before_next_run = due_jobs(&config, before_next_run).unwrap();
+    assert!(
+        due_before_next_run.is_empty(),
+        "job should not be due before its next_run timestamp"
+    );
 
-    let far_future = Utc::now() + ChronoDuration::days(365);
-    let due_future = due_jobs(&config, far_future).unwrap();
-    assert_eq!(due_future.len(), 1, "job should be due in far future");
+    let due_at_next_run = due_jobs(&config, job.next_run).unwrap();
+    assert_eq!(due_at_next_run.len(), 1, "job should be due at next_run");
 
     let _ = update_job(
         &config,
@@ -95,8 +99,182 @@ fn due_jobs_filters_by_timestamp_and_enabled() {
         },
     )
     .unwrap();
-    let due_after_disable = due_jobs(&config, far_future).unwrap();
+    let due_after_disable = due_jobs(&config, job.next_run).unwrap();
     assert!(due_after_disable.is_empty());
+}
+
+#[test]
+fn agent_job_round_trips_profile_id_and_patch_clears_it() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Create an agent job attributed to a profile.
+    let job = add_agent_job_with_definition(
+        &config,
+        Some("attributed".into()),
+        Schedule::Cron {
+            expr: "0 9 * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "do the thing",
+        SessionTarget::Isolated,
+        None,
+        None,
+        false,
+        None,
+        true,
+        Some("alice".into()),
+    )
+    .unwrap();
+    assert_eq!(job.profile_id.as_deref(), Some("alice"));
+
+    // Reload from disk — the column round-trips.
+    let stored = get_job(&config, &job.id).unwrap();
+    assert_eq!(stored.profile_id.as_deref(), Some("alice"));
+
+    // Patch to a different profile.
+    let repointed = update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            profile_id: Some(Some("bob".into())),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(repointed.profile_id.as_deref(), Some("bob"));
+
+    // Patch with `Some(None)` clears the attribution; `None` leaves it untouched.
+    let cleared = update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            profile_id: Some(None),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(cleared.profile_id, None);
+
+    let untouched = update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            name: Some("renamed".into()),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(untouched.profile_id, None);
+    assert_eq!(untouched.name.as_deref(), Some("renamed"));
+}
+
+#[test]
+fn shell_job_has_no_profile_attribution() {
+    // Back-compat: shell jobs (and any job created without profile_id) load with
+    // profile_id = None.
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+    assert_eq!(job.profile_id, None);
+    assert_eq!(get_job(&config, &job.id).unwrap().profile_id, None);
+}
+
+#[test]
+fn enabling_stale_disabled_job_refreshes_next_run() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Daily 7 AM job, then disable it (mimics a seeded opt-in morning briefing).
+    let job = add_job(&config, "0 7 * * *", "echo briefing").unwrap();
+    update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            enabled: Some(false),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+
+    // Force a stale next_run in the past, as if the user onboarded before the
+    // job's first scheduled fire and only opted in later (hours or days after).
+    let stale = Utc::now() - ChronoDuration::hours(2);
+    with_connection(&config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+            params![stale.to_rfc3339(), job.id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Opt in: disabled -> enabled, with the schedule unchanged.
+    let enabled = update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            enabled: Some(true),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert!(enabled.enabled);
+    assert!(
+        enabled.next_run > Utc::now(),
+        "enabling a job with a stale next_run must refresh it to the future, got {}",
+        enabled.next_run
+    );
+    assert!(
+        due_jobs(&config, Utc::now()).unwrap().is_empty(),
+        "freshly opted-in job must not fire immediately on enable"
+    );
+}
+
+#[test]
+fn enabling_job_with_future_next_run_preserves_it() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    let job = add_job(&config, "0 7 * * *", "echo briefing").unwrap();
+    update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            enabled: Some(false),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+
+    // A future next_run is still valid and must be left untouched on enable.
+    let future = Utc::now() + ChronoDuration::hours(3);
+    with_connection(&config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+            params![future.to_rfc3339(), job.id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let enabled = update_job(
+        &config,
+        &job.id,
+        CronJobPatch {
+            enabled: Some(true),
+            ..CronJobPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        enabled.next_run.to_rfc3339(),
+        future.to_rfc3339(),
+        "enabling a job whose next_run is in the future must not reschedule it"
+    );
 }
 
 #[test]
@@ -235,4 +413,202 @@ fn reschedule_after_run_truncates_last_output() {
     let last_output = stored.last_output.as_deref().unwrap_or_default();
     assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
     assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
+}
+
+// ── dedup_named_jobs ─────────────────────────────────────────────
+
+#[test]
+fn dedup_named_jobs_no_op_on_empty_db() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    let removed = dedup_named_jobs(&config).unwrap();
+    assert_eq!(removed, 0);
+}
+
+#[test]
+fn dedup_named_jobs_no_op_when_no_duplicates() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    add_shell_job(
+        &config,
+        Some("job_a".into()),
+        Schedule::Cron {
+            expr: "*/5 * * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo a",
+    )
+    .unwrap();
+    add_shell_job(
+        &config,
+        Some("job_b".into()),
+        Schedule::Cron {
+            expr: "*/10 * * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo b",
+    )
+    .unwrap();
+    let removed = dedup_named_jobs(&config).unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(list_jobs(&config).unwrap().len(), 2);
+}
+
+#[test]
+fn dedup_named_jobs_removes_duplicates_keeping_history() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Insert two jobs with the same name directly — simulating the old double-seed bug.
+    let job_a = add_shell_job(
+        &config,
+        Some("morning_briefing".into()),
+        Schedule::Cron {
+            expr: "0 7 * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo briefing",
+    )
+    .unwrap();
+    let job_b = add_shell_job(
+        &config,
+        Some("morning_briefing".into()),
+        Schedule::Cron {
+            expr: "0 7 * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo briefing",
+    )
+    .unwrap();
+
+    // Add run history to job_a — it should survive.
+    let now = Utc::now();
+    record_run(
+        &config,
+        &job_a.id,
+        now,
+        now + ChronoDuration::seconds(1),
+        "ok",
+        Some("output"),
+        1000,
+    )
+    .unwrap();
+
+    let removed = dedup_named_jobs(&config).unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = list_jobs(&config).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].id, job_a.id,
+        "job with run history should be kept"
+    );
+    assert!(
+        get_job(&config, &job_b.id).is_err(),
+        "duplicate without history should be removed"
+    );
+}
+
+#[test]
+fn dedup_named_jobs_keeps_earliest_when_history_tied() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Both jobs have no run history — tie broken by earliest created_at.
+    let job_a = add_shell_job(
+        &config,
+        Some("routine".into()),
+        Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo first",
+    )
+    .unwrap();
+    let job_b = add_shell_job(
+        &config,
+        Some("routine".into()),
+        Schedule::Cron {
+            expr: "0 8 * * *".into(),
+            tz: None,
+            active_hours: None,
+        },
+        "echo second",
+    )
+    .unwrap();
+
+    let removed = dedup_named_jobs(&config).unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = list_jobs(&config).unwrap();
+    assert_eq!(remaining.len(), 1);
+    // job_a was created first — it should win the tie.
+    assert_eq!(remaining[0].id, job_a.id, "earliest job should be kept");
+    assert!(get_job(&config, &job_b.id).is_err());
+}
+
+// ── add_flow_schedule_job race-safety (CodeRabbit finding A) ────────
+
+#[test]
+fn add_flow_schedule_job_twice_yields_a_single_row() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+    let schedule = Schedule::Cron {
+        expr: "0 9 * * *".into(),
+        tz: None,
+        active_hours: None,
+    };
+
+    let first = add_flow_schedule_job(&config, "flow-1", schedule.clone()).unwrap();
+    let second = add_flow_schedule_job(&config, "flow-1", schedule).unwrap();
+
+    // Calling it twice for the same flow must not create a duplicate — the
+    // second call returns the same row the first one created.
+    assert_eq!(first.id, second.id);
+
+    let flow_jobs: Vec<_> = list_jobs(&config)
+        .unwrap()
+        .into_iter()
+        .filter(|j| j.job_type == JobType::Flow && j.command == "flow-1")
+        .collect();
+    assert_eq!(
+        flow_jobs.len(),
+        1,
+        "exactly one job_type='flow' row should exist for flow-1"
+    );
+}
+
+#[test]
+fn add_flow_schedule_job_unique_index_does_not_affect_shell_jobs() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Two shell jobs sharing the same command must both persist — the new
+    // partial unique index is scoped to job_type = 'flow' and must not
+    // constrain shell/agent jobs, which may legitimately share a command.
+    let shell_a = add_job(&config, "*/5 * * * *", "echo shared").unwrap();
+    let shell_b = add_job(&config, "*/10 * * * *", "echo shared").unwrap();
+
+    assert!(get_job(&config, &shell_a.id).is_ok());
+    assert!(get_job(&config, &shell_b.id).is_ok());
+    assert_eq!(list_jobs(&config).unwrap().len(), 2);
+}
+
+#[test]
+fn dedup_named_jobs_ignores_unnamed_jobs() {
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Unnamed jobs (name = NULL) — dedup should not touch them.
+    add_job(&config, "*/5 * * * *", "echo unnamed-1").unwrap();
+    add_job(&config, "*/5 * * * *", "echo unnamed-2").unwrap();
+
+    let removed = dedup_named_jobs(&config).unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(list_jobs(&config).unwrap().len(), 2);
 }

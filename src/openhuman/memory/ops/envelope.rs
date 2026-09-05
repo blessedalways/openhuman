@@ -80,3 +80,7 @@ pub(crate) fn error_envelope<T: Serialize>(
         vec![],
     )
 }
+
+#[cfg(test)]
+#[path = "envelope_tests.rs"]
+mod tests;

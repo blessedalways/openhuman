@@ -19,25 +19,36 @@
 //! (step 1). This avoids double-delivering to a channel that doesn't
 //! exist.
 
-use crate::core::event_bus::{DomainEvent, EventHandler};
+use crate::core::events::DomainEvent;
 use crate::core::socketio::WebChannelEvent;
-use crate::openhuman::channels::providers::web::publish_web_channel_event;
-use crate::openhuman::channels::{Channel, SendMessage};
+use crate::openhuman::channels::{Channel, ChannelSendExt, SendMessage};
+use crate::openhuman::web_chat::publish_web_channel_event;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tinybus::EventHandler;
+
+#[cfg(not(test))]
+fn proactive_approval_gate() -> Option<Arc<crate::openhuman::security::approval::ApprovalGate>> {
+    crate::openhuman::security::approval::ApprovalGate::try_global()
+}
+
+#[cfg(test)]
+fn proactive_approval_gate() -> Option<Arc<crate::openhuman::security::approval::ApprovalGate>> {
+    None
+}
 
 /// Register a web-only proactive message subscriber on the global event
 /// bus. Guarded by `std::sync::Once` so it is safe to call from both
-/// `bootstrap_skill_runtime` (desktop/JSON-RPC) and domain-level
+/// `bootstrap_core_runtime` (desktop/JSON-RPC) and domain-level
 /// startup — only the first call takes effect.
 pub fn register_web_only_proactive_subscriber() {
     use std::sync::Once;
     static REGISTERED: Once = Once::new();
     REGISTERED.call_once(|| {
-        if let Some(handle) = crate::core::event_bus::subscribe_global(Arc::new(
-            ProactiveMessageSubscriber::web_only(),
-        )) {
+        if let Some(handle) =
+            crate::core::bus::BUS.subscribe(Arc::new(ProactiveMessageSubscriber::web_only()))
+        {
             std::mem::forget(handle);
             tracing::debug!("[proactive] web-only subscriber registered");
         } else {
@@ -85,10 +96,70 @@ impl ProactiveMessageSubscriber {
             *guard = channel;
         }
     }
+
+    /// Share this subscriber's active-channel handle so the runtime can update it
+    /// in place after construction (see [`register_active_channel_handle`]).
+    pub fn active_channel_handle(&self) -> Arc<RwLock<Option<String>>> {
+        Arc::clone(&self.active_channel)
+    }
+}
+
+/// Handle to the live proactive subscriber's `active_channel`, registered at
+/// channel-runtime startup (issue #3712 — "switch default channel
+/// Telegram↔Discord"). The `channels_set_default` RPC mutates this exact handle
+/// via [`set_runtime_active_channel`] so a default-channel switch from the UI
+/// takes effect without a restart. Only the full channel runtime registers
+/// (the web-only subscriber can't deliver externally), and nothing registers in
+/// unit tests — so [`set_runtime_active_channel`] is a no-op there and never
+/// leaks across the parallel test suite. The choice is also persisted to
+/// `config.channels_config.active_channel`, which seeds the handle on next start.
+type ActiveChannelHandle = Arc<RwLock<Option<String>>>;
+type ActiveChannelHandleSlot = RwLock<Option<ActiveChannelHandle>>;
+
+static ACTIVE_CHANNEL_HANDLE: std::sync::OnceLock<ActiveChannelHandleSlot> =
+    std::sync::OnceLock::new();
+
+fn active_channel_handle_slot() -> &'static ActiveChannelHandleSlot {
+    ACTIVE_CHANNEL_HANDLE.get_or_init(|| RwLock::new(None))
+}
+
+/// Register the live subscriber's active-channel handle so the RPC can update it
+/// at runtime. Called once from channel-runtime startup; the latest registration
+/// wins.
+pub fn register_active_channel_handle(handle: Arc<RwLock<Option<String>>>) {
+    if let Ok(mut slot) = active_channel_handle_slot().write() {
+        *slot = Some(handle);
+    }
+}
+
+/// Update the live proactive subscriber's active channel. No-op when no
+/// subscriber has registered a handle (e.g. unit tests, or before the channel
+/// runtime starts) — config persistence still applies and the value is read at
+/// next startup.
+pub fn set_runtime_active_channel(channel: Option<String>) {
+    // Clone the Arc out and drop the slot read-guard before locking the handle,
+    // so we never hold two locks at once and the borrow doesn't outlive the read.
+    let handle = match active_channel_handle_slot().read() {
+        Ok(slot) => slot.clone(),
+        Err(_) => return,
+    };
+    let Some(handle) = handle else {
+        tracing::debug!("[proactive] set_runtime_active_channel: no live subscriber registered");
+        return;
+    };
+    // Bind the guard out of the match (rather than `if let`) so the write-lock
+    // temporary is dropped before `handle`, avoiding an E0597 borrow on the
+    // local `handle`.
+    let mut guard = match handle.write() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    tracing::debug!(channel = ?channel, "[proactive] runtime active channel updated");
+    *guard = channel;
 }
 
 #[async_trait]
-impl EventHandler for ProactiveMessageSubscriber {
+impl EventHandler<DomainEvent> for ProactiveMessageSubscriber {
     fn name(&self) -> &str {
         "channels::proactive"
     }
@@ -126,6 +197,11 @@ impl EventHandler for ProactiveMessageSubscriber {
             full_response: Some(message.clone()),
             message: None,
             error_type: None,
+            error_source: None,
+            error_retryable: None,
+            error_retry_after_ms: None,
+            error_provider: None,
+            error_fallback_available: None,
             tool_name: None,
             skill_id: None,
             args: None,
@@ -138,11 +214,21 @@ impl EventHandler for ProactiveMessageSubscriber {
             delta: None,
             delta_kind: None,
             tool_call_id: None,
+            failure: None,
             citations: None,
             subagent: None,
+            task_board: None,
+            tool_display_label: None,
+            tool_display_detail: None,
+            usage: None,
+            // Proactive delivery is emitted outside the seq-stamping progress
+            // bridge; leave `seq` unset (older clients ignore it).
+            seq: None,
         });
 
         // 2. If an active external channel is configured, deliver there too.
+        //    The `channels_set_default` RPC mutates this handle in place (issue
+        //    #3712), so reading it here picks up a live default-channel switch.
         let active = self
             .active_channel
             .read()
@@ -157,12 +243,100 @@ impl EventHandler for ProactiveMessageSubscriber {
 
             let key = channel_name.to_ascii_lowercase();
             if let Some(ch) = self.channels_by_name.get(&key) {
+                // Resolve a delivery target before doing any work. Proactive
+                // sends carry no inbound recipient, so the channel must supply
+                // its configured default (e.g. Discord's `channel_id`). Channels
+                // with no resolvable target (e.g. Telegram, which has no stored
+                // default chat) are skipped with a warning rather than handed an
+                // empty recipient that would hit the platform API with a blank
+                // chat/channel id (#3794 review — Codex P2). Web delivery above
+                // already happened, so skipping only drops the external echo.
+                let Some(recipient) = ch.proactive_target() else {
+                    tracing::warn!(
+                        source = %source,
+                        channel = %key,
+                        "[proactive] active external channel has no configured \
+                         delivery target for recipient-less proactive messages; \
+                         skipping external delivery (web delivery unaffected)"
+                    );
+                    return;
+                };
+
                 tracing::debug!(
                     source = %source,
                     channel = %key,
                     "[proactive] delivering to active external channel"
                 );
-                match ch.send(&SendMessage::new(message, "")).await {
+
+                // ── External-effect approval gate (#1339, #2135) ─
+                // Proactive sends to Telegram/Discord/Slack/etc.
+                // are outbound writes — route through the gate
+                // before handing off to the channel implementation.
+                // Web delivery above is internal and exempt. When
+                // the gate persists an approval row, we keep its
+                // `request_id` so we can record the delivery
+                // outcome after `ch.send` returns (issue #2135).
+                let mut approval_request_id: Option<String> = None;
+                let mut approval_gate_for_audit: Option<
+                    std::sync::Arc<crate::openhuman::security::approval::ApprovalGate>,
+                > = None;
+                if let Some(gate) = proactive_approval_gate() {
+                    let summary = format!(
+                        "proactive-send to {key} ({} chars)",
+                        message.chars().count()
+                    );
+                    let redacted = serde_json::json!({
+                        "channel": key,
+                        "source": source.to_string(),
+                        "message_chars": message.chars().count(),
+                    });
+                    let (outcome, request_id) = gate
+                        .intercept_audited("channels.proactive_send", &summary, redacted)
+                        .await;
+                    match outcome {
+                        crate::openhuman::security::approval::GateOutcome::Allow => {
+                            approval_request_id = request_id;
+                            if approval_request_id.is_some() {
+                                approval_gate_for_audit = Some(gate);
+                            }
+                        }
+                        crate::openhuman::security::approval::GateOutcome::Deny { reason } => {
+                            tracing::warn!(
+                                source = %source,
+                                channel = %key,
+                                reason = %reason,
+                                "[proactive] approval gate denied external delivery"
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                let send_result = ch
+                    .send_with_outbound_intent(&SendMessage::new(message, &recipient))
+                    .await;
+                // Record the terminal status on the approval audit
+                // row before we log the outcome — best-effort, see
+                // #2135. `record_execution` itself logs write
+                // errors so we don't pile on here.
+                if let (Some(gate), Some(req_id)) = (
+                    approval_gate_for_audit.as_ref(),
+                    approval_request_id.as_ref(),
+                ) {
+                    let (exec_outcome, err_text) = match &send_result {
+                        Ok(()) => (
+                            crate::openhuman::security::approval::ExecutionOutcome::Success,
+                            None,
+                        ),
+                        Err(e) => (
+                            crate::openhuman::security::approval::ExecutionOutcome::Failure,
+                            Some(e.to_string()),
+                        ),
+                    };
+                    gate.record_execution(req_id, exec_outcome, err_text.as_deref());
+                }
+
+                match send_result {
                     Ok(()) => {
                         tracing::debug!(
                             source = %source,
@@ -192,129 +366,5 @@ impl EventHandler for ProactiveMessageSubscriber {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::openhuman::channels::traits::ChannelMessage;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
-
-    struct MockChannel {
-        name: String,
-        send_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Channel for MockChannel {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
-            self.send_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn proactive_event() -> DomainEvent {
-        DomainEvent::ProactiveMessageRequested {
-            source: "cron:test".into(),
-            message: "Hello!".into(),
-            job_name: Some("test".into()),
-        }
-    }
-
-    #[tokio::test]
-    async fn web_only_does_not_panic() {
-        let sub = ProactiveMessageSubscriber::web_only();
-        // Should publish to web channel and not panic.
-        sub.handle(&proactive_event()).await;
-    }
-
-    #[tokio::test]
-    async fn routes_to_active_external_channel() {
-        let send_count = Arc::new(AtomicUsize::new(0));
-        let ch: Arc<dyn Channel> = Arc::new(MockChannel {
-            name: "telegram".into(),
-            send_count: Arc::clone(&send_count),
-        });
-        let map: HashMap<String, Arc<dyn Channel>> = [("telegram".into(), ch)].into();
-        let sub = ProactiveMessageSubscriber::new(Arc::new(map), Some("telegram".into()));
-
-        sub.handle(&proactive_event()).await;
-
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn skips_external_when_active_is_web() {
-        let send_count = Arc::new(AtomicUsize::new(0));
-        let ch: Arc<dyn Channel> = Arc::new(MockChannel {
-            name: "telegram".into(),
-            send_count: Arc::clone(&send_count),
-        });
-        let map: HashMap<String, Arc<dyn Channel>> = [("telegram".into(), ch)].into();
-        let sub = ProactiveMessageSubscriber::new(Arc::new(map), Some("web".into()));
-
-        sub.handle(&proactive_event()).await;
-
-        // Active channel is "web" — external channel should NOT be called.
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn skips_external_when_active_is_none() {
-        let send_count = Arc::new(AtomicUsize::new(0));
-        let ch: Arc<dyn Channel> = Arc::new(MockChannel {
-            name: "telegram".into(),
-            send_count: Arc::clone(&send_count),
-        });
-        let map: HashMap<String, Arc<dyn Channel>> = [("telegram".into(), ch)].into();
-        let sub = ProactiveMessageSubscriber::new(Arc::new(map), None);
-
-        sub.handle(&proactive_event()).await;
-
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn runtime_update_active_channel() {
-        let send_count = Arc::new(AtomicUsize::new(0));
-        let ch: Arc<dyn Channel> = Arc::new(MockChannel {
-            name: "discord".into(),
-            send_count: Arc::clone(&send_count),
-        });
-        let map: HashMap<String, Arc<dyn Channel>> = [("discord".into(), ch)].into();
-        let sub = ProactiveMessageSubscriber::new(Arc::new(map), None);
-
-        // Initially no active channel — external not called.
-        sub.handle(&proactive_event()).await;
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-
-        // Update at runtime.
-        sub.set_active_channel(Some("discord".into()));
-        sub.handle(&proactive_event()).await;
-        assert_eq!(send_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn ignores_non_proactive_events() {
-        let send_count = Arc::new(AtomicUsize::new(0));
-        let ch: Arc<dyn Channel> = Arc::new(MockChannel {
-            name: "telegram".into(),
-            send_count: Arc::clone(&send_count),
-        });
-        let map: HashMap<String, Arc<dyn Channel>> = [("telegram".into(), ch)].into();
-        let sub = ProactiveMessageSubscriber::new(Arc::new(map), Some("telegram".into()));
-
-        sub.handle(&DomainEvent::CronJobTriggered {
-            job_id: "j".into(),
-            job_name: "test-job".into(),
-            job_type: "agent".into(),
-        })
-        .await;
-
-        assert_eq!(send_count.load(Ordering::SeqCst), 0);
-    }
-}
+#[path = "proactive_tests.rs"]
+mod tests;

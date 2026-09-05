@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
@@ -16,6 +17,7 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct DockerRuntimeConfig {
     #[serde(default = "default_docker_image")]
     pub image: String,
@@ -31,6 +33,19 @@ pub struct DockerRuntimeConfig {
     pub mount_workspace: bool,
     #[serde(default)]
     pub allowed_workspace_roots: Vec<String>,
+}
+
+/// `[shell]` — behaviour of the shell-family tools (`shell`, `node_exec`,
+/// `npm_exec`, monitor) when they spawn child processes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// On Windows, suppress the console window that briefly flashes for every
+    /// child process the shell tool spawns by passing `CREATE_NO_WINDOW`
+    /// (`0x08000000`) in the process creation flags. No-op on macOS/Linux.
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    pub hide_window: bool,
 }
 
 fn default_true() -> bool {
@@ -82,6 +97,7 @@ impl Default for RuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct ReliabilityConfig {
     #[serde(default = "default_provider_retries")]
     pub provider_retries: u32,
@@ -141,6 +157,7 @@ impl Default for ReliabilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct SchedulerConfig {
     #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
@@ -171,3 +188,7 @@ impl Default for SchedulerConfig {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_shell_config_tests_tests.rs"]
+mod shell_config_tests;

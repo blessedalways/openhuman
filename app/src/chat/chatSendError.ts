@@ -6,6 +6,8 @@ export type ChatSendErrorCode =
   | 'cloud_send_failed'
   | 'voice_transcription'
   | 'stt_not_ready'
+  | 'voice_synthesis'
+  | 'tts_not_ready'
   | 'microphone_unavailable'
   | 'microphone_recording'
   | 'microphone_access'
@@ -13,7 +15,9 @@ export type ChatSendErrorCode =
   | 'safety_timeout'
   | 'usage_limit_reached'
   | 'prompt_blocked'
-  | 'prompt_review';
+  | 'prompt_review'
+  | 'attachment_invalid'
+  | 'create_thread_failed';
 
 export interface ChatSendError {
   code: ChatSendErrorCode;
