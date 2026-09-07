@@ -6778,6 +6778,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'Провайдеры',
   'settings.ai.picker.modelIdPlaceholder': 'Введите ID модели',
   'settings.ai.picker.claudeCodeHint': 'Используйте псевдоним модели Claude Code или ID модели.',
+  'settings.ai.picker.catalogError': 'Не удалось загрузить модели от этого провайдера.',
   'settings.ai.loops.memoryTreeWorkers.name': 'Воркеры дерева памяти',
   'settings.ai.loops.cadence.queue': 'очередь',
   'settings.ai.loops.memoryTreeWorkers.work':

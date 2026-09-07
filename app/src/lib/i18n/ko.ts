@@ -6626,6 +6626,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': '제공업체',
   'settings.ai.picker.modelIdPlaceholder': '모델 ID 입력',
   'settings.ai.picker.claudeCodeHint': 'Claude Code 모델 별칭 또는 모델 ID를 사용하세요.',
+  'settings.ai.picker.catalogError': '이 제공업체에서 모델을 불러올 수 없습니다.',
   'settings.ai.loops.memoryTreeWorkers.name': '메모리 트리 워커',
   'settings.ai.loops.cadence.queue': '대기열',
   'settings.ai.loops.memoryTreeWorkers.work':

@@ -142,10 +142,17 @@ export function ProviderModelPickerDialog({
         setCatalog(models);
         setLoading(false);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (active) {
           setLoading(false);
-          setCatalogError('Could not load models from this provider.');
+          // The core's list_models errors are already sanitized and carry the
+          // recovery hint (e.g. a 404 names the missing `/models` endpoint and
+          // the usual `/v1` base-URL fix) — show them, don't bury them.
+          setCatalogError(
+            err instanceof Error && err.message
+              ? `${t('settings.ai.picker.catalogError')}: ${err.message}`
+              : t('settings.ai.picker.catalogError')
+          );
         }
       });
     return () => {

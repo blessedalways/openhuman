@@ -6831,6 +6831,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'Provider',
   'settings.ai.picker.modelIdPlaceholder': "Inserisci l'ID del modello",
   'settings.ai.picker.claudeCodeHint': 'Usa un alias di modello Claude Code o un ID modello.',
+  'settings.ai.picker.catalogError': 'Impossibile caricare i modelli da questo provider.',
   'settings.ai.loops.memoryTreeWorkers.name': "Worker dell'albero di memoria",
   'settings.ai.loops.cadence.queue': 'coda',
   'settings.ai.loops.memoryTreeWorkers.work':

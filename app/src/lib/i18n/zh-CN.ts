@@ -6334,6 +6334,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': '提供方',
   'settings.ai.picker.modelIdPlaceholder': '输入模型 ID',
   'settings.ai.picker.claudeCodeHint': '使用 Claude Code 模型别名或模型 ID。',
+  'settings.ai.picker.catalogError': '无法从此提供商加载模型。',
   'settings.ai.loops.memoryTreeWorkers.name': '记忆树工作进程',
   'settings.ai.loops.cadence.queue': '队列',
   'settings.ai.loops.memoryTreeWorkers.work': '提取片段、封存分支、生成每日摘要并对主题进行路由。',

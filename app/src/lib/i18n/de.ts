@@ -6891,6 +6891,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.modelIdPlaceholder': 'Modell-ID eingeben',
   'settings.ai.picker.claudeCodeHint':
     'Verwende einen Claude-Code-Modellalias oder eine Modell-ID.',
+  'settings.ai.picker.catalogError': 'Modelle konnten von diesem Anbieter nicht geladen werden.',
   'settings.ai.loops.memoryTreeWorkers.name': 'Speicherbaum-Worker',
   'settings.ai.loops.cadence.queue': 'Warteschlange',
   'settings.ai.loops.memoryTreeWorkers.work':

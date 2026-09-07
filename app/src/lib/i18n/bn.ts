@@ -6701,6 +6701,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'প্রদানকারী',
   'settings.ai.picker.modelIdPlaceholder': 'মডেল আইডি লিখুন',
   'settings.ai.picker.claudeCodeHint': 'একটি Claude Code মডেল উপনাম বা মডেল আইডি ব্যবহার করুন।',
+  'settings.ai.picker.catalogError': 'এই প্রদানকারী থেকে মডেল লোড করা যায়নি।',
   'settings.ai.loops.memoryTreeWorkers.name': 'মেমরি ট্রি ওয়ার্কার',
   'settings.ai.loops.cadence.queue': 'সারি',
   'settings.ai.loops.memoryTreeWorkers.work':

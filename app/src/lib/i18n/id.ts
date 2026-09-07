@@ -6738,6 +6738,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'Penyedia',
   'settings.ai.picker.modelIdPlaceholder': 'Masukkan ID model',
   'settings.ai.picker.claudeCodeHint': 'Gunakan alias model Claude Code atau ID model.',
+  'settings.ai.picker.catalogError': 'Tidak dapat memuat model dari penyedia ini.',
   'settings.ai.loops.memoryTreeWorkers.name': 'Worker pohon memori',
   'settings.ai.loops.cadence.queue': 'antrean',
   'settings.ai.loops.memoryTreeWorkers.work':

@@ -6807,6 +6807,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'Dostawcy',
   'settings.ai.picker.modelIdPlaceholder': 'Wpisz identyfikator modelu',
   'settings.ai.picker.claudeCodeHint': 'Użyj aliasu modelu Claude Code lub identyfikatora modelu.',
+  'settings.ai.picker.catalogError': 'Nie można wczytać modeli od tego dostawcy.',
   'settings.ai.loops.memoryTreeWorkers.name': 'Workery drzewa pamięci',
   'settings.ai.loops.cadence.queue': 'kolejka',
   'settings.ai.loops.memoryTreeWorkers.work':

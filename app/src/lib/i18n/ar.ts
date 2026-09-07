@@ -6549,6 +6549,7 @@ const messages: TranslationMap = {
   'settings.ai.picker.providersLabel': 'المزوّدون',
   'settings.ai.picker.modelIdPlaceholder': 'أدخل معرّف النموذج',
   'settings.ai.picker.claudeCodeHint': 'استخدم اسمًا مستعارًا لنموذج Claude Code أو معرّف نموذج.',
+  'settings.ai.picker.catalogError': 'تعذّر تحميل النماذج من هذا المزوّد.',
   'settings.ai.loops.memoryTreeWorkers.name': 'عمّال شجرة الذاكرة',
   'settings.ai.loops.cadence.queue': 'قائمة الانتظار',
   'settings.ai.loops.memoryTreeWorkers.work':
