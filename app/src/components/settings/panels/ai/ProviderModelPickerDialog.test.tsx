@@ -105,4 +105,44 @@ describe('ProviderModelPickerDialog', () => {
 
     expect(screen.queryByTestId('model-picker-managed-pane')).toBeNull();
   });
+
+  /**
+   * The core's list_models errors carry the recovery hint (a 404 names the
+   * missing `/models` endpoint and the usual `/v1` base-URL fix). The dialog
+   * must surface that message instead of burying it behind the generic
+   * fallback, or the user cannot tell a typo'd endpoint from a dead server.
+   */
+  it('surfaces the core error message when the catalog fails to load', async () => {
+    vi.mocked(listProviderModels).mockRejectedValue(
+      new Error(
+        "provider returned 404: 404 page not found — the configured base URL does not expose a `/models` endpoint; check the provider's base URL (it usually ends in `/v1`)"
+      )
+    );
+    const onSelect = vi.fn();
+
+    render(
+      <ProviderModelPickerDialog
+        cloudProviders={[
+          {
+            id: 'custom-1',
+            slug: 'custom-1',
+            label: 'My llama',
+            endpoint: 'http://127.0.0.1:8080',
+            authStyle: 'none',
+            maskedKey: '',
+          },
+        ]}
+        localModels={[]}
+        ollamaRunning={false}
+        claudeCodeEnabled={false}
+        initial={null}
+        onClose={() => {}}
+        onSelect={onSelect}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /My llama/ }));
+
+    await waitFor(() => expect(screen.getByText(/it usually ends in `\/v1`/)).toBeInTheDocument());
+  });
 });
